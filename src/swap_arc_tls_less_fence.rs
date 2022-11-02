@@ -112,13 +112,15 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
             let curr = self.curr.load(Ordering::Acquire);
             LocalData {
                 parent: self.clone(),
-                state: AtomicU8::new(STATE_UPDATED),
+                intermediate_update: AtomicPtr::new(curr),
+                update: AtomicPtr::new(curr),
                 inner: UnsafeCell::new(LocalDataInner {
-                    new_val: Default::default(),
-                    new_val_ptr: null_mut(),
-                    new_ref_cnt: 0,
-                    val: ManuallyDrop::new(D::from(curr)),
-                    ref_cnt: 1,
+                    intermediate_ptr: null(),
+                    intermediate: LocalCounted { val: MaybeUninit::uninit(), ref_cnt: 0, },
+                    new_ptr: null(),
+                    new: LocalCounted { val: MaybeUninit::uninit(), ref_cnt: 0, },
+                    // FIXME: increase ref count
+                    curr: LocalCounted { val: MaybeUninit::new(D::from(curr)), ref_cnt: 1, }
                 }),
             }
         });
@@ -133,9 +135,10 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                 fake_ref,
             };
         }
+        /*
         data.ref_cnt += 1;
-        if data.new_val_ptr.is_null() {
-            if parent.state.compare_exchange(!STATE_IN_USE, Ordering::SeqCst).is_ok() {
+        if data.intermediate_ptr == data.new_ptr {
+            if parent.update.compare_exchange(!STATE_IN_USE, Ordering::SeqCst).is_ok() {
 
             }
             let loaded =  // FIXME: try reducing this ordering!
@@ -153,7 +156,51 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
             parent,
             // SAFETY: we know that this is safe because the ref count is non-zero
             fake_ref,
+        }*/
+        if data.new_ptr.is_null() {
+            let ptr = if parent.update.load(Ordering::Acquire) != unsafe { data.curr.val.assume_init_ref() }.as_ptr() {
+                let loaded = parent.load_update();
+                data.new_ptr = loaded.0;
+                data.new_src = loaded.1;
+                data.new = LocalCounted {
+                    val: MaybeUninit::new(D::from(loaded.0)),
+                    ref_cnt: 1,
+                };
+                loaded.0.cast_const()
+            } else {
+                data.curr.ref_cnt += 1;
+                unsafe { data.curr.val.assume_init_ref() }.as_ptr()
+            };
+            // FIXME: perform an update!
+            let fake_ref = ManuallyDrop::new(D::from(ptr));
+            return SwapArcIntermediateGuard {
+                parent,
+                // SAFETY: we know that this is safe because the ref count is non-zero
+                fake_ref,
+            };
         }
+        if data.intermediate_ptr.is_null() {
+            let ptr = if parent.intermediate_update.load(Ordering::Acquire).cast_const() != data.new_ptr {
+                let loaded = parent.intermediate_update.fetch_or(IN_USE_FLAG, Ordering::SeqCst).map_addr(|x| x & !META_DATA_MASK);
+                data.intermediate_ptr = loaded.0;
+                data.intermediate = LocalCounted {
+                    val: MaybeUninit::new(D::from(loaded)),
+                    ref_cnt: 1,
+                };
+                loaded.cast_const()
+            } else {
+                data.new.ref_cnt += 1;
+                data.new_ptr
+            };
+            // FIXME: perform an update!
+            let fake_ref = ManuallyDrop::new(D::from(ptr));
+            return SwapArcIntermediateGuard {
+                parent,
+                // SAFETY: we know that this is safe because the ref count is non-zero
+                fake_ref,
+            };
+        }
+        todo!()
     }
 
     pub fn load_full(self: &Arc<Self>) -> D {
@@ -234,19 +281,32 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
         if !updating.is_ok() {
             return None;
         }
+        let curr = self.curr.load(Ordering::Acquire);
         for local in self.thread_local.iter() {
-            let curr = local.state.fetch_or(NORMALIZATION_MASK, Ordering::SeqCst);
+            let mapped = val.map_addr(|x| x | UPDATE_FLAG).cast_mut();
             // the thread this `local` belongs to didn't already update and
             // it isn't idling
-            if curr == STATE_IN_USE {
-                // FIXME: fixup states for all thread_locals!
+            // note: the `UPDATE_FLAG` has a different meaning for `intermediate` and for `update` (although one could say that it has the exact sane meaning)
+            // for `intermediate` it means that `update` has a pending update
+            // for `update` it means that itself has a pending update
+            if !local.intermediate_update.compare_exchange(curr, mapped, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                // fixup states for all thread locals
+                for local in self.thread_local.iter() {
+                    if !local.intermediate_update.compare_exchange(mapped, local.update.load(Ordering::SeqCst).map_addr(|x| x & !META_DATA_MASK), Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                        break;
+                    }
+                }
                 return Some(false);
             }
         }
-        self.curr.store(val.cast_mut(), Ordering::Release);
         for local in self.thread_local.iter() {
-            local.state.store(STATE_UPDATABLE, Ordering::Release);
+            let curr = local.update.fetch_or(UPDATE_FLAG, Ordering::SeqCst);
+            if curr.expose_addr() & IN_USE_FLAG == 0 {
+                local.update.store(val.cast_mut(), Ordering::SeqCst);
+                local.intermediate_update.fetch_and(!UPDATE_FLAG, Ordering::SeqCst);
+            }
         }
+        self.curr.store(val.cast_mut(), Ordering::Release);
         Some(true)
     }
 
@@ -586,31 +646,56 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop
         // and we also know, that the pointer has to be non-null
         let data = unsafe { self.parent.inner.get().as_mut().unwrap_unchecked() };
         // release the reference we hold
-        if data.val.as_ptr() == self.fake_ref.as_ptr() {
-            data.ref_cnt -= 1;
-            if data.ref_cnt == 0 {
+        if unsafe { self.fake_ref.as_ptr() == data.curr.val.assume_init_ref() }.as_ptr() {
+            data.curr.ref_cnt -= 1;
+            if data.curr.ref_cnt == 0 {
                 // SAFETY: This is safe because we know that the reference count
                 // was 1 before we just decremented it and thus we know that
                 // `inner` has to be initialized right now.
                 // unsafe { data.inner.assume_init_drop(); }
 
-                if let Some(new) = data.new_val.take() {
-                    let old_ref_ptr = data.val.as_ptr();
-                    data.val = ManuallyDrop::new(new);
-                    data.new_val_ptr = null();
-                    data.ref_cnt = data.new_ref_cnt;
-                    data.new_ref_cnt = 0;
-                    self.parent.state.store(STATE_READY, Ordering::Release);
+                if !data.new_ptr.is_null() {
+                    unsafe { data.curr.val.assume_init_drop() };
+                    data.curr = mem::take(&mut data.new);
+                    if !data.intermediate_ptr.is_null() {
+                        data.new = mem::take(&mut data.intermediate);
+                        data.new_ptr = data.intermediate_ptr;
+                        data.intermediate_ptr = null();
+                        self.parent.intermediate_update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+                    } else {
+                        data.new_ptr = null();
+                        if data.new_src == RefSource::Curr {
+                            self.parent.update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+                        } else {
+                            self.parent.intermediate_update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+                        }
+                    }
+                } else {
                     // FIXME: try update!
                     // data.parent.thread_local.iter()
                     // FIXME: go through all thread locals and check if
                     // signal that this thread has no pending updates
                 }
             }
+        } else if self.fake_ref.as_ptr() == data.new_ptr {
+            data.new.ref_cnt -= 1;
+            if data.new.ref_cnt == 0 {
+                if !data.intermediate_ptr.is_null() {
+                    data.new = mem::take(&mut data.intermediate);
+                    data.new_ptr = data.intermediate_ptr;
+                    data.intermediate_ptr = null();
+                    // FIXME: we could optimize the `Arc` ref counting by only increasing and decreasing the ref counts of the thread locals that get used.
+                    self.parent.update.store(data.new_ptr.cast_mut(), Ordering::SeqCst);
+                    self.parent.intermediate_update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+                } else {
+                    data.new_ptr = null();
+                    self.parent.update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+                }
+            }
         } else {
-            data.new_ref_cnt -= 1;
-            if data.new_ref_cnt == 0 {
-                // FIXME: is this really a NOOP?
+            data.intermediate.ref_cnt -= 1;
+            if data.intermediate.ref_cnt == 0 {
+                self.parent.intermediate_update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
             }
         }
     }
@@ -668,17 +753,107 @@ const STATE_UPDATING: u8 = 0b011;  // 6 - this state indicates that there is an 
                                    // the `NORMALIZATION_MASK`
 const NORMALIZATION_MASK: u8 = 0b011; // can be used to make all states equal except the in_use state
 
+const IN_USE_FLAG: usize = 1 << 0;
+const UPDATE_FLAG: usize = 1 << 1;
+const META_DATA_MASK: usize = IN_USE_FLAG | UPDATE_FLAG;
+
+#[derive(Default)]
 struct LocalData<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const METADATA_PREFIX_BITS: u32 = 0> {
     parent: Arc<SwapArcIntermediateTLS<T, D, METADATA_PREFIX_BITS>>,
-    state: AtomicU8,
+    intermediate_update: AtomicPtr<T>,
+    update: AtomicPtr<T>,
     inner: UnsafeCell<LocalDataInner<T, D, METADATA_PREFIX_BITS>>,
 }
 
+impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> LocalData<T, D, METADATA_PREFIX_BITS> {
+
+    fn load_update(&self) -> (*mut T, RefSource) {
+        let update = self.update.fetch_or(IN_USE_FLAG, Ordering::SeqCst);
+        let (ptr, src) = if update.expose_addr() & UPDATE_FLAG != 0 {
+            let intermediate = self.intermediate_update.fetch_or(IN_USE_FLAG, Ordering::SeqCst);
+            /*if intermediate.expose_addr() & UPDATE_FLAG != 0 {
+                let update = self.update.load(Ordering::Acquire);
+                // release the redundant reference
+                self.intermediate_update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+                (update.map_addr(|x| x & !META_DATA_MASK), RefSource::Curr)
+            } else {
+                // release the redundant reference
+                self.update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+                (intermediate.map_addr(|x| x & !META_DATA_MASK), RefSource::Intermediate)
+            }*/
+            // release the redundant reference
+            self.update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+            (intermediate.map_addr(|x| x & !META_DATA_MASK), RefSource::Intermediate)
+        } else {
+            (update.map_addr(|x| x & !META_DATA_MASK), RefSource::Curr)
+        };
+        (ptr, src)
+    }
+
+    /*
+    fn update(&self, new: *mut T) -> bool {
+        let updated = Self::strip_metadata(updated);
+        loop {
+            match self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => {
+                    let new = updated.cast_mut();
+                    // clear out old updates to make sure our update won't be overwritten by them in the future
+                    let old = self.updated.swap(null_mut(), Ordering::SeqCst);
+                    let metadata = Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire));
+                    let new = Self::merge_ptr_and_metadata(new, metadata).cast_mut();
+                    self.intermediate_ptr.store(new, Ordering::Release);
+                    // unset the update flag
+                    self.intermediate_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
+                    if !old.is_null() {
+                        // drop the `virtual reference` we hold to the Arc
+                        D::from(old);
+                    }
+                    // try finishing the update up!
+                    match self.curr_ref_cnt.compare_exchange(0, Self::UPDATE, Ordering::SeqCst, Ordering::SeqCst) {
+                        Ok(_) => {
+                            let prev = self.ptr.swap(new, Ordering::Release);
+                            // unset the update flag
+                            self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
+                            // unset the `weak` update flag from the intermediate ref cnt
+                            self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::SeqCst);
+                            // drop the `virtual reference` we hold to the Arc
+                            D::from(Self::strip_metadata(prev));
+                        }
+                        Err(_) => {}
+                    }
+                    break;
+                }
+                Err(old) => {
+                    if old & Self::UPDATE != 0 { // FIXME: what about Self::UPDATE_OTHER?
+                        // somebody else already updates the current ptr, so we wait until they finish their update
+                        continue;
+                    }
+                    // push our update up, so it will be applied in the future
+                    let old = self.updated.swap(updated.cast_mut(), Ordering::SeqCst); // FIXME: should we add some sort of update counter
+                    // FIXME: to determine which update is the most recent?
+                    if !old.is_null() {
+                        // drop the `virtual reference` we hold to the Arc
+                        D::from(old);
+                    }
+                    break;
+                }
+            }
+        }
+    }*/
+
+}
+
 struct LocalDataInner<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const METADATA_PREFIX_BITS: u32 = 0> {
-    new_val: ManuallyDrop</*Option<*/D/*>*/>,
-    new_val_ptr: *const T,
-    new_ref_cnt: usize,
-    val: ManuallyDrop<D>,
+    intermediate_ptr: *const T,
+    intermediate: LocalCounted<D>,
+    new_ptr: *const T,
+    new_src: RefSource,
+    new: LocalCounted<D>,
+    curr: LocalCounted<D>,
+}
+
+struct LocalCounted<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>> {
+    val: MaybeUninit<D>,
     ref_cnt: usize,
 }
 
