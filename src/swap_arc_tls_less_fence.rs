@@ -64,8 +64,16 @@ const fn assert_alignment<T, const METADATA_BITS: u32>() -> bool {
 
 /// This variant of `SwapArc` has wait-free reads (although
 /// this is at the cost of additional atomic instructions
-/// (at most 2 additional updates).
+/// (at least 1 additional load - this will never be more than 1 load if there are no updates happening).
 pub struct SwapArcIntermediateTLS<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const METADATA_HEADER_BITS: u32 = 0> {
+    // FIXME: support metadata - how can we do that?
+    // FIXME: we could maybe do this by putting the metadata inside of the curr and intermediate atomic ptrs
+    // FIXME: inside the SwapArc itself - the major issue we have is that with this approach we loose basically all the benefits
+    // FIXME: of using thread locals as we have to maintain the same structure inside the SwapArc as with the old `SwapArc` (without tls)
+    // FIXME: this is because we have to maintain the same old ref counter using atomic fetch_add and fetch_sub instructions
+    // FIXME: this prevents new updates from happening (probably)
+    // FIXME: IMPORTANT: if we want to solve the metadata issue if we have to solve the compare_exchange issue first
+    // FIXME: because the metadata solution has to take the compare_exchange behavior into account
     updated: AtomicPtr<T>,
     curr: AtomicPtr<T>,
     thread_local: ThreadLocal<LocalData<T, D, METADATA_HEADER_BITS>>,
@@ -109,7 +117,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                 inner: MaybeUninit::new(self.clone().load_internal()),
                 ref_cnt: 1,
             }*/
-            let curr = self.curr.load(Ordering::Acquire);
+            let curr = self.curr.load(Ordering::Acquire); // FIXME: we have to be sure that this won't give us an already expired value so we have to lock the write lock
+                                                                       // FIXME: or alternatively we can employ the same mechanism as in `SwapArcIntermediate` (but without counter to ensure this will work)
+                                                                       // FIXME: maybe we could even use an additional `SwapArcIntermediate` that handles the `parent` pointer shenanigans
             LocalData {
                 parent: self.clone(),
                 intermediate_update: AtomicPtr::new(curr),
@@ -118,6 +128,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                     intermediate_ptr: null(),
                     intermediate: LocalCounted { val: MaybeUninit::uninit(), ref_cnt: 0, },
                     new_ptr: null(),
+                    new_src: RefSource::Curr,
                     new: LocalCounted { val: MaybeUninit::uninit(), ref_cnt: 0, },
                     // FIXME: increase ref count
                     curr: LocalCounted { val: MaybeUninit::new(D::from(curr)), ref_cnt: 1, }
@@ -171,7 +182,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                 data.curr.ref_cnt += 1;
                 unsafe { data.curr.val.assume_init_ref() }.as_ptr()
             };
-            // FIXME: perform an update!
+            // FIXME: perform an update! - this is probably fixed
             let fake_ref = ManuallyDrop::new(D::from(ptr));
             return SwapArcIntermediateGuard {
                 parent,
@@ -192,15 +203,20 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                 data.new.ref_cnt += 1;
                 data.new_ptr
             };
-            // FIXME: perform an update!
+            // FIXME: perform an update! - this is probably fixed
             let fake_ref = ManuallyDrop::new(D::from(ptr));
             return SwapArcIntermediateGuard {
                 parent,
                 // SAFETY: we know that this is safe because the ref count is non-zero
                 fake_ref,
             };
+        } else {
+            let fake_ref = ManuallyDrop::new(D::from(data.intermediate_ptr));
+            return SwapArcIntermediateGuard {
+                parent: &parent,
+                fake_ref,
+            };
         }
-        todo!()
     }
 
     pub fn load_full(self: &Arc<Self>) -> D {
@@ -283,11 +299,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
         }
         let curr = self.curr.load(Ordering::Acquire);
         for local in self.thread_local.iter() {
-            let mapped = val.map_addr(|x| x | UPDATE_FLAG).cast_mut();
+            let mapped = val.map_addr(|x| x | UPDATE_FLAG | IN_USE_FLAG).cast_mut();
             // the thread this `local` belongs to didn't already update and
             // it isn't idling
             // note: the `UPDATE_FLAG` has a different meaning for `intermediate` and for `update` (although one could say that it has the exact sane meaning)
-            // for `intermediate` it means that `update` has a pending update
+            // for `intermediate` it means that `update` has a pending update, but if `IN_USE_FLAG` is set for it as well, it means it is currently being updated
             // for `update` it means that itself has a pending update
             if !local.intermediate_update.compare_exchange(curr, mapped, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
                 // fixup states for all thread locals
@@ -300,6 +316,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
             }
         }
         for local in self.thread_local.iter() {
+            local.intermediate_update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
             let curr = local.update.fetch_or(UPDATE_FLAG, Ordering::SeqCst);
             if curr.expose_addr() & IN_USE_FLAG == 0 {
                 local.update.store(val.cast_mut(), Ordering::SeqCst);
@@ -316,7 +333,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
     }
 
     unsafe fn update_raw(&self, updated: *const T) {
-        let updated = Self::strip_metadata(updated);
+        /*let updated = Self::strip_metadata(updated);
         loop {
             match self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::SeqCst, Ordering::SeqCst) {
                 Ok(_) => {
@@ -364,10 +381,33 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                     break;
                 }
             }
+        }*/
+        if self.try_update(updated) != Some(true) {
+            // if the update failed, store it in the update `cache` such that it will be performed
+            // later, if possible.
+            // FIXME: actually use updated in other places in order to perform the `cached` updates, once possible
+            self.updated.store(updated.cast_mut(), Ordering::Release);
         }
     }
 
     unsafe fn try_compare_exchange<const IGNORE_META: bool>(&self, old: *const T, new: D/*&SwapArcIntermediateGuard<'_, T, D>*/) -> bool {
+        // FIXME: what should be compared against? `curr`? or is `update` to be taken into account as well?
+        // FIXME: a good solution could be to compare against both `curr` and `intermediate` of the "main struct"(`ArcSwapIntermediateTLSLessFence`)
+        // FIXME: this could lead to a problem tho because it doesn't seem very bulletproof to simply compare against 2 values that could point to two entirely different allocations
+        // FIXME: if not done with careful consideration this could defeat the whole purpose of implementing compare_exchange for the data structure
+        // FIXME: because this could lead to clients of this function to get unreliable feedback and weird updates to be performed which is the worst case scenario and should be avoided at all costs
+        // FIXME: another solution could be to let the caller provide whether to check for the intermediate or curr value which is okay because then this
+        // FIXME: compare_exchange function would check if the state the caller last saw is still up to date or not which would (probably) solve all problems
+        // FIXME: we had before - the only problem that remains is that this will (probably) not work for thread locals because 1.
+        // FIXME: their states are inconsistent across different threads and because something loaded as `RefSource::Curr` can become `RefSource::Intermediate`
+        // FIXME: without notice - although if the first point could be neglected, the second one can be solved, the only problem remaining is that once
+        // FIXME: we compared the thread local states, we have to perform a global update that is propagated down to the source of the compare
+        // FIXME: if we do that we have replaced the global state source and have replaced the local one, the only problem remaining still
+        // FIXME: is if another thread tries to perform a compare_exchange, but this could be solved by using compare_exchange on the global state source
+        // FIXME: and acquiring the update lock. but if the update failed we have to somehow update the local state because otherwise we could
+        // FIXME: run into an infinite loop also what is to be considered the "global state source"? is it `curr` or `updated` - or both in some weird way?
+        // FIXME: if the local has some `intermediate` value then we can simply use said value for comparison (but only if the provided source is also `intermediate`)
+        // FIXME: OR maybe even then?
         if !self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             return false;
         }
@@ -616,12 +656,57 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop
         // and we also know, that the pointer has to be non-null
         let data = unsafe { self.parent.inner.get().as_mut().unwrap_unchecked() };
         // release the reference we hold
-        data.ref_cnt -= 1;
-        if data.ref_cnt == 0 {
-            // SAFETY: This is safe because we know that the reference count
-            // was 1 before we just decremented it and thus we know that
-            // `inner` has to be initialized right now.
-            unsafe { data.inner.assume_init_drop(); }
+        if unsafe { self.fake_ref.as_ptr() == data.curr.val.assume_init_ref() }.as_ptr() {
+            data.curr.ref_cnt -= 1;
+            if data.curr.ref_cnt == 0 {
+                // SAFETY: This is safe because we know that the reference count
+                // was 1 before we just decremented it and thus we know that
+                // `inner` has to be initialized right now.
+                // unsafe { data.inner.assume_init_drop(); }
+
+                if !data.new_ptr.is_null() {
+                    unsafe { data.curr.val.assume_init_drop() };
+                    data.curr = mem::take(&mut data.new);
+                    if !data.intermediate_ptr.is_null() {
+                        data.new = mem::take(&mut data.intermediate);
+                        data.new_ptr = data.intermediate_ptr;
+                        data.intermediate_ptr = null();
+                        self.parent.intermediate_update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+                    } else {
+                        data.new_ptr = null();
+                        if data.new_src == RefSource::Curr {
+                            self.parent.update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+                        } else {
+                            self.parent.intermediate_update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+                        }
+                    }
+                } else {
+                    // FIXME: try update!
+                    // data.parent.thread_local.iter()
+                    // FIXME: go through all thread locals and check if
+                    // signal that this thread has no pending updates
+                }
+            }
+        } else if self.fake_ref.as_ptr() == data.new_ptr {
+            data.new.ref_cnt -= 1;
+            if data.new.ref_cnt == 0 {
+                if !data.intermediate_ptr.is_null() {
+                    data.new = mem::take(&mut data.intermediate);
+                    data.new_ptr = data.intermediate_ptr;
+                    data.intermediate_ptr = null();
+                    // FIXME: we could optimize the `Arc` ref counting by only increasing and decreasing the ref counts of the thread locals that get used.
+                    self.parent.update.store(data.new_ptr.cast_mut(), Ordering::SeqCst);
+                    self.parent.intermediate_update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+                } else {
+                    data.new_ptr = null();
+                    self.parent.update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+                }
+            }
+        } else {
+            data.intermediate.ref_cnt -= 1;
+            if data.intermediate.ref_cnt == 0 {
+                self.parent.intermediate_update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
+            }
         }
     }
 }
