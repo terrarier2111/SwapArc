@@ -191,7 +191,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
             };
         }
         if data.intermediate_ptr.is_null() {
-            let ptr = if parent.intermediate_update.load(Ordering::Acquire).cast_const() != data.new_ptr {
+            let intermediate = parent.intermediate_update.load(Ordering::Acquire);
+            // check if there is a new intermediate value and that the intermediate value has been verified to be usable
+            // (it doesn't have the `IN_USE_FLAG` and the `UPDATE_FLAG` set)
+            let ptr = if intermediate.expose_addr() & META_DATA_MASK != META_DATA_MASK &&
+                intermediate.cast_const() != data.new_ptr {
                 let loaded = parent.intermediate_update.fetch_or(IN_USE_FLAG, Ordering::SeqCst).map_addr(|x| x & !META_DATA_MASK);
                 data.intermediate_ptr = loaded.0;
                 data.intermediate = LocalCounted {
@@ -385,7 +389,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
         if self.try_update(updated) != Some(true) {
             // if the update failed, store it in the update `cache` such that it will be performed
             // later, if possible.
-            // FIXME: actually use updated in other places in order to perform the `cached` updates, once possible
+            // FIXME: actually use SwapArcIntermediateTLS's `updated` field in other places in order to perform the `cached` updates, once possible
             self.updated.store(updated.cast_mut(), Ordering::Release);
         }
     }
@@ -405,9 +409,13 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
         // FIXME: if we do that we have replaced the global state source and have replaced the local one, the only problem remaining still
         // FIXME: is if another thread tries to perform a compare_exchange, but this could be solved by using compare_exchange on the global state source
         // FIXME: and acquiring the update lock. but if the update failed we have to somehow update the local state because otherwise we could
-        // FIXME: run into an infinite loop also what is to be considered the "global state source"? is it `curr` or `updated` - or both in some weird way?
+        // FIXME: run into an infinite loop (QUESTION: is this really true? because if we load the most recent value from local, we won't get an expired one -
+        // FIXME: the only possible thing that i can think of right now is when intermediate is not null but even then intermediate should always contain
+        // FIXME: the most recent value and there shouldn't be a more recent one in global state sources (except for `updated` - but only if that is to be
+        // FIXME: considered a "global state source")
+        // FIXME: also what is to be considered the "global state source"? is it `curr` or `updated` - or both in some weird way?
         // FIXME: if the local has some `intermediate` value then we can simply use said value for comparison (but only if the provided source is also `intermediate`)
-        // FIXME: OR maybe even then?
+        // FIXME: OR maybe even if not?
         if !self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             return false;
         }
