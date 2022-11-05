@@ -158,28 +158,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                 fake_ref,
             };
         }
-        /*
-        data.ref_cnt += 1;
-        if data.intermediate_ptr == data.new_ptr {
-            if parent.update.compare_exchange(!STATE_IN_USE, Ordering::SeqCst).is_ok() {
-
-            }
-            let loaded =  // FIXME: try reducing this ordering!
-                .map_addr(|x| x & !IDLE_MARKER);
-            if !loaded.is_null() {
-                data.new_val_ptr = loaded;
-                data.new_val = ManuallyDrop::new(D::from(loaded));
-            }
-        } else {
-
-        }
-        // FIXME: try using intermediate value instead
-        let fake_ref = ManuallyDrop::new(D::from(data.val.as_ptr()));
-        SwapArcIntermediateGuard {
-            parent,
-            // SAFETY: we know that this is safe because the ref count is non-zero
-            fake_ref,
-        }*/
         if data.new.ref_cnt == 0 {
             let ptr = if parent.parent.ptr.load(Ordering::Acquire) != unsafe { data.curr.val.assume_init_ref() }.as_ptr().cast_mut() {
                 let curr = self.clone().load_internal();
@@ -232,6 +210,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                 fake_ref,
             };
         } else {
+            data.intermediate.ref_cnt += 1;
             let fake_ref = ManuallyDrop::new(D::from(data.intermediate.ptr));
             return SwapArcIntermediateGuard {
                 parent: &parent,
@@ -246,10 +225,12 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
 
     pub unsafe fn load_raw<'a>(self: &'a Arc<Self>) -> SwapArcIntermediatePtrGuard<'a, T, D, METADATA_PREFIX_BITS> {
         let guard = ManuallyDrop::new(self.load());
-        // FIXME: provide metadata as well (it is cutted off of ptrs when using `load`)
+        let curr_meta = {
+            Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire)) // FIXME: is this okay - even, when `intermediate` is getting updated?
+        };
         SwapArcIntermediatePtrGuard {
             parent: guard.parent,
-            ptr: guard.fake_ref.as_ptr(),
+            ptr: guard.fake_ref.as_ptr().map_addr(|x| x | curr_meta),
         }
     }
 
@@ -292,7 +273,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                     self.ptr.store(intermediate, Ordering::Release);
                     // unset the update flag
                     self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
-                    println!("UPDATE status: {}", (self.intermediate_ref_cnt.load(Ordering::SeqCst) & Self::UPDATE != 0));
                     // unset the `weak` update flag from the intermediate ref cnt
                     self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::SeqCst); // FIXME: are we sure this can't happen if there is UPDATE set for intermediate_ref?
                     // drop the `virtual reference` we hold to the Arc
@@ -341,82 +321,18 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
         }
     }
 
-    /*
-    fn try_update(&self, val: *const T) -> Option<bool> {
-        let curr = self.curr.fetch_or(GLOBAL_UPDATE_FLAG, Ordering::SeqCst);
-        if curr & GLOBAL_UPDATE_FLAG != 0 {
-            return None;
-        }
-        for local in self.thread_local.iter() {
-            let mapped = val.map_addr(|x| x | UPDATE_FLAG | IN_USE_FLAG).cast_mut();
-            // the thread this `local` belongs to didn't already update and
-            // it isn't idling
-            // note: the `UPDATE_FLAG` has a different meaning for `intermediate` and for `update` (although one could say that it has the exact sane meaning)
-            // for `intermediate` it means that `update` has a pending update, but if `IN_USE_FLAG` is set for it as well, it means it is currently being updated
-            // for `update` it means that itself has a pending update
-            if !local.intermediate_update.compare_exchange(curr, mapped, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
-                // fixup states for all thread locals
-                for local in self.thread_local.iter() {
-                    if !local.intermediate_update.compare_exchange(mapped, local.update.load(Ordering::SeqCst).map_addr(|x| x & !META_DATA_MASK), Ordering::SeqCst, Ordering::Relaxed).is_ok() {
-                        break;
-                    }
-                }
-                return Some(false);
-            }
-        }
-        for local in self.thread_local.iter() {
-            local.intermediate_update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
-            let curr = local.update.fetch_or(UPDATE_FLAG, Ordering::SeqCst);
-            if curr.expose_addr() & IN_USE_FLAG == 0 {
-                local.update.store(val.cast_mut(), Ordering::SeqCst);
-                local.intermediate_update.fetch_and(!UPDATE_FLAG, Ordering::SeqCst);
-            }
-        }
-        self.curr.store(val.cast_mut(), Ordering::Release);
-        Some(true)
-    }
-
-    fn try_update_locals(&self, curr: *mut T, val: *const T) -> bool {
-        for local in self.thread_local.iter() {
-            let mapped = val.map_addr(|x| x | UPDATE_FLAG | IN_USE_FLAG).cast_mut();
-            // the thread this `local` belongs to didn't already update and
-            // it isn't idling
-            // note: the `UPDATE_FLAG` has a different meaning for `intermediate` and for `update` (although one could say that it has the exact sane meaning)
-            // for `intermediate` it means that `update` has a pending update, but if `IN_USE_FLAG` is set for it as well, it means it is currently being updated
-            // for `update` it means that itself has a pending update
-            if !local.intermediate_update.compare_exchange(curr, mapped, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
-                // fixup states for all thread locals
-                for local in self.thread_local.iter() {
-                    if !local.intermediate_update.compare_exchange(mapped, local.update.load(Ordering::SeqCst).map_addr(|x| x & !META_DATA_MASK), Ordering::SeqCst, Ordering::Relaxed).is_ok() {
-                        break;
-                    }
-                }
-                return false;
-            }
-        }
-        for local in self.thread_local.iter() {
-            local.intermediate_update.fetch_and(!IN_USE_FLAG, Ordering::SeqCst);
-            let curr = local.update.fetch_or(UPDATE_FLAG, Ordering::SeqCst);
-            if curr.expose_addr() & IN_USE_FLAG == 0 {
-                local.update.store(val.cast_mut(), Ordering::Release); // FIXME: this can probably lead to a data race with thread locals loading things (and setting the IN_USE_FLAG in the process)
-                local.intermediate_update.fetch_and(!UPDATE_FLAG, Ordering::Release);
-            }
-        }
-        true
-    }*/
-
     pub fn update(&self, updated: D) {
         unsafe { self.update_raw(updated.as_ptr()); }
     }
 
     unsafe fn update_raw(&self, updated: *const T) {
         let updated = Self::strip_metadata(updated);
+        let new = updated.cast_mut();
+        let tmp = ManuallyDrop::new(D::from(new));
+        tmp.increase_ref_cnt();
         loop {
             match self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::SeqCst, Ordering::SeqCst) {
                 Ok(_) => {
-                    let new = updated.cast_mut();
-                    let tmp = ManuallyDrop::new(D::from(new));
-                    tmp.increase_ref_cnt();
                     // clear out old updates to make sure our update won't be overwritten by them in the future
                     let old = self.updated.swap(null_mut(), Ordering::SeqCst);
                     let metadata = Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire));
@@ -448,9 +364,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                         // somebody else already updates the current ptr, so we wait until they finish their update
                         continue;
                     }
-                    let new = updated.cast_mut();
-                    let tmp = ManuallyDrop::new(D::from(new));
-                    tmp.increase_ref_cnt();
                     // push our update up, so it will be applied in the future
                     let old = self.updated.swap(new, Ordering::SeqCst); // FIXME: should we add some sort of update counter
                     // FIXME: to determine which update is the most recent?
@@ -462,13 +375,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                 }
             }
         }
-        /*
-        if self.try_update(updated) != Some(true) {
-            // if the update failed, store it in the update `cache` such that it will be performed
-            // later, if possible.
-            // FIXME: actually use SwapArcIntermediateTLS's `updated` field in other places in order to perform the `cached` updates, once possible
-            self.updated.store(updated.cast_mut(), Ordering::Release);
-        }*/
     }
 
     unsafe fn try_compare_exchange<const IGNORE_META: bool>(&self, old: *const T, new: D/*&SwapArcIntermediateGuard<'_, T, D>*/) -> Result</*Option<*/bool/*>*/, D> {
@@ -533,51 +439,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
             Err(_) => {}
         }
         Ok(true)
-        /*
-        if IGNORE_META {
-            match self.curr.compare_exchange(old.cast_mut(), new.as_ptr().cast_mut().map_addr(|x| x | GLOBAL_UPDATE_FLAG), Ordering::SeqCst, Ordering::Acquire) {
-                Ok(_) => {
-                    if !self.try_update_locals(old.cast_mut(), new.as_ptr()) {
-                        self.curr.fetch_and(!GLOBAL_UPDATE_FLAG, Ordering::Release);
-                        return Err(new);
-                    }
-                    // leak reference to new ptr
-                    mem::forget(new);
-                    // release the old reference
-                    D::from(old);
-                    self.curr.fetch_and(!GLOBAL_UPDATE_FLAG, Ordering::Release);
-                    Ok(Some(true))
-                }
-                Err(actual) => {
-                    if actual.expose_addr() & GLOBAL_UPDATE_FLAG != 0 {
-                        // we can't know whether the new thingy will be the same as the old one or not
-                        return Ok(None);
-                    }
-                    Ok(Some(false))
-                }
-            }
-        } else {
-            let curr = self.curr.fetch_or(GLOBAL_UPDATE_FLAG, Ordering::SeqCst);
-            if curr.expose_addr() & GLOBAL_UPDATE_FLAG != 0 {
-                // we can't know whether the new thingy will be the same as the old one or not
-                return Ok(None);
-            }
-            if curr == old.cast_mut() {
-                if !self.try_update_locals(old.cast_mut(), new.as_ptr()) {
-                    self.curr.fetch_and(!GLOBAL_UPDATE_FLAG, Ordering::Release);
-                    return Err(new);
-                }
-                // leak reference to new ptr
-                mem::forget(new);
-                // release the old reference
-                D::from(old);
-                self.curr.fetch_and(!GLOBAL_UPDATE_FLAG, Ordering::Release);
-                Ok(Some(true))
-            } else {
-                self.curr.fetch_and(!GLOBAL_UPDATE_FLAG, Ordering::Release);
-                Ok(Some(false))
-            }
-        }*/
     }
 
     // FIXME: this causes "deadlocks" if there are any other references alive
@@ -685,41 +546,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
         UpdateResult::Ok
     }*/
 
-    /*
-    fn load_local(self: &Arc<Self>) -> (&LocalData<T, D, METADATA_PREFIX_BITS>, bool) {
-        let mut new = false;
-        let parent = self.thread_local.get_or(|| {
-            new = true;
-            /*LocalData {
-                inner: MaybeUninit::new(self.clone().load_internal()),
-                ref_cnt: 1,
-            }*/
-            let mut curr = self.curr.fetch_or(GLOBAL_UPDATE_FLAG, Ordering::SeqCst); // FIXME: is it okay to have a blocking solution here?
-            let mut back_off = 1;
-            while curr & GLOBAL_UPDATE_FLAG != 0 {
-                curr = self.curr.fetch_or(GLOBAL_UPDATE_FLAG, Ordering::SeqCst);
-                // back-off
-                thread::sleep(Duration::from_micros(10 * back_off));
-                back_off += 1;
-            }
-            // increase the reference count
-            let tmp = ManuallyDrop::new(D::from(curr));
-            mem::forget(tmp.clone());
-            // we know the current state of the ptr stored in curr
-            self.curr.fetch_and(GLOBAL_UPDATE_FLAG, Ordering::Release);
-            LocalData {
-                parent: self.clone(),
-                inner: UnsafeCell::new(LocalDataInner {
-                    intermediate: LocalCounted { val: MaybeUninit::uninit(), ptr: null(), ref_cnt: 0, },
-                    new: LocalCounted { val: MaybeUninit::uninit(), ptr: null(), ref_cnt: 0, },
-                    // FIXME: increase ref count
-                    curr: LocalCounted { val: MaybeUninit::new(D::from(curr)), ptr: curr, ref_cnt: 1, }
-                }),
-            }
-        });
-        (parent, new)
-    }*/
-
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcIntermediateTLS<T, D, METADATA_PREFIX_BITS> {
@@ -735,13 +561,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop
             // FIXME: the reason why we have to do this currently is because the update function doesn't work properly, fix the root cause!
             D::from(intermediate);
         }
-        /*for x in self.thread_local.iter() {
-            let mut data = unsafe { x.inner.get().as_mut() }.unwrap();
-            unsafe { data.curr.val.assume_init_drop() };
-            if !data.new.ptr.is_null() {
-                unsafe { data.new.val.assume_init_drop() };
-            }
-        }*/
         // drop the current arc
         D::from(curr);
     }
@@ -909,23 +728,18 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop
         // release the reference we hold
         match self.ref_src {
             RefSource::Curr => {
-                // let ref_cnt = self.parent.curr_ref_cnt.load(Ordering::SeqCst);
                 let ref_cnt = self.parent.curr_ref_cnt.fetch_sub(1, Ordering::SeqCst);
                 if ref_cnt == 1 {
                     self.parent.try_update_curr();
                 }
-                // self.parent.curr_ref_cnt.fetch_sub(1, Ordering::SeqCst);
             }
             RefSource::Intermediate => {
-                // FIXME: do we actually have to load the ref cnt before subtracting 1 from it?
-                // let ref_cnt = self.parent.intermediate_ref_cnt.load(Ordering::SeqCst);
                 let ref_cnt = self.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
                 // fast-rejection path to ensure we are only trying to update if it's worth it
                 // FIXME: this probably isn't correct: Note: UPDATE is set (seldom) on the immediate ref_cnt if there is a forced update waiting in the queue
                 if (ref_cnt == 1/* || ref_cnt == SwapArcIntermediate::<T>::UPDATE*/) && !self.parent.updated.load(Ordering::Acquire).is_null() {
                     self.parent.try_update_intermediate();
                 }
-                // self.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
             }
         }
     }

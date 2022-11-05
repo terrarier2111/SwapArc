@@ -23,10 +23,15 @@ fn main() {
     for _ in 0..20/*5*//*1*/ {
         let tmp = tmp.clone();
         threads.push(thread::spawn(move || {
-            for x in 0..10/*200*/ {
-                println!("{}", tmp.load());
+            for x in 0..50/*200*/ {
+                let l1 = tmp.load();
+                let l2 = tmp.load();
+                let l3 = tmp.load();
+                let l4 = tmp.load();
+                let l5 = tmp.load();
+                println!("{}{}{}{}{}", l1, l2, l3, l4, l5);
                 if x % 5 == 0 {
-                    println!("completed push: {x}");
+                    println!("completed load: {x}");
                 }
                 // thread::sleep(Duration::from_millis(1000));
             }
