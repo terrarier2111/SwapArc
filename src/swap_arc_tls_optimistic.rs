@@ -3,7 +3,7 @@ use std::{mem, ptr, thread};
 use std::borrow::Borrow;
 use std::cell::UnsafeCell;
 use std::fmt::{Debug, Display, Formatter};
-use std::intrinsics::unlikely;
+use std::intrinsics::{likely, unlikely};
 use std::mem::{align_of, ManuallyDrop, MaybeUninit, transmute};
 use std::num::Wrapping;
 use std::ops::Deref;
@@ -122,6 +122,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
         })
     }*/
 
+    #[inline(never)]
     pub fn load<'a>(self: &'a Arc<Self>) -> SwapArcIntermediateGuard<'a, T, D, METADATA_PREFIX_BITS> {
         let mut new = false;
         let parent = self.thread_local.get_or(|| {
@@ -154,31 +155,15 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
                 gen_cnt: data.curr.gen_cnt,
             };
         }
-        if data.new.ref_cnt == 0 {
-            let (ptr, gen_cnt) = if Self::strip_metadata(parent.parent.ptr.load(Ordering::Acquire)) != data.curr.ptr.cast_mut() {
-                let curr = self.clone().load_internal();
-                // increase the strong reference count
-                mem::forget(curr.fake_ref.clone());
-                let new_ptr = curr.fake_ref.as_ptr();
 
-                let gen_cnt = if data.curr.ref_cnt == 0 {
-                    // don't modify the gen_cnt
-                    data.curr.refill_unchecked(new_ptr);
-                    data.curr.gen_cnt
-                } else {
-                    // data.new.refill(data, new_ptr);
-                    if data.new.gen_cnt != 0 {
-                        data.new.refill_unchecked(new_ptr);
-                    } else {
-                        let new = LocalCounted::new(data, new_ptr);
-                        data.new = new;
-                    }
-                    data.new.gen_cnt
-                };
-                (new_ptr, gen_cnt)
-            } else {
+
+        // FIXME: try doing all the drop checks and updates inside here!
+        if likely(data.new.ref_cnt == 0) {
+            let (ptr, gen_cnt) = if likely(Self::strip_metadata(parent.parent.ptr.load(Ordering::Acquire)) == data.curr.ptr) {
                 data.curr.ref_cnt += 1;
                 (data.curr.ptr, data.curr.gen_cnt)
+            } else {
+                load_new_slow(self, data)
             };
             let fake_ref = ManuallyDrop::new(D::from(ptr));
             return SwapArcIntermediateGuard {
@@ -188,45 +173,94 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
                 gen_cnt,
             };
         }
-        if data.intermediate.ref_cnt == 0 {
-            let intermediate = Self::strip_metadata(parent.parent.intermediate_ptr.load(Ordering::Acquire));
-            // check if there is a new intermediate value and that the intermediate value has been verified to be usable
-            let (ptr, gen_cnt) = if intermediate != data.new.ptr {
-                let loaded = parent.parent.intermediate_ref_cnt.fetch_add(1, Ordering::SeqCst);
-                if loaded & Self::UPDATE == 0 {
-                    let loaded = Self::strip_metadata(parent.parent.intermediate_ptr.load(Ordering::Acquire)); // FIXME: using this leads to a use-after-free bug!
-                    // data.intermediate.refill(data, loaded);
-                    if data.intermediate.gen_cnt != 0 {
-                        data.intermediate.refill_unchecked(loaded);
-                    } else {
-                        let new = LocalCounted::new(data, loaded);
-                        data.intermediate = new;
-                    }
-                    (loaded, data.intermediate.gen_cnt)
+
+        #[cold]
+        fn load_new_slow<'a, T, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(this: &'a Arc<SwapArcIntermediateTLS<T, D, { META_DATA_BITS }>>, data: &'a mut LocalDataInner<T, D>) -> (*const T, usize) {
+            let curr = this.clone().load_internal();
+            // increase the strong reference count
+            mem::forget(curr.fake_ref.clone());
+            let new_ptr = curr.fake_ref.as_ptr();
+
+            let gen_cnt = if data.curr.ref_cnt == 0 {
+                // don't modify the gen_cnt
+                data.curr.refill_unchecked(new_ptr);
+                data.curr.gen_cnt
+            } else {
+                // data.new.refill(data, new_ptr);
+                if data.new.gen_cnt != 0 {
+                    data.new.refill_unchecked(new_ptr);
                 } else {
+                    let new = LocalCounted::new(data, new_ptr);
+                    data.new = new;
+                }
+                data.new.gen_cnt
+            };
+            (new_ptr, gen_cnt)
+        }
+
+        #[cold]
+        fn load_slow<'a, T, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(parent: &'a LocalData<T, D, META_DATA_BITS>, data: &mut LocalDataInner<T, D>) -> SwapArcIntermediateGuard<'a, T, D, META_DATA_BITS> {
+            if data.curr.ref_cnt == 0 {
+                // we can do the `curr` update on load because we know that we have a strong reference
+                // to the value stored inside `ptr` anyways, so it doesn't really matter when exactly we update `curr`
+                // and this allows us to save many branches on drop
+                data.curr = mem::take(&mut data.new);
+                if data.intermediate.ref_cnt != 0 {
+                    data.new = mem::take(&mut data.intermediate).make_drop();
+                    // increase the ref count of the new value
+                    mem::forget(data.new.val().clone());
                     parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                    let fake_ref = ManuallyDrop::new(D::from(data.new.ptr));
+                    return SwapArcIntermediateGuard {
+                        parent,
+                        fake_ref,
+                        gen_cnt: data.new.gen_cnt,
+                    };
+                }
+                // FIXME: what do we do here? `curr` was replaced by `new` and `new` is empty now, do we return now, or do we allow a potential update of `intermediate`?
+            }
+            if data.intermediate.ref_cnt == 0 {
+                let intermediate = SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(parent.parent.intermediate_ptr.load(Ordering::Acquire));
+                // check if there is a new intermediate value and that the intermediate value has been verified to be usable
+                let (ptr, gen_cnt) = if intermediate != data.new.ptr {
+                    let loaded = parent.parent.intermediate_ref_cnt.fetch_add(1, Ordering::SeqCst);
+                    if loaded & SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::UPDATE == 0 {
+                        let loaded = SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(parent.parent.intermediate_ptr.load(Ordering::Acquire)); // FIXME: using this leads to a use-after-free bug!
+                        // data.intermediate.refill(data, loaded);
+                        if data.intermediate.gen_cnt != 0 {
+                            data.intermediate.refill_unchecked(loaded);
+                        } else {
+                            let new = LocalCounted::new(data, loaded);
+                            data.intermediate = new;
+                        }
+                        (loaded, data.intermediate.gen_cnt)
+                    } else {
+                        parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                        data.new.ref_cnt += 1;
+                        (data.new.ptr, data.new.gen_cnt)
+                    }
+                } else {
                     data.new.ref_cnt += 1;
                     (data.new.ptr, data.new.gen_cnt)
-                }
+                };
+                let fake_ref = ManuallyDrop::new(D::from(ptr));
+                return SwapArcIntermediateGuard {
+                    parent,
+                    fake_ref,
+                    gen_cnt,
+                };
             } else {
-                data.new.ref_cnt += 1;
-                (data.new.ptr, data.new.gen_cnt)
-            };
-            let fake_ref = ManuallyDrop::new(D::from(ptr));
-            return SwapArcIntermediateGuard {
-                parent,
-                fake_ref,
-                gen_cnt,
-            };
-        } else {
-            data.intermediate.ref_cnt += 1;
-            let fake_ref = ManuallyDrop::new(D::from(data.intermediate.ptr)); // FIXME: for some reason this gives us UB ("error: Undefined Behavior: overflowing in-bounds pointer arithmetic")
-            return SwapArcIntermediateGuard {
-                parent: &parent,
-                fake_ref,
-                gen_cnt: data.intermediate.gen_cnt,
-            };
+                data.intermediate.ref_cnt += 1;
+                let fake_ref = ManuallyDrop::new(D::from(data.intermediate.ptr)); // FIXME: for some reason this gives us UB ("error: Undefined Behavior: overflowing in-bounds pointer arithmetic")
+                return SwapArcIntermediateGuard {
+                    parent: &parent,
+                    fake_ref,
+                    gen_cnt: data.intermediate.gen_cnt,
+                };
+            }
         }
+
+        load_slow(parent, data)
     }
 
     pub fn load_full(self: &Arc<Self>) -> D {
@@ -682,54 +716,55 @@ pub struct SwapArcIntermediateGuard<'a, T, D: DataPtrConvert<T> = Arc<T>, const 
 }
 
 impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcIntermediateGuard<'_, T, D, METADATA_PREFIX_BITS> {
+    // #[inline]
     fn drop(&mut self) {
         // SAFETY: This is safe because we know that we are the only thread that
         // is able to access the thread local data at this time and said data has to be initialized
         // and we also know, that the pointer has to be non-null
         let data = unsafe { self.parent.inner.get().as_mut().unwrap_unchecked() };
         // release the reference we hold
-        if self.gen_cnt == data.curr.gen_cnt {
+        if likely(self.gen_cnt == data.curr.gen_cnt) {
             /*if data.curr.ref_cnt == 0 {
                 println!("1: {} | 2: {} | 3: {} | 4: {}", self.fake_ref.as_ptr() == data.new.ptr, data.new.ref_cnt, self.fake_ref.as_ptr() == data.intermediate.ptr, data.intermediate.ref_cnt);
             }*/
-            data.curr.ref_cnt -= 1; // FIXME: this sometimes subtracts below 0 - this is probably fixed!
-            if data.curr.ref_cnt == 0 {
-                if !data.new.ptr.is_null() {
+            data.curr.ref_cnt -= 1;
+            /*if data.curr.ref_cnt == 0 {
                     if data.new.ref_cnt != 0 {
                         data.curr = mem::take(&mut data.new);
-                        if !data.intermediate.ptr.is_null() {
                             if data.intermediate.ref_cnt != 0 {
                                 data.new = mem::take(&mut data.intermediate).make_drop();
                                 // increase the ref count of the new value
                                 mem::forget(data.new.val().clone());
                                 self.parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
-                            } else {
+                            }/* else if !data.intermediate.ptr.is_null() {
                                 // FIXME: add a fallback case for this!
-                            }
-                        }
-                    } else {
+                            }*/
+                    }/* else if !data.new.ptr.is_null() {
                         // FIXME: add a fallback case for this!
-                    }
-                }
-            }
-        } else if self.gen_cnt == data.new.gen_cnt {
-            data.new.ref_cnt -= 1;
-            if data.new.ref_cnt == 0 {
-                if !data.intermediate.ptr.is_null() {
+                    }*/
+            }*/
+        } else {
+            slow_drop(self.parent, data, self.gen_cnt);
+        }
+        #[cold]
+        fn slow_drop<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>(parent: &LocalData<T, D, METADATA_BITS>, data: &mut LocalDataInner<T, D>, gen_cnt: usize) {
+            if gen_cnt == data.new.gen_cnt {
+                data.new.ref_cnt -= 1;
+                if data.new.ref_cnt == 0 {
                     if data.intermediate.ref_cnt != 0 {
                         data.new = mem::take(&mut data.intermediate).make_drop();
                         // increase the ref count of the new value
                         mem::forget(data.new.val().clone());
-                        self.parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
-                    } else {
+                        parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                    }/* else if !data.intermediate.ptr.is_null() {
                         // FIXME: add a fallback case for this!
-                    }
+                    }*/
                 }
-            }
-        } else {
-            data.intermediate.ref_cnt -= 1;
-            if data.intermediate.ref_cnt == 0 {
-                self.parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+            } else {
+                data.intermediate.ref_cnt -= 1;
+                if data.intermediate.ref_cnt == 0 {
+                    parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                }
             }
         }
     }
@@ -759,12 +794,14 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> AsRef<D> for Swap
 }
 
 impl<T, D: DataPtrConvert<T> + Display, const METADATA_PREFIX_BITS: u32> Display for SwapArcIntermediateGuard<'_, T, D, METADATA_PREFIX_BITS> {
+    #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         D::fmt(self.as_ref(), f)
     }
 }
 
 impl<T, D: DataPtrConvert<T> + Debug, const METADATA_PREFIX_BITS: u32> Debug for SwapArcIntermediateGuard<'_, T, D, METADATA_PREFIX_BITS> {
+    #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         D::fmt(self.as_ref(), f)
     }
@@ -801,12 +838,14 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcI
 }
 
 impl<T, D: DataPtrConvert<T> + Display, const METADATA_PREFIX_BITS: u32> Display for SwapArcIntermediateInternalGuard<T, D, METADATA_PREFIX_BITS> {
+    #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         D::fmt(self.fake_ref.deref(), f)
     }
 }
 
 impl<T, D: DataPtrConvert<T> + Debug, const METADATA_PREFIX_BITS: u32> Debug for SwapArcIntermediateInternalGuard<T, D, METADATA_PREFIX_BITS> {
+    #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         D::fmt(self.fake_ref.deref(), f)
     }
@@ -864,6 +903,7 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
         }
     }
 
+    #[inline]
     fn val(&self) -> ManuallyDrop<D> {
         ManuallyDrop::new(D::from(self.ptr))
     }
@@ -894,6 +934,7 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
 
 impl<T, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
 
+    #[inline]
     fn make_drop(mut self) -> LocalCounted<T, D, true> {
         LocalCounted {
             gen_cnt: self.gen_cnt,
@@ -906,6 +947,7 @@ impl<T, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
 }
 
 impl<T, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCounted<T, D, DROP> {
+    #[inline]
     fn default() -> Self {
         Self {
             gen_cnt: 0,
@@ -970,6 +1012,7 @@ unsafe impl<T> RefCnt for Arc<T> {}
 impl<T> DataPtrConvert<T> for Arc<T> {
     const INVALID: *const T = null();
 
+    #[inline]
     fn from(ptr: *const T) -> Self {
         unsafe { Arc::from_raw(ptr) }
     }
@@ -981,6 +1024,7 @@ impl<T> DataPtrConvert<T> for Arc<T> {
         ret
     }
 
+    #[inline]
     fn as_ptr(&self) -> *const T {
         Arc::as_ptr(self)
     }
