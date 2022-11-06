@@ -136,8 +136,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
                 parent: ManuallyDrop::new(unsafe { Arc::from_raw(Arc::as_ptr(self)) }),
                 inner: UnsafeCell::new(LocalDataInner {
                     next_gen_cnt: 2,
-                    intermediate: LocalCounted { gen_cnt: 0, ptr: null(), ref_cnt: 0, _phantom_data: Default::default() },
-                    new: LocalCounted { gen_cnt: 0, ptr: null(), ref_cnt: 0, _phantom_data: Default::default() },
+                    intermediate: LocalCounted::default(),
+                    new: LocalCounted::default(),
                     curr: LocalCounted { gen_cnt: 1, ptr: curr_ptr, ref_cnt: 1, _phantom_data: Default::default() }
                 }),
             }
@@ -274,7 +274,11 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
     }
 
     fn try_update_curr(&self) -> bool {
-        match self.curr_ref_cnt.compare_exchange(0, Self::UPDATE, Ordering::SeqCst, Ordering::Relaxed) {
+        if self.intermediate_ref_cnt.fetch_or(Self::OTHER_UPDATE, Ordering::SeqCst) & Self::OTHER_UPDATE != 0 {
+            // an other update is already happening, so we can't do our update
+            return false;
+        }
+        let ret = match self.curr_ref_cnt.compare_exchange(0, Self::UPDATE, Ordering::SeqCst, Ordering::Relaxed) {
             Ok(_) => {
                 // FIXME: can we somehow bypass intermediate if we have a new update upcoming - we probably can't because this would probably cause memory leaks and other funny things that we don't like
                 let intermediate = self.intermediate_ptr.load(Ordering::SeqCst);
@@ -284,8 +288,6 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
                     self.ptr.store(intermediate, Ordering::Release);
                     // unset the update flag
                     self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
-                    // unset the `weak` update flag from the intermediate ref cnt
-                    self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::SeqCst); // FIXME: are we sure this can't happen if there is UPDATE set for intermediate_ref?
                     // drop the `virtual reference` we hold to the Arc
                     D::from(Self::strip_metadata(prev));
                 } else {
@@ -295,7 +297,13 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
                 true
             }
             _ => false,
+        };
+        // unset the `weak` update flag from the intermediate ref cnt
+        let test = self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::SeqCst); // FIXME: are we sure this can't happen if there is UPDATE set for intermediate_ref?
+        if test & Self::UPDATE != 0 {
+            println!("FATAL ERROR!!! (1)");
         }
+        ret
     }
 
     fn try_update_intermediate(&self) {
@@ -340,6 +348,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
         let updated = Self::strip_metadata(updated);
         let new = updated.cast_mut();
         let tmp = ManuallyDrop::new(D::from(new));
+        // increase the ref count
         mem::forget(tmp.clone());
         let backoff = Backoff::new();
         loop {
@@ -775,7 +784,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcI
             RefSource::Curr => {
                 let ref_cnt = self.parent.curr_ref_cnt.fetch_sub(1, Ordering::SeqCst);
                 if ref_cnt == 1 {
-                    self.parent.try_update_curr();
+                    self.parent.try_update_curr(); // FIXME: couldn't this set the update flag for `curr` while `intermediate` has an update flag set as well?
+                                                    // FIXME: we probably have to set the `UPDATE_OTHER` flag on intermediate immediately
                 }
             }
             RefSource::Intermediate => {
