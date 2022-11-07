@@ -4,6 +4,7 @@
 #![feature(const_option_ext)]
 #![feature(test)]
 #![allow(soft_unstable)]
+#![feature(bench_black_box)]
 
 mod swap_arc_intermediate;
 mod swap_arc_tls;
@@ -13,6 +14,8 @@ mod swap_arc_tls_optimistic;
 
 use std::{mem, thread};
 use std::hint::{black_box, spin_loop};
+use std::mem::transmute;
+use std::ops::Range;
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,6 +24,27 @@ use crate::swap_arc_tls_optimistic::SwapArcIntermediateTLS;
 extern crate test;
 use test::Bencher;
 use arc_swap::ArcSwap;
+
+/// this subtracts 1 from val and if it underflows, it sets it back to `1 << shr`
+fn ranged_dec_shifted<const SHR: usize>(val: usize) -> usize {
+    let result = val.overflowing_sub(1);
+    result.0 + ((unsafe { transmute::<bool, u8>(result.1) } as usize) << SHR)
+}
+
+/// this adds 1 to val and if it overflows, it sets it back to `1 << shr`
+fn ranged_dec<const MAX: u8>(val: u8) -> u8 { // FIXME: finish this!
+    const OFFSET: u8 = u8::MAX - MAX;
+    let val = val + OFFSET;
+    let result = val.overflowing_add(1);
+    result.0 + (OFFSET & (0_u8.wrapping_sub(unsafe { transmute::<bool, u8>(result.1) }))) - OFFSET
+}
+
+/// this adds 1 to val and if it overflows, it sets it back to `1 << shr`
+fn ranged_inc(val: u8, max: u8) -> u8 { // FIXME: finish this!
+    const OFFSET: u8 = u8::MAX - max;
+    let result = val.overflowing_add(1);
+    result.0 + (OFFSET & (0_u8.wrapping_sub(unsafe { transmute::<bool, u8>(result.1) })))
+}
 
 fn main() {
     /*for _ in 0..10 {
