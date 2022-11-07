@@ -4,6 +4,7 @@
 #![feature(const_option_ext)]
 #![feature(test)]
 #![allow(soft_unstable)]
+#![feature(cell_update)]
 
 mod swap_arc_intermediate;
 mod swap_arc_tls;
