@@ -302,7 +302,6 @@ fn bench_other_multi(bencher: &mut Bencher) {
     });
 }*/
 
-/*
 #[bench]
 fn bench_us_multi(bencher: &mut Bencher) {
     let tmp: Arc<SwapArcIntermediateTLS<i32, Arc<i32>, 0>> = SwapArcIntermediateTLS::new(Arc::new(0));
@@ -431,7 +430,7 @@ fn bench_other_single(bencher: &mut Bencher) {
         }
         threads.into_iter().for_each(|thread| thread.join().unwrap());
     });
-}*/
+}
 
 #[bench]
 fn bench_us_read_heavy_single(bencher: &mut Bencher) {
