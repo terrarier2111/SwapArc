@@ -11,8 +11,7 @@ use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
-use cache_padded::CachePadded;
-use crossbeam_utils::Backoff;
+use crossbeam_utils::{Backoff, CachePadded};
 use thread_local::ThreadLocal;
 
 #[derive(Copy, Clone, Debug)]
@@ -35,7 +34,11 @@ const fn most_sig_set_bit(val: usize) -> Option<u32> {
 }
 
 const fn assert_alignment<T, const METADATA_BITS: u32>() -> bool {
-    let free_bits = most_sig_set_bit(align_of::<T>()).unwrap_or(0);
+    // FIXME: use `unwrap_or` once it's const-stable
+    let free_bits = match most_sig_set_bit(align_of::<T>()) {
+        Some(val) => val,
+        None => 0,
+    };
     if free_bits < METADATA_BITS {
         /*let tmp = 1 << METADATA_BITS;
         let tmp_2 = 1 << free_bits;
@@ -98,20 +101,19 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
         })
     }
 
-    /*
     /// SAFETY: this is only safe to call if the caller increments the
     /// reference count of the "object" `val` points to.
-    unsafe fn new_raw(val: *const T) -> Arc<Self> {
+    pub unsafe fn new_raw(val: *const T) -> Arc<Self> {
+        // static_assertions::const_assert!(assert_alignment::<T, { METADATA_PREFIX_BITS }>()); // FIXME: fix this!
         Arc::new(Self {
             curr_ref_cnt: Default::default(),
             ptr: AtomicPtr::new(val.cast_mut()),
             intermediate_ref_cnt: Default::default(),
-            intermediate_ptr: AtomicPtr::new(null_mut()),
+            intermediate_ptr: AtomicPtr::new(val.cast_mut()/*null_mut()*/),
             updated: AtomicPtr::new(null_mut()),
             thread_local: ThreadLocal::new(),
-            _phantom_data: Default::default(),
         })
-    }*/
+    }
 
     // #[inline(never)]
     pub fn load<'a>(self: &'a Arc<Self>) -> SwapArcIntermediateGuard<'a, T, D, METADATA_PREFIX_BITS> {
@@ -294,11 +296,6 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
     }
 
     fn try_update_curr(&self) -> bool {
-        /*if self.curr_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::SeqCst) & Self::OTHER_UPDATE == 0 {
-            // an other update is already happening, so we can't do our update
-            // FIXME: this other update could be us, so we have to know whether we should keep on going or not.
-            return false;
-        }*/
         let ret = match self.curr_ref_cnt.compare_exchange(Self::OTHER_UPDATE, Self::UPDATE, Ordering::SeqCst, Ordering::Relaxed) {
             Ok(_) => {
                 // FIXME: can we somehow bypass intermediate if we have a new update upcoming - we probably can't because this would probably cause memory leaks and other funny things that we don't like
@@ -319,11 +316,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
                 self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::SeqCst);
                 true
             }
-            _ => false/*{
-                // we failed, let's set the update flag for the next "last" dropper to see
-                self.curr_ref_cnt.fetch_or(Self::OTHER_UPDATE, Ordering::SeqCst);
-                false
-            }*/,
+            _ => false,
         };
         ret
     }
@@ -500,12 +493,9 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
 
     // FIXME: this causes "deadlocks" if there are any other references alive
     unsafe fn try_compare_exchange_with_meta(&self, old: *const T, new: *const T) -> bool {
-        // let mut back_off_weight = 1;
         let backoff = Backoff::new();
         while !self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
             // back-off
-            /*thread::sleep(Duration::from_micros(10 * back_off_weight));
-            back_off_weight += 1;*/
             backoff.snooze();
         }
         let intermediate = self.intermediate_ptr.load(Ordering::Acquire);
@@ -628,7 +618,6 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
     /// finish and to update the ptr, even when no update
     /// is queued this will block new readers for a short
     /// amount of time, until failure got detected
-    fn dummy() {}
     fn force_update(&self) -> UpdateResult {
         let curr = self.ref_cnt.fetch_or(Self::FORCE_UPDATE, Ordering::SeqCst);
         if curr & Self::UPDATE != 0 {

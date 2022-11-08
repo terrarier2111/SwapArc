@@ -1,9 +1,9 @@
 #![feature(strict_provenance_atomic_ptr)]
 #![feature(strict_provenance)]
 #![feature(core_intrinsics)]
-#![feature(const_option_ext)]
-#![feature(test)]
+// only for testing!
 #![allow(soft_unstable)]
+#![feature(test)]
 #![feature(bench_black_box)]
 
 mod swap_arc_intermediate;
