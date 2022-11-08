@@ -190,7 +190,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
                 if data.new.gen_cnt != 0 {
                     data.new.refill_unchecked(new_ptr);
                 } else {
-                    let new = LocalCounted::new(data, new_ptr);
+                    let new = LocalCounted::new(/*data, */new_ptr);
                     data.new = new;
                 }
                 data.new.gen_cnt
@@ -632,7 +632,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcI
 pub struct SwapArcIntermediatePtrGuard<'a, T, D: DataPtrConvert<T> = Arc<T>, const METADATA_PREFIX_BITS: u32 = 0> {
     parent: &'a LocalData<T, D, METADATA_PREFIX_BITS>,
     ptr: *const T,
-    gen_cnt: usize,
+    // gen_cnt: usize,
+    src_idx: u8,
 }
 
 impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermediatePtrGuard<'_, T, D, METADATA_PREFIX_BITS> {
@@ -712,7 +713,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Debug for SwapArc
 pub struct SwapArcIntermediateGuard<'a, T, D: DataPtrConvert<T> = Arc<T>, const METADATA_PREFIX_BITS: u32 = 0> {
     parent: &'a LocalData<T, D, METADATA_PREFIX_BITS>,
     fake_ref: ManuallyDrop<D>,
-    gen_cnt: usize,
+    // gen_cnt: usize,
+    src_idx: u8,
 }
 
 impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcIntermediateGuard<'_, T, D, METADATA_PREFIX_BITS> {
@@ -723,35 +725,20 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcI
         // and we also know, that the pointer has to be non-null
         let data = unsafe { self.parent.inner.get().as_mut().unwrap_unchecked() };
         // release the reference we hold
-        if likely(self.gen_cnt == data.curr.gen_cnt) {
-            /*if data.curr.ref_cnt == 0 {
-                println!("1: {} | 2: {} | 3: {} | 4: {}", self.fake_ref.as_ptr() == data.new.ptr, data.new.ref_cnt, self.fake_ref.as_ptr() == data.intermediate.ptr, data.intermediate.ref_cnt);
-            }*/
-            data.curr.ref_cnt -= 1;
-            /*if data.curr.ref_cnt == 0 {
-                    if data.new.ref_cnt != 0 {
-                        data.curr = mem::take(&mut data.new);
-                            if data.intermediate.ref_cnt != 0 {
-                                data.new = mem::take(&mut data.intermediate).make_drop();
-                                // increase the ref count of the new value
-                                mem::forget(data.new.val().clone());
-                                self.parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
-                            }/* else if !data.intermediate.ptr.is_null() {
-                                // FIXME: add a fallback case for this!
-                            }*/
-                    }/* else if !data.new.ptr.is_null() {
-                        // FIXME: add a fallback case for this!
-                    }*/
-            }*/
-        } else {
-            slow_drop(self.parent, data, self.gen_cnt);
+        data.buckets[self.src_idx as usize].ref_cnt -= 1;
+        if unlikely(self.src_idx != data.curr_idx.0) {
+            slow_drop(self.parent, data, self.src_idx);
         }
         #[cold]
-        fn slow_drop<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>(parent: &LocalData<T, D, METADATA_BITS>, data: &mut LocalDataInner<T, D>, gen_cnt: usize) {
-            if gen_cnt == data.new.gen_cnt {
-                data.new.ref_cnt -= 1;
-                if data.new.ref_cnt == 0 {
-                    if data.intermediate.ref_cnt != 0 {
+        fn slow_drop<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>(parent: &LocalData<T, D, METADATA_BITS>, data: &mut LocalDataInner<T, D>, src_idx: u8) {
+            // check for `new`
+            if src_idx == data.curr_idx.ranged_dec() {
+                if data.buckets[src_idx as usize].ref_cnt == 0 {
+                    let intermediate = RangedU8(src_idx).ranged_dec();
+                    if data.buckets[intermediate.0 as usize].ref_cnt != 0 {
+                        // update `new`
+                        // FIXME: maybe we could fix the update difficulties by allowing `intermediate` to be present
+                        // FIXME: even in cases in which `new` isn' present (although that would mean sacrificing update responsivenes for a POTENTIAL read-perf optimization)
                         data.new = mem::take(&mut data.intermediate).make_drop();
                         // increase the ref count of the new value
                         mem::forget(data.new.val().clone());
@@ -874,29 +861,37 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for LocalDat
 }*/
 
 struct LocalDataInner<T, D: DataPtrConvert<T> = Arc<T>> {
-    next_gen_cnt: usize,
-    intermediate: LocalCounted<T, D>,
+    /*next_gen_cnt*/curr_idx: RangedU8<2>,
+    /*intermediate: LocalCounted<T, D>,
     new: LocalCounted<T, D, true>,
-    curr: LocalCounted<T, D, true>,
+    curr: LocalCounted<T, D, true>,*/
+    buckets: [LocalCounted<T, D>; 3],
 }
 
-struct LocalCounted<T, D: DataPtrConvert<T> = Arc<T>, const DROP: bool = false> {
-    gen_cnt: usize,
+impl<T, D: DataPtrConvert<T>> Drop for LocalDataInner<T, D> {
+    fn drop(&mut self) {
+        // FIXME: drop `curr` and `new` (if `new` even exists)
+
+    }
+}
+
+struct LocalCounted<T, D: DataPtrConvert<T> = Arc<T>/*, const DROP: bool = false*/> {
+    // gen_cnt: usize,
     ptr: *const T,
     ref_cnt: usize,
     _phantom_data: PhantomData<D>,
 }
 
-impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
+impl<T, D: DataPtrConvert<T>/*, const DROP: bool*/> LocalCounted<T, D/*, DROP*/> {
 
-    fn new(parent: &mut LocalDataInner<T, D>, ptr: *const T) -> Self {
-        let gen_cnt = parent.next_gen_cnt;
+    fn new(/*parent: &mut LocalDataInner<T, D>, */ptr: *const T) -> Self {
+        /*let gen_cnt = parent.next_gen_cnt;
         let res = parent.next_gen_cnt.overflowing_add(1);
         // if an overflow occurs, we add an additional 1 to the result in order to never
         // reach 0
-        parent.next_gen_cnt = res.0 + unsafe { transmute::<bool, u8>(res.1) } as usize;
+        parent.next_gen_cnt = res.0 + unsafe { transmute::<bool, u8>(res.1) } as usize;*/
         Self {
-            gen_cnt,
+            // gen_cnt,
             ptr,
             ref_cnt: 1,
             _phantom_data: Default::default(),
@@ -918,7 +913,7 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
         }
     }*/
 
-    fn refill_unchecked(&mut self, ptr: *const T) {
+    fn refill_unchecked<const DROP: bool>(&mut self, ptr: *const T) {
         if DROP {
             if !self.ptr.is_null() {
                 // SAFETY: the person defining this struct has to make sure that
@@ -932,6 +927,7 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
 
 }
 
+/*
 impl<T, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
 
     #[inline]
@@ -944,13 +940,13 @@ impl<T, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
         }
     }
 
-}
+}*/
 
-impl<T, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCounted<T, D, DROP> {
+impl<T, D: DataPtrConvert<T>/*, const DROP: bool*/> Default for LocalCounted<T, D/*, DROP*/> {
     #[inline]
     fn default() -> Self {
         Self {
-            gen_cnt: 0,
+            // gen_cnt: 0,
             ptr: null(),
             ref_cnt: 0,
             _phantom_data: Default::default(),
@@ -960,9 +956,10 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCounted<T, D, D
 
 // FIXME: is `Send` safe to implement even for `DROP = true`? - it probably is!
 // FIXME: add safety comment (the gist is that this will only ever be used when `parent` is dropped)
-unsafe impl<T, D: DataPtrConvert<T>, const DROP: bool> Send for LocalCounted<T, D, DROP> {}
+unsafe impl<T, D: DataPtrConvert<T>/*, const DROP: bool*/> Send for LocalCounted<T, D/*, DROP*/> {}
 
-impl<T, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCounted<T, D, DROP> {
+/*
+impl<T, D: DataPtrConvert<T>/*, const DROP: bool*/> Drop for LocalCounted<T, D/*, DROP*/> {
     #[inline]
     fn drop(&mut self) {
         // println!("try dropping!");
@@ -975,7 +972,7 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCounted<T, D, DROP
             }
         }
     }
-}
+}*/
 
 /// SAFETY: Types implementing this trait are expected to perform
 /// reference counting through cloning/dropping internally.
@@ -1061,4 +1058,45 @@ impl<T> DataPtrConvert<T> for Option<Arc<T>> {
             Some(val) => Arc::as_ptr(val),
         }
     }
+}
+
+#[derive(Copy, Clone, Debug)]
+#[repr(transparent)]
+struct RangedU8<const MAX: u8>(u8);
+
+impl<const MAX: u8> RangedU8<MAX> {
+
+    /*
+    /// this subtracts 1 from val and if it underflows, it sets it back to `MAX`
+    fn ranged_dec_shifted(self) -> Self {
+        if !MAX.is_power_of_two() {
+            unimplemented!("This function only works for MAX values that are a power of two!");
+        }
+        // const SHR: u8 = MAX.trailing_zeros() as u8;
+        let shr = MAX.trailing_zeros() as u8;
+        let val = self.0;
+        let result = val.overflowing_sub(1);
+        let overflow_flag = unsafe { transmute::<bool, u8>(result.1) };
+        Self(result.0.wrapping_add(overflow_flag) + (overflow_flag << shr/*SHR*/))
+    }*/
+
+    /// this subtracts 1 from val and if it underflows, it sets it back to `MAX`
+    fn ranged_dec(self) -> Self {
+        // const OFFSET: u8 = 1 + MAX;
+        let offset = 1 + MAX;
+        let val = self.0;
+        let result = val.overflowing_sub(1);
+        Self(result.0.wrapping_add(offset/*OFFSET*/ & (0_u8.wrapping_sub(unsafe { transmute::<bool, u8>(result.1) }))))
+    }
+
+    /// this adds 1 to val and if it exceeds `MAX`, it sets it back to `0`
+    fn ranged_inc(self) -> Self {
+        // const OFFSET: u8 = u8::MAX - MAX;
+        let offset = u8::MAX - MAX;
+        let val = self.0;
+        let val = val + offset/*OFFSET*/;
+        let result = val.overflowing_add(1);
+        Self(result.0 + (offset/*OFFSET*/ & (0_u8.wrapping_sub(unsafe { transmute::<bool, u8>(result.1) }))) - offset/*OFFSET*/)
+    }
+
 }
