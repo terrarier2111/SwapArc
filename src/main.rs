@@ -25,27 +25,6 @@ extern crate test;
 use test::Bencher;
 use arc_swap::ArcSwap;
 
-/// this subtracts 1 from val and if it underflows, it sets it back to `1 << shr`
-fn ranged_dec_shifted<const SHR: usize>(val: usize) -> usize {
-    let result = val.overflowing_sub(1);
-    result.0 + ((unsafe { transmute::<bool, u8>(result.1) } as usize) << SHR)
-}
-
-/// this adds 1 to val and if it overflows, it sets it back to `1 << shr`
-fn ranged_dec<const MAX: u8>(val: u8) -> u8 { // FIXME: finish this!
-    const OFFSET: u8 = u8::MAX - MAX;
-    let val = val + OFFSET;
-    let result = val.overflowing_add(1);
-    result.0 + (OFFSET & (0_u8.wrapping_sub(unsafe { transmute::<bool, u8>(result.1) }))) - OFFSET
-}
-
-/// this adds 1 to val and if it overflows, it sets it back to `1 << shr`
-fn ranged_inc(val: u8, max: u8) -> u8 { // FIXME: finish this!
-    const OFFSET: u8 = u8::MAX - max;
-    let result = val.overflowing_add(1);
-    result.0 + (OFFSET & (0_u8.wrapping_sub(unsafe { transmute::<bool, u8>(result.1) })))
-}
-
 fn main() {
     /*for _ in 0..10 {
         test_us_single();
@@ -462,7 +441,7 @@ fn bench_us_read_heavy_single(bencher: &mut Bencher) {
         for _ in 0..20/*5*//*1*/ {
             let tmp = tmp.clone();
             threads.push(thread::spawn(move || {
-                for _ in 0..20000/*200*/ {
+                for _ in 0..200000/*200*/ {
                     let l1 = tmp.load();
                     black_box(l1);
                 }
@@ -481,7 +460,7 @@ fn bench_other_read_heavy_single(bencher: &mut Bencher) {
         for _ in 0..20/*5*//*1*/ {
             let tmp = tmp.clone();
             threads.push(thread::spawn(move || {
-                for _ in 0..20000/*200*/ {
+                for _ in 0..200000/*200*/ {
                     let l1 = tmp.load();
                     black_box(l1);
                 }
@@ -499,7 +478,7 @@ fn bench_us_read_heavy_multi(bencher: &mut Bencher) {
         for _ in 0..20/*5*//*1*/ {
             let tmp = tmp.clone();
             threads.push(thread::spawn(move || {
-                for _ in 0..20000/*200*/ {
+                for _ in 0..200000/*200*/ {
                     let l1 = tmp.load();
                     let l2 = tmp.load();
                     let l3 = tmp.load();
@@ -526,7 +505,7 @@ fn bench_other_read_heavy_multi(bencher: &mut Bencher) {
         for _ in 0..20/*5*//*1*/ {
             let tmp = tmp.clone();
             threads.push(thread::spawn(move || {
-                for _ in 0..20000/*200*/ {
+                for _ in 0..200000/*200*/ {
                     let l1 = tmp.load();
                     let l2 = tmp.load();
                     let l3 = tmp.load();
