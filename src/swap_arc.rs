@@ -5,7 +5,7 @@
 /// to be passed around and swapped out with other `Arc`s.
 /// In order to achieve this, an internal reference count
 /// scheme is used which allows for very quick, low overhead
-/// reads in the common case (no update) and will sill be
+/// reads in the common case (no update) and will still be
 /// decently fast when an update is performed, as updates
 /// only consist of 3 atomic instructions. When a new
 /// `Arc` is to be stored in the `SwapArc`, it first tries to
