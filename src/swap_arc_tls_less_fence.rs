@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 use thread_local::ThreadLocal;
 
+/*
 #[derive(Copy, Clone, Debug)]
 pub enum UpdateResult {
     Ok,
@@ -86,7 +87,7 @@ pub struct SwapArcIntermediateTLS<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>,
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermediateTLS<T, D, METADATA_PREFIX_BITS> {
 
     pub fn new(val: D) -> Arc<Self> {
-        static_assertions::const_assert!(assert_alignment());
+        static_assertions::const_assert!(assert_alignment::<T, { METADATA_PREFIX_BITS }>());
         let val = ManuallyDrop::new(val);
         let virtual_ref = val.as_ptr();
         Arc::new(Self {
@@ -139,12 +140,12 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                 update: AtomicPtr::new(curr),
                 inner: UnsafeCell::new(LocalDataInner {
                     intermediate_ptr: null(),
-                    intermediate: LocalCounted { val: MaybeUninit::uninit(), ref_cnt: 0, },
+                    intermediate: LocalCounted { val: MaybeUninit::uninit(), ref_cnt: 0, _phantom_data: Default::default() },
                     new_ptr: null(),
                     new_src: RefSource::Curr,
-                    new: LocalCounted { val: MaybeUninit::uninit(), ref_cnt: 0, },
+                    new: LocalCounted { val: MaybeUninit::uninit(), ref_cnt: 0, _phantom_data: Default::default() },
                     // FIXME: increase ref count
-                    curr: LocalCounted { val: MaybeUninit::new(D::from(curr)), ref_cnt: 1, }
+                    curr: LocalCounted { val: MaybeUninit::new(D::from(curr)), ref_cnt: 1, _phantom_data: Default::default() }
                 }),
             }
         });
@@ -189,6 +190,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                 data.new = LocalCounted {
                     val: MaybeUninit::new(D::from(loaded.0)),
                     ref_cnt: 1,
+                    _phantom_data: Default::default()
                 };
                 loaded.0.cast_const()
             } else {
@@ -214,6 +216,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                 data.intermediate = LocalCounted {
                     val: MaybeUninit::new(D::from(loaded)),
                     ref_cnt: 1,
+                    _phantom_data: Default::default()
                 };
                 loaded.cast_const()
             } else {
@@ -675,12 +678,12 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Swap
                 update: AtomicPtr::new(curr),
                 inner: UnsafeCell::new(LocalDataInner {
                     intermediate_ptr: null(),
-                    intermediate: LocalCounted { val: MaybeUninit::uninit(), ref_cnt: 0, },
+                    intermediate: LocalCounted { val: MaybeUninit::uninit(), ref_cnt: 0, _phantom_data: Default::default() },
                     new_ptr: null(),
                     new_src: RefSource::Curr,
-                    new: LocalCounted { val: MaybeUninit::uninit(), ref_cnt: 0, },
+                    new: LocalCounted { val: MaybeUninit::uninit(), ref_cnt: 0, _phantom_data: Default::default() },
                     // FIXME: increase ref count
-                    curr: LocalCounted { val: MaybeUninit::new(D::from(curr)), ref_cnt: 1, }
+                    curr: LocalCounted { val: MaybeUninit::new(D::from(curr)), ref_cnt: 1, _phantom_data: Default::default() }
                 }),
             }
         });
@@ -1069,9 +1072,12 @@ struct LocalDataInner<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const METAD
     curr: LocalCounted<D>,
 }
 
+unsafe impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Send for LocalDataInner<T, D, METADATA_PREFIX_BITS> {}
+
 struct LocalCounted<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>> {
     val: MaybeUninit<D>,
     ref_cnt: usize,
+    _phantom_data: PhantomData<T>,
 }
 
 /// SAFETY: Types implementing this trait are expected to perform
@@ -1163,3 +1169,4 @@ impl<T: Send + Sync> DataPtrConvert<T> for Option<Arc<T>> {
         mem::forget(self.clone());
     }
 }
+*/

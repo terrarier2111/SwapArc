@@ -33,21 +33,6 @@ const fn most_sig_set_bit(val: usize) -> Option<u32> {
     ret
 }
 
-const fn assert_alignment<T, const METADATA_BITS: u32>() -> bool {
-    // FIXME: use `unwrap_or` once it's const-stable
-    let free_bits = match most_sig_set_bit(align_of::<T>()) {
-        Some(val) => val,
-        None => 0,
-    };
-    if free_bits < METADATA_BITS {
-        /*let tmp = 1 << METADATA_BITS;
-        let tmp_2 = 1 << free_bits;
-        panic!("The alignment of T is insufficient, expected `{}`, but found `{}`", tmp, tmp_2);*/ // FIXME: use better formatting, once available in const contexts
-        panic!("The alignment of T is insufficient");
-    }
-    true
-}
-
 /// A `SwapArc` is a data structure that allows for an `Arc`
 /// to be passed around and swapped out with other `Arc`s.
 /// In order to achieve this, an internal reference count
@@ -71,16 +56,16 @@ const fn assert_alignment<T, const METADATA_BITS: u32>() -> bool {
 /// This variant of `SwapArc` has wait-free reads (although
 /// this is at the cost of additional atomic instructions
 /// (at least 1 additional load - this will never be more than 1 load if there are no updates happening).
-pub struct SwapArcIntermediateTLS<T, D: DataPtrConvert<T> = Arc<T>, const METADATA_HEADER_BITS: u32 = 0> {
+pub struct SwapArcIntermediateTLS<T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
     curr_ref_cnt: AtomicUsize, // the last bit is the `update` bit
     ptr: AtomicPtr<T>,
     intermediate_ref_cnt: AtomicUsize, // the last bit is the `update` bit
     intermediate_ptr: AtomicPtr<T>,
     updated: AtomicPtr<T>,
-    thread_local: ThreadLocal<CachePadded<LocalData<T, D, METADATA_HEADER_BITS>>>,
+    thread_local: ThreadLocal<CachePadded<LocalData<T, D, METADATA_BITS>>>,
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermediateTLS<T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T, D, METADATA_BITS> {
 
     const UPDATE: usize = 1 << (usize::BITS - 1);
     const OTHER_UPDATE: usize = 1 << (usize::BITS - 2);
@@ -88,7 +73,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
     // FIXME: implement force updating!
 
     pub fn new(val: D) -> Arc<Self> {
-        // static_assertions::const_assert!(assert_alignment::<T, { METADATA_PREFIX_BITS }>()); // FIXME: fix this!
+        let free_bits = most_sig_set_bit(align_of::<T>()).unwrap_or(0);
+        if free_bits < METADATA_BITS { // FIXME: make sure this check is optimized away at compile time!
+            let expected = 1 << METADATA_BITS;
+            let found = 1 << free_bits;
+            panic!("The alignment of T is insufficient, expected `{}`, but found `{}`", expected, found);
+        }
         let val = ManuallyDrop::new(val);
         let virtual_ref = val.as_ptr();
         Arc::new(Self {
@@ -104,7 +94,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
     /// SAFETY: this is only safe to call if the caller increments the
     /// reference count of the "object" `val` points to.
     pub unsafe fn new_raw(val: *const T) -> Arc<Self> {
-        // static_assertions::const_assert!(assert_alignment::<T, { METADATA_PREFIX_BITS }>()); // FIXME: fix this!
+        let free_bits = most_sig_set_bit(align_of::<T>()).unwrap_or(0);
+        if free_bits < METADATA_BITS { // FIXME: make sure this check is optimized away at compile time!
+            let expected = 1 << METADATA_BITS;
+            let found = 1 << free_bits;
+            panic!("The alignment of T is insufficient, expected `{}`, but found `{}`", expected, found);
+        }
         Arc::new(Self {
             curr_ref_cnt: Default::default(),
             ptr: AtomicPtr::new(val.cast_mut()),
@@ -116,7 +111,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
     }
 
     // #[inline(never)]
-    pub fn load<'a>(self: &'a Arc<Self>) -> SwapArcIntermediateGuard<'a, T, D, METADATA_PREFIX_BITS> {
+    pub fn load<'a>(self: &'a Arc<Self>) -> SwapArcIntermediateGuard<'a, T, D, METADATA_BITS> {
         let parent = self.thread_local.get_or(|| {
             let curr = self.load_internal();
             let curr_ptr = curr.fake_ref.as_ptr();
@@ -255,19 +250,21 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
         self.load().as_ref().clone()
     }
 
-    pub unsafe fn load_raw<'a>(self: &'a Arc<Self>) -> SwapArcIntermediatePtrGuard<'a, T, D, METADATA_PREFIX_BITS> {
+    pub unsafe fn load_raw<'a>(self: &'a Arc<Self>) -> SwapArcIntermediatePtrGuard<'a, T, D, METADATA_BITS> {
         let guard = ManuallyDrop::new(self.load());
         let curr_meta = {
             Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire)) // FIXME: is this okay - even, when `intermediate` is getting updated?
         };
         SwapArcIntermediatePtrGuard {
             parent: guard.parent,
-            ptr: guard.fake_ref.as_ptr().map_addr(|x| x | curr_meta),
+            // FIXME: use this once strict provenance got stabilized!
+            // ptr: guard.fake_ref.as_ptr().map_addr(|x| x | curr_meta),
+            ptr: (guard.fake_ref.as_ptr() as usize | curr_meta) as *const T,
             gen_cnt: guard.gen_cnt,
         }
     }
 
-    fn load_internal<'a>(self: &'a Arc<Self>) -> SwapArcIntermediateInternalGuard<'a, T, D, METADATA_PREFIX_BITS> {
+    fn load_internal<'a>(self: &'a Arc<Self>) -> SwapArcIntermediateInternalGuard<'a, T, D, METADATA_BITS> {
         let ref_cnt = self.curr_ref_cnt.fetch_add(1, Ordering::SeqCst);
         let (ptr, src) = if ref_cnt & Self::UPDATE != 0 {
             let intermediate_ref_cnt = self.intermediate_ref_cnt.fetch_add(1, Ordering::SeqCst);
@@ -556,7 +553,9 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
     /// `old` should contain the previous metadata.
     pub fn try_update_meta(&self, old: *const T, metadata: usize) -> bool {
         let prefix = metadata & Self::META_MASK;
-        self.intermediate_ptr.compare_exchange(old.cast_mut(), old.map_addr(|x| (x & !Self::META_MASK) | prefix).cast_mut(), Ordering::SeqCst, Ordering::Relaxed).is_ok()
+        // FIXME: use this once strict provenance got stabilized
+        // self.intermediate_ptr.compare_exchange(old.cast_mut(), old.map_addr(|x| (x & !Self::META_MASK) | prefix).cast_mut(), Ordering::SeqCst, Ordering::Relaxed).is_ok()
+        self.intermediate_ptr.compare_exchange(old.cast_mut(), ((old as usize & !Self::META_MASK) | prefix) as *mut T, Ordering::SeqCst, Ordering::Relaxed).is_ok()
     }
 
     pub fn set_in_metadata(&self, active_bits: usize) {
@@ -564,7 +563,9 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
         loop {
             let curr = self.intermediate_ptr.load(Ordering::Acquire);
             let prefix = active_bits & Self::META_MASK;
-            if self.intermediate_ptr.compare_exchange(curr, curr.map_addr(|x| x | prefix), Ordering::SeqCst, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
+            // FIXME: use this once strict provenance got stabilized
+            // if self.intermediate_ptr.compare_exchange(curr, curr.map_addr(|x| x | prefix), Ordering::SeqCst, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
+            if self.intermediate_ptr.compare_exchange(curr, (curr as usize | prefix) as *mut T, Ordering::SeqCst, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
                 break;
             }
             backoff.spin(); // FIXME: should we really backoff here? the other thread will make progress anyways and we will only have to spin once more if it makes progress again
@@ -576,7 +577,9 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
         loop {
             let curr = self.intermediate_ptr.load(Ordering::Acquire);
             let prefix = inactive_bits & Self::META_MASK;
-            if self.intermediate_ptr.compare_exchange(curr, curr.map_addr(|x| x & !prefix), Ordering::SeqCst, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
+            // FIXME: use this once strict provenance got stabilized!
+            //if self.intermediate_ptr.compare_exchange(curr, curr.map_addr(|x| x & !prefix), Ordering::SeqCst, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
+            if self.intermediate_ptr.compare_exchange(curr, (curr as usize & !prefix) as *mut T, Ordering::SeqCst, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
                 break;
             }
             backoff.spin(); // FIXME: should we really backoff here? the other thread will make progress anyways and we will only have to spin once more if it makes progress again
@@ -584,28 +587,32 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
     }
 
     pub fn load_metadata(&self) -> usize {
-        self.intermediate_ptr.load(Ordering::Acquire).expose_addr() & Self::META_MASK
+        self.intermediate_ptr.load(Ordering::Acquire) as usize & Self::META_MASK
     }
 
     #[inline]
     fn get_metadata(ptr: *const T) -> usize {
-        ptr.expose_addr() & Self::META_MASK
+        ptr as usize & Self::META_MASK
     }
 
     #[inline]
     fn strip_metadata(ptr: *const T) -> *const T {
-        ptr.map_addr(|x| x & !Self::META_MASK)
+        // FIXME: use this once strict_provenance has been stabilized
+        // ptr.map_addr(|x| x & !Self::META_MASK)
+        (ptr as usize & !Self::META_MASK) as *const T
     }
 
     #[inline]
     fn merge_ptr_and_metadata(ptr: *const T, metadata: usize) -> *const T {
-        ptr.map_addr(|x| x | metadata)
+        // FIXME: use this once strict_provenance has been stabilized
+        // ptr.map_addr(|x| x | metadata)
+        (ptr as usize | metadata) as *const T
     }
 
     const META_MASK: usize = {
         let mut result = 0;
         let mut i = 0;
-        while METADATA_PREFIX_BITS > i {
+        while METADATA_BITS > i {
             result |= 1 << i;
             i += 1;
         }
@@ -633,7 +640,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
 
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcIntermediateTLS<T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermediateTLS<T, D, METADATA_BITS> {
     fn drop(&mut self) {
         // FIXME: how should we handle intermediate inside drop?
         let updated = *self.updated.get_mut();
@@ -651,13 +658,13 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcI
     }
 }
 
-pub struct SwapArcIntermediatePtrGuard<'a, T, D: DataPtrConvert<T> = Arc<T>, const METADATA_PREFIX_BITS: u32 = 0> {
-    parent: &'a LocalData<T, D, METADATA_PREFIX_BITS>,
+pub struct SwapArcIntermediatePtrGuard<'a, T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
+    parent: &'a LocalData<T, D, METADATA_BITS>,
     ptr: *const T,
     gen_cnt: usize,
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermediatePtrGuard<'_, T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
 
     #[inline]
     pub fn as_raw(&self) -> *const T {
@@ -666,13 +673,13 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> SwapArcIntermedia
 
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Clone for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Clone for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
     fn clone(&self) -> Self {
         unsafe { self.parent.parent.load_raw() }
     }
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
     fn drop(&mut self) {
         // SAFETY: This is safe because we know that we are the only thread that
         // is able to access the thread local data at this time and said data has to be initialized
@@ -724,7 +731,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcI
     }
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Debug for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Debug for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let tmp = format!("{:?}", self.ptr);
         f.write_str(tmp.as_str())
@@ -732,13 +739,13 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Debug for SwapArc
 }
 
 
-pub struct SwapArcIntermediateGuard<'a, T, D: DataPtrConvert<T> = Arc<T>, const METADATA_PREFIX_BITS: u32 = 0> {
-    parent: &'a LocalData<T, D, METADATA_PREFIX_BITS>,
+pub struct SwapArcIntermediateGuard<'a, T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
+    parent: &'a LocalData<T, D, METADATA_BITS>,
     fake_ref: ManuallyDrop<D>,
     gen_cnt: usize,
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcIntermediateGuard<'_, T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS> {
     #[inline]
     fn drop(&mut self) {
         // SAFETY: This is safe because we know that we are the only thread that
@@ -791,7 +798,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcI
     }
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Deref for SwapArcIntermediateGuard<'_, T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Deref for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS> {
     type Target = D;
 
     #[inline]
@@ -800,28 +807,28 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Deref for SwapArc
     }
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Borrow<D> for SwapArcIntermediateGuard<'_, T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Borrow<D> for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS> {
     #[inline]
     fn borrow(&self) -> &D {
         self.fake_ref.deref()
     }
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> AsRef<D> for SwapArcIntermediateGuard<'_, T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> AsRef<D> for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS> {
     #[inline]
     fn as_ref(&self) -> &D {
         self.fake_ref.deref()
     }
 }
 
-impl<T, D: DataPtrConvert<T> + Display, const METADATA_PREFIX_BITS: u32> Display for SwapArcIntermediateGuard<'_, T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T> + Display, const METADATA_BITS: u32> Display for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS> {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         D::fmt(self.as_ref(), f)
     }
 }
 
-impl<T, D: DataPtrConvert<T> + Debug, const METADATA_PREFIX_BITS: u32> Debug for SwapArcIntermediateGuard<'_, T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T> + Debug, const METADATA_BITS: u32> Debug for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS> {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         D::fmt(self.as_ref(), f)
@@ -829,19 +836,19 @@ impl<T, D: DataPtrConvert<T> + Debug, const METADATA_PREFIX_BITS: u32> Debug for
 }
 
 
-struct SwapArcIntermediateInternalGuard<'a, T, D: DataPtrConvert<T> = Arc<T>, const METADATA_PREFIX_BITS: u32 = 0> {
-    parent: &'a Arc<SwapArcIntermediateTLS<T, D, METADATA_PREFIX_BITS>>,
+struct SwapArcIntermediateInternalGuard<'a, T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
+    parent: &'a Arc<SwapArcIntermediateTLS<T, D, METADATA_BITS>>,
     fake_ref: ManuallyDrop<D>,
     ref_src: RefSource,
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcIntermediateInternalGuard<'_, T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermediateInternalGuard<'_, T, D, METADATA_BITS> {
     fn drop(&mut self) {
         // release the reference we hold
         match self.ref_src {
             RefSource::Curr => {
                 let ref_cnt = self.parent.curr_ref_cnt.fetch_sub(1, Ordering::SeqCst);
-                if ref_cnt == SwapArcIntermediateTLS::<T, D, METADATA_PREFIX_BITS>::OTHER_UPDATE + 1/*1*/ { // FIXME: is it okay to do nothing on 1?
+                if ref_cnt == SwapArcIntermediateTLS::<T, D, METADATA_BITS>::OTHER_UPDATE + 1/*1*/ { // FIXME: is it okay to do nothing on 1?
                     self.parent.try_update_curr();
                 }
             }
@@ -857,14 +864,14 @@ impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Drop for SwapArcI
     }
 }
 
-impl<T, D: DataPtrConvert<T> + Display, const METADATA_PREFIX_BITS: u32> Display for SwapArcIntermediateInternalGuard<'_, T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T> + Display, const METADATA_BITS: u32> Display for SwapArcIntermediateInternalGuard<'_, T, D, METADATA_BITS> {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         D::fmt(self.fake_ref.deref(), f)
     }
 }
 
-impl<T, D: DataPtrConvert<T> + Debug, const METADATA_PREFIX_BITS: u32> Debug for SwapArcIntermediateInternalGuard<'_, T, D, METADATA_PREFIX_BITS> {
+impl<T, D: DataPtrConvert<T> + Debug, const METADATA_BITS: u32> Debug for SwapArcIntermediateInternalGuard<'_, T, D, METADATA_BITS> {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         D::fmt(self.fake_ref.deref(), f)
@@ -876,15 +883,15 @@ enum RefSource {
     Intermediate,
 }
 
-struct LocalData<T, D: DataPtrConvert<T> = Arc<T>, const METADATA_PREFIX_BITS: u32 = 0> {
-    parent: ManuallyDrop<Arc<SwapArcIntermediateTLS<T, D, METADATA_PREFIX_BITS>>>, // this acts as a reference with hidden lifetime that only we know is safe because
+struct LocalData<T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
+    parent: ManuallyDrop<Arc<SwapArcIntermediateTLS<T, D, METADATA_BITS>>>, // this acts as a reference with hidden lifetime that only we know is safe because
                                                                                    // `parent` won't be used in the drop impl and `LocalData` can only be accessed
                                                                                    // through `parent`
     inner: UnsafeCell<LocalDataInner<T, D>>,
 }
 
 // FIXME: add safety comment (the gist is that this will only ever be used when `parent` is dropped)
-unsafe impl<T, D: DataPtrConvert<T>, const METADATA_PREFIX_BITS: u32> Sync for LocalData<T, D, METADATA_PREFIX_BITS> {}
+unsafe impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Sync for LocalData<T, D, METADATA_BITS> {}
 
 struct LocalDataInner<T, D: DataPtrConvert<T> = Arc<T>> {
     next_gen_cnt: usize,

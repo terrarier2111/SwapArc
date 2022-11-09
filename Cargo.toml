@@ -1,5 +1,5 @@
 [package]
-name = "rust-playground"
+name = "swap-arc"
 version = "0.1.0"
 edition = "2021"
 
@@ -17,4 +17,7 @@ thread_local = "1.1.4"
 static_assertions = "1.1.0"
 rand = "0.8.5"
 crossbeam-utils = "0.8.12"
+likely_stable = "0.1.2"
+
+[dev-dependencies]
 arc-swap = "1.5.1"

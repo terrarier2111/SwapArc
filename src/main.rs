@@ -1,5 +1,3 @@
-#![feature(strict_provenance_atomic_ptr)]
-#![feature(strict_provenance)]
 #![feature(core_intrinsics)]
 // only for testing!
 #![allow(soft_unstable)]
@@ -21,8 +19,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::swap_arc_tls_optimistic::SwapArcIntermediateTLS;
 
+#[cfg(test)]
 extern crate test;
+#[cfg(test)]
 use test::Bencher;
+#[cfg(test)]
 use arc_swap::ArcSwap;
 
 fn main() {
@@ -119,7 +120,7 @@ fn main() {
     for _ in 0..20/*5*//*1*/ {
         let tmp = tmp.clone();
         threads.push(thread::spawn(move || {
-            for _ in 0..20000/*200*/ {
+            for _ in 0..50/*200*/ {
                 let l1 = tmp.load();
                 let l2 = tmp.load();
                 let l3 = tmp.load();
@@ -130,6 +131,14 @@ fn main() {
                 black_box(l3);
                 black_box(l4);
                 black_box(l5);
+            }
+        }));
+    }
+    for _ in 0..20/*5*//*1*/ {
+        let tmp = tmp.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..50/*200*/ {
+                tmp.update(Arc::new(rand::random()));
             }
         }));
     }

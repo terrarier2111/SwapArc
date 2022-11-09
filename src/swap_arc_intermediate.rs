@@ -1,3 +1,4 @@
+/*
 use std::marker::PhantomData;
 use std::{mem, ptr};
 use std::borrow::Borrow;
@@ -628,3 +629,4 @@ impl<T> DataPtrConvert<T> for Option<Arc<T>> {
         mem::forget(self.clone());
     }
 }
+*/
