@@ -72,7 +72,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     // const FORCE_UPDATE: usize = 1 << (usize::BITS - 3); // FIXME: do we actually need a separate flag? - we probably do
     // FIXME: implement force updating!
 
-    pub fn new(val: D) -> Arc<Self> {
+    pub fn new(val: D) -> Self {
         let free_bits = most_sig_set_bit(align_of::<T>()).unwrap_or(0);
         if free_bits < METADATA_BITS { // FIXME: make sure this check is optimized away at compile time!
             let expected = 1 << METADATA_BITS;
@@ -81,37 +81,37 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         }
         let val = ManuallyDrop::new(val);
         let virtual_ref = val.as_ptr();
-        Arc::new(Self {
+        Self {
             curr_ref_cnt: Default::default(),
             ptr: AtomicPtr::new(virtual_ref.cast_mut()),
             intermediate_ref_cnt: Default::default(),
             intermediate_ptr: AtomicPtr::new(virtual_ref.cast_mut()/*null_mut()*/),
             updated: AtomicPtr::new(null_mut()),
             thread_local: ThreadLocal::new(),
-        })
+        }
     }
 
     /// SAFETY: this is only safe to call if the caller increments the
     /// reference count of the "object" `val` points to.
-    pub unsafe fn new_raw(val: *const T) -> Arc<Self> {
+    pub unsafe fn new_raw(val: *const T) -> Self {
         let free_bits = most_sig_set_bit(align_of::<T>()).unwrap_or(0);
         if free_bits < METADATA_BITS { // FIXME: make sure this check is optimized away at compile time!
             let expected = 1 << METADATA_BITS;
             let found = 1 << free_bits;
             panic!("The alignment of T is insufficient, expected `{}`, but found `{}`", expected, found);
         }
-        Arc::new(Self {
+        Self {
             curr_ref_cnt: Default::default(),
             ptr: AtomicPtr::new(val.cast_mut()),
             intermediate_ref_cnt: Default::default(),
             intermediate_ptr: AtomicPtr::new(val.cast_mut()/*null_mut()*/),
             updated: AtomicPtr::new(null_mut()),
             thread_local: ThreadLocal::new(),
-        })
+        }
     }
 
     // #[inline(never)]
-    pub fn load<'a>(self: &'a Arc<Self>) -> SwapArcIntermediateGuard<'a, T, D, METADATA_BITS> {
+    pub fn load<'a>(&'a self) -> SwapArcIntermediateGuard<'a, T, D, METADATA_BITS> {
         let parent = self.thread_local.get_or(|| {
             let curr = self.load_internal();
             let curr_ptr = curr.fake_ref.as_ptr();
@@ -120,7 +120,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
             CachePadded::new(LocalData {
                 // SAFETY: this is safe because we know that this will only ever be accessed
                 // if there is a life reference to `self` present.
-                parent: ManuallyDrop::new(unsafe { Arc::from_raw(Arc::as_ptr(self)) }),
+                parent: self as *const Self,
                 inner: UnsafeCell::new(LocalDataInner {
                     next_gen_cnt: 2,
                     intermediate: LocalCounted::default(),
@@ -135,7 +135,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         let data = unsafe { parent.inner.get().as_mut().unwrap_unchecked() };
 
         if likely(data.new.ref_cnt == 0) {
-            let (ptr, gen_cnt) = if likely(Self::strip_metadata(parent.parent.ptr.load(Ordering::Acquire)) == data.curr.ptr) {
+            let (ptr, gen_cnt) = if likely(Self::strip_metadata(parent.parent().ptr.load(Ordering::Acquire)) == data.curr.ptr) {
                 data.curr.ref_cnt += 1;
                 (data.curr.ptr, data.curr.gen_cnt)
             } else {
@@ -158,7 +158,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         }
 
         #[cold]
-        fn load_new_slow<'a, T, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(this: &'a Arc<SwapArcIntermediateTLS<T, D, { META_DATA_BITS }>>, data: &'a mut LocalDataInner<T, D>) -> (*const T, usize) {
+        fn load_new_slow<'a, T, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(this: &'a SwapArcIntermediateTLS<T, D, { META_DATA_BITS }>, data: &'a mut LocalDataInner<T, D>) -> (*const T, usize) {
             let curr = this.load_internal();
             // increase the strong reference count
             mem::forget(curr.fake_ref.clone());
@@ -192,7 +192,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                     data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
                     // increase the ref count of the new value
                     mem::forget(data.new.val().clone());
-                    parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                    parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
                     let fake_ref = ManuallyDrop::new(unsafe { D::from(data.new.ptr) });
                     return SwapArcIntermediateGuard {
                         parent,
@@ -203,12 +203,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                 // FIXME: what do we do here? `curr` was replaced by `new` and `new` is empty now, do we return now, or do we allow a potential update of `intermediate`?
             }
             if data.intermediate.ref_cnt == 0 {
-                let intermediate = SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(parent.parent.intermediate_ptr.load(Ordering::Acquire));
+                let intermediate = SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(parent.parent().intermediate_ptr.load(Ordering::Acquire));
                 // check if there is a new intermediate value and that the intermediate value has been verified to be usable
                 let (ptr, gen_cnt) = if intermediate != data.new.ptr {
-                    let loaded = parent.parent.intermediate_ref_cnt.fetch_add(1, Ordering::SeqCst);
+                    let loaded = parent.parent().intermediate_ref_cnt.fetch_add(1, Ordering::SeqCst);
                     if loaded & SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::UPDATE == 0 {
-                        let loaded = SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(parent.parent.intermediate_ptr.load(Ordering::Acquire));
+                        let loaded = SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(parent.parent().intermediate_ptr.load(Ordering::Acquire));
                         // data.intermediate.refill(data, loaded);
                         if data.intermediate.gen_cnt != 0 {
                             data.intermediate.refill_unchecked(loaded);
@@ -218,7 +218,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                         }
                         (loaded, data.intermediate.gen_cnt)
                     } else {
-                        parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                        parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
                         data.new.ref_cnt += 1;
                         (data.new.ptr, data.new.gen_cnt)
                     }
@@ -246,11 +246,11 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         load_slow(parent, data)
     }
 
-    pub fn load_full(self: &Arc<Self>) -> D {
+    pub fn load_full(&self) -> D {
         self.load().as_ref().clone()
     }
 
-    pub unsafe fn load_raw<'a>(self: &'a Arc<Self>) -> SwapArcIntermediatePtrGuard<'a, T, D, METADATA_BITS> {
+    pub unsafe fn load_raw<'a>(&'a self) -> SwapArcIntermediatePtrGuard<'a, T, D, METADATA_BITS> {
         let guard = ManuallyDrop::new(self.load());
         let curr_meta = {
             Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire)) // FIXME: is this okay - even, when `intermediate` is getting updated?
@@ -264,7 +264,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         }
     }
 
-    fn load_internal<'a>(self: &'a Arc<Self>) -> SwapArcIntermediateInternalGuard<'a, T, D, METADATA_BITS> {
+    fn load_internal<'a>(&'a self) -> SwapArcIntermediateInternalGuard<'a, T, D, METADATA_BITS> {
         let ref_cnt = self.curr_ref_cnt.fetch_add(1, Ordering::SeqCst);
         let (ptr, src) = if ref_cnt & Self::UPDATE != 0 {
             let intermediate_ref_cnt = self.intermediate_ref_cnt.fetch_add(1, Ordering::SeqCst);
@@ -675,7 +675,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediatePtrGu
 
 impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Clone for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
     fn clone(&self) -> Self {
-        unsafe { self.parent.parent.load_raw() }
+        unsafe { self.parent.parent().load_raw() }
     }
 }
 
@@ -718,13 +718,13 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
                         data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
                         // increase the ref count of the new value
                         mem::forget(data.new.val().clone());
-                        parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                        parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
                     }
                 }
             } else {
                 data.intermediate.ref_cnt -= 1;
                 if data.intermediate.ref_cnt == 0 {
-                    parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                    parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
                 }
             }
         }
@@ -785,13 +785,13 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
                         data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
                         // increase the ref count of the new value
                         mem::forget(data.new.val().clone());
-                        parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                        parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
                     }
                 }
             } else {
                 data.intermediate.ref_cnt -= 1;
                 if data.intermediate.ref_cnt == 0 {
-                    parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                    parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
                 }
             }
         }
@@ -837,7 +837,7 @@ impl<T, D: DataPtrConvert<T> + Debug, const METADATA_BITS: u32> Debug for SwapAr
 
 
 struct SwapArcIntermediateInternalGuard<'a, T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
-    parent: &'a Arc<SwapArcIntermediateTLS<T, D, METADATA_BITS>>,
+    parent: &'a SwapArcIntermediateTLS<T, D, METADATA_BITS>,
     fake_ref: ManuallyDrop<D>,
     ref_src: RefSource,
 }
@@ -884,14 +884,28 @@ enum RefSource {
 }
 
 struct LocalData<T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
-    parent: ManuallyDrop<Arc<SwapArcIntermediateTLS<T, D, METADATA_BITS>>>, // this acts as a reference with hidden lifetime that only we know is safe because
+    parent: *const SwapArcIntermediateTLS<T, D, METADATA_BITS>, // this acts as a reference with hidden lifetime that only we know is safe because
                                                                                    // `parent` won't be used in the drop impl and `LocalData` can only be accessed
                                                                                    // through `parent`
     inner: UnsafeCell<LocalDataInner<T, D>>,
 }
 
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> LocalData<T, D, METADATA_BITS> {
+
+    #[inline]
+    fn parent(&self) -> &SwapArcIntermediateTLS<T, D, METADATA_BITS> {
+        // SAFETY: we know that `parent` has to be alive at this point
+        // because otherwise `LocalData` wouldn't be alive.
+        unsafe { self.parent.as_ref().unwrap_unchecked() }
+    }
+
+}
+
 // FIXME: add safety comment (the gist is that this will only ever be used when `parent` is dropped)
 unsafe impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Sync for LocalData<T, D, METADATA_BITS> {}
+// SAFETY: this is safe because `parent` has to be alive when `LocalData` gets used
+// as it is only reachable through a valid reference to `SwapArc`
+unsafe impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Send for LocalData<T, D, METADATA_BITS> {}
 
 struct LocalDataInner<T, D: DataPtrConvert<T> = Arc<T>> {
     next_gen_cnt: usize,
