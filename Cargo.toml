@@ -13,11 +13,13 @@ linker = "/usr/bin/clang"
 rustflags = ["-Clink-arg=-fuse-ld=lld", "-Clink-arg=-Wl,--no-rosegment"]
 
 [dependencies]
-thread_local = "1.1.4"
+# thread_local = "1.1.4"
+thread_local = { git = "https://github.com/terrarier2111/thread_local-rs" }
 static_assertions = "1.1.0"
 rand = "0.8.5"
 crossbeam-utils = "0.8.12"
 likely_stable = "0.1.2"
+arc-swap = "1.5.1"
 
 [dev-dependencies]
 arc-swap = "1.5.1"

@@ -134,21 +134,9 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         // and we also know, that the pointer has to be non-null
         let data = unsafe { parent.inner.get().as_mut().unwrap_unchecked() };
 
-        if likely(data.new.ref_cnt == 0) {
-            let (ptr, gen_cnt) = if likely(Self::strip_metadata(parent.parent().ptr.load(Ordering::Acquire)) == data.curr.ptr) {
-                data.curr.ref_cnt += 1;
-                (data.curr.ptr, data.curr.gen_cnt)
-            } else {
-                load_new_slow(self, data)
-            };
-            let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
-            return SwapArcIntermediateGuard {
-                parent,
-                fake_ref,
-                gen_cnt,
-            };
-        } else if unlikely(data.new.ref_cnt == usize::MAX) {
-            data.new.ref_cnt = 0;
+        let updated = Self::strip_metadata(parent.parent().ptr.load(Ordering::Acquire)) == data.curr.ptr;
+        if likely(updated && data.new.ref_cnt == 0) {
+            data.curr.ref_cnt += 1;
             let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
             return SwapArcIntermediateGuard {
                 parent,
@@ -182,7 +170,26 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         }
 
         #[cold]
-        fn load_slow<'a, T, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(parent: &'a LocalData<T, D, META_DATA_BITS>, data: &mut LocalDataInner<T, D>) -> SwapArcIntermediateGuard<'a, T, D, META_DATA_BITS> {
+        fn load_slow<'a, T, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(this: &'a SwapArcIntermediateTLS<T, D, { META_DATA_BITS }>, parent: &'a LocalData<T, D, META_DATA_BITS>, data: &mut LocalDataInner<T, D>) -> SwapArcIntermediateGuard<'a, T, D, META_DATA_BITS> {
+            // the following conditional relies on preconditions provided by the caller (`load`)
+            if data.new.ref_cnt == 0 {
+                let (ptr, gen_cnt) = load_new_slow(this, data);
+                let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
+                return SwapArcIntermediateGuard {
+                    parent,
+                    fake_ref,
+                    gen_cnt,
+                };
+            } else if unlikely(data.new.ref_cnt == usize::MAX) {
+                data.new.ref_cnt = 0;
+                let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
+                return SwapArcIntermediateGuard {
+                    parent,
+                    fake_ref,
+                    gen_cnt: data.curr.gen_cnt,
+                };
+            }
+
             if data.curr.ref_cnt == 0 {
                 // we can do the `curr` update on load because we know that we have a strong reference
                 // to the value stored inside `ptr` anyways, so it doesn't really matter when exactly we update `curr`
@@ -243,7 +250,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
             }
         }
 
-        load_slow(parent, data)
+        load_slow(self, parent, data)
     }
 
     pub fn load_full(&self) -> D {
