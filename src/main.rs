@@ -3,6 +3,7 @@
 #![allow(soft_unstable)]
 #![feature(test)]
 #![feature(bench_black_box)]
+#![feature(cell_update)]
 
 mod swap_arc_intermediate;
 mod swap_arc_tls;
@@ -347,6 +348,7 @@ fn bench_us_multi(bencher: &mut Bencher) {
     });
 }
 
+/*
 #[bench]
 fn bench_other_multi(bencher: &mut Bencher) {
     let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
@@ -382,7 +384,7 @@ fn bench_other_multi(bencher: &mut Bencher) {
         }
         threads.into_iter().for_each(|thread| thread.join().unwrap());
     });
-}
+}*/
 
 #[bench]
 fn bench_us_single(bencher: &mut Bencher) {
@@ -412,6 +414,7 @@ fn bench_us_single(bencher: &mut Bencher) {
     });
 }
 
+/*
 #[bench]
 fn bench_other_single(bencher: &mut Bencher) {
     let tmp = Arc::new(ArcSwap::new(Arc::new(0)));
@@ -439,7 +442,7 @@ fn bench_other_single(bencher: &mut Bencher) {
         }
         threads.into_iter().for_each(|thread| thread.join().unwrap());
     });
-}
+}*/
 
 #[bench]
 fn bench_us_read_heavy_single(bencher: &mut Bencher) {
