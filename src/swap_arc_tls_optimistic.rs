@@ -199,7 +199,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                     data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
                     // increase the ref count of the new value
                     mem::forget(data.new.val().clone());
-                    parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                    parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                     let fake_ref = ManuallyDrop::new(unsafe { D::from(data.new.ptr) });
                     return SwapArcIntermediateGuard {
                         parent,
@@ -213,7 +213,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                 let intermediate = SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(parent.parent().intermediate_ptr.load(Ordering::Acquire));
                 // check if there is a new intermediate value and that the intermediate value has been verified to be usable
                 let (ptr, gen_cnt) = if intermediate != data.new.ptr {
-                    let loaded = parent.parent().intermediate_ref_cnt.fetch_add(1, Ordering::SeqCst);
+                    let loaded = parent.parent().intermediate_ref_cnt.fetch_add(1, Ordering::AcqRel);
                     if loaded & SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::UPDATE == 0 {
                         let loaded = SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(parent.parent().intermediate_ptr.load(Ordering::Acquire));
                         // data.intermediate.refill(data, loaded);
@@ -225,7 +225,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                         }
                         (loaded, data.intermediate.gen_cnt)
                     } else {
-                        parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                        parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                         data.new.ref_cnt += 1;
                         (data.new.ptr, data.new.gen_cnt)
                     }
@@ -257,7 +257,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         self.load().as_ref().clone()
     }
 
-    pub unsafe fn load_raw<'a>(&'a self) -> SwapArcIntermediatePtrGuard<'a, T, D, METADATA_BITS> {
+    pub fn load_raw<'a>(&'a self) -> SwapArcIntermediatePtrGuard<'a, T, D, METADATA_BITS> {
         let guard = ManuallyDrop::new(self.load());
         let curr_meta = {
             Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire)) // FIXME: is this okay - even, when `intermediate` is getting updated?
@@ -272,18 +272,18 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     }
 
     fn load_internal<'a>(&'a self) -> SwapArcIntermediateInternalGuard<'a, T, D, METADATA_BITS> {
-        let ref_cnt = self.curr_ref_cnt.fetch_add(1, Ordering::SeqCst);
+        let ref_cnt = self.curr_ref_cnt.fetch_add(1, Ordering::AcqRel);
         let (ptr, src) = if ref_cnt & Self::UPDATE != 0 {
-            let intermediate_ref_cnt = self.intermediate_ref_cnt.fetch_add(1, Ordering::SeqCst);
+            let intermediate_ref_cnt = self.intermediate_ref_cnt.fetch_add(1, Ordering::AcqRel);
             if intermediate_ref_cnt & Self::UPDATE != 0 {
                 let ret = self.ptr.load(Ordering::Acquire);
                 // release the redundant reference
-                self.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                self.intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                 (ret, RefSource::Curr)
             } else {
                 let ret = self.intermediate_ptr.load(Ordering::Acquire);
                 // release the redundant reference
-                self.curr_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                self.curr_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                 (ret, RefSource::Intermediate)
             }
         } else {
@@ -300,24 +300,24 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     }
 
     fn try_update_curr(&self) -> bool {
-        let ret = match self.curr_ref_cnt.compare_exchange(Self::OTHER_UPDATE, Self::UPDATE, Ordering::SeqCst, Ordering::Relaxed) {
+        let ret = match self.curr_ref_cnt.compare_exchange(Self::OTHER_UPDATE, Self::UPDATE, Ordering::AcqRel, Ordering::Relaxed) {
             Ok(_) => {
                 // FIXME: can we somehow bypass intermediate if we have a new update upcoming - we probably can't because this would probably cause memory leaks and other funny things that we don't like
-                let intermediate = self.intermediate_ptr.load(Ordering::SeqCst);
+                let intermediate = self.intermediate_ptr.load(Ordering::Acquire);
                 // update the pointer
                 let prev = self.ptr.load(Ordering::Acquire);
                 if Self::strip_metadata(prev) != Self::strip_metadata(intermediate) {
                     self.ptr.store(intermediate, Ordering::Release);
                     // unset the update flag
-                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
+                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                     // drop the `virtual reference` we hold to the Arc
                     unsafe { D::from(Self::strip_metadata(prev)); }
                 } else {
                     // unset the update flag
-                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
+                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                 }
                 // unset the `weak` update flag from the intermediate ref cnt
-                self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::SeqCst);
+                self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
                 true
             }
             _ => false,
@@ -326,25 +326,25 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     }
 
     fn try_update_intermediate(&self) {
-        match self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::SeqCst, Ordering::Relaxed) {
+        match self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::AcqRel, Ordering::Relaxed) {
             Ok(_) => {
                 // take the update
-                let update = self.updated.swap(null_mut(), Ordering::SeqCst);
+                let update = self.updated.swap(null_mut(), Ordering::AcqRel);
                 // check if we even have an update
                 if !update.is_null() {
                     let metadata = Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire));
                     let update = Self::merge_ptr_and_metadata(update, metadata).cast_mut();
                     self.intermediate_ptr.store(update, Ordering::Release);
                     // unset the update flag
-                    self.intermediate_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
+                    self.intermediate_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                     // try finishing the update up!
-                    match self.curr_ref_cnt.compare_exchange(0, Self::UPDATE, Ordering::SeqCst, Ordering::Relaxed) {
+                    match self.curr_ref_cnt.compare_exchange(0, Self::UPDATE, Ordering::AcqRel, Ordering::Relaxed) {
                         Ok(_) => {
-                            let prev = self.ptr.swap(update, Ordering::SeqCst);
+                            let prev = self.ptr.swap(update, Ordering::AcqRel);
                             // unset the update flag
-                            self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
+                            self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                             // unset the `weak` update flag from the intermediate ref cnt
-                            self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::SeqCst);
+                            self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
                             // drop the `virtual reference` we hold to the Arc
                             unsafe { D::from(Self::strip_metadata(prev)); }
                         }
@@ -352,7 +352,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                     }
                 } else {
                     // unset the update flags
-                    self.intermediate_ref_cnt.fetch_and(!(Self::UPDATE | Self::OTHER_UPDATE), Ordering::SeqCst);
+                    self.intermediate_ref_cnt.fetch_and(!(Self::UPDATE | Self::OTHER_UPDATE), Ordering::AcqRel);
                 }
             }
             Err(_) => {}
@@ -363,7 +363,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         unsafe { self.update_raw(updated.as_ptr()); }
     }
 
-    unsafe fn update_raw(&self, updated: *const T) {
+    pub unsafe fn update_raw(&self, updated: *const T) {
         let updated = Self::strip_metadata(updated);
         let new = updated.cast_mut();
         let tmp = ManuallyDrop::new(D::from(new));
@@ -371,15 +371,15 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         mem::forget(tmp.clone());
         let backoff = Backoff::new();
         loop {
-            match self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::SeqCst, Ordering::SeqCst) {
+            match self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => {
                     // clear out old updates to make sure our update won't be overwritten by them in the future
-                    let old = self.updated.swap(null_mut(), Ordering::SeqCst);
+                    let old = self.updated.swap(null_mut(), Ordering::AcqRel);
                     let metadata = Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire));
                     let new = Self::merge_ptr_and_metadata(new, metadata).cast_mut();
                     self.intermediate_ptr.store(new, Ordering::Release);
                     // unset the update flag
-                    self.intermediate_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
+                    self.intermediate_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                     if !old.is_null() {
                         // drop the `virtual reference` we hold to the Arc
                         D::from(old);
@@ -387,20 +387,20 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                     // try finishing the update up!
                     loop {
                         let mut curr = 0;
-                        match self.curr_ref_cnt.compare_exchange(curr, Self::UPDATE, Ordering::SeqCst, Ordering::Relaxed) {
+                        match self.curr_ref_cnt.compare_exchange(curr, Self::UPDATE, Ordering::AcqRel, Ordering::Relaxed) {
                             Ok(_) => {
-                                let prev = self.ptr.swap(new, Ordering::SeqCst);
+                                let prev = self.ptr.swap(new, Ordering::AcqRel);
                                 // unset the update flag
-                                self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
+                                self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                                 // unset the `weak` update flag from the intermediate ref cnt
-                                self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::SeqCst);
+                                self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
                                 // drop the `virtual reference` we hold to the Arc
                                 D::from(Self::strip_metadata(prev));
                                 break;
                             }
                             Err(_) => {
                                 // signal that it's allowed to implicitly update this now
-                                if self.curr_ref_cnt.fetch_or(Self::OTHER_UPDATE, Ordering::SeqCst) == 0 {
+                                if self.curr_ref_cnt.fetch_or(Self::OTHER_UPDATE, Ordering::AcqRel) == 0 {
                                     curr = Self::OTHER_UPDATE;
                                     // retry update, as no implicit update can occur anymore
                                     continue;
@@ -418,7 +418,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                         continue;
                     }
                     // push our update up, so it will be applied in the future
-                    let old = self.updated.swap(new, Ordering::SeqCst); // FIXME: should we add some sort of update counter
+                    let old = self.updated.swap(new, Ordering::AcqRel); // FIXME: should we add some sort of update counter
                     // FIXME: to determine which update is the most recent?
                     if !old.is_null() {
                         // drop the `virtual reference` we hold to the Arc
@@ -453,7 +453,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         // FIXME: also what is to be considered the "global state source"? is it `curr` or `updated` - or both in some weird way?
         // FIXME: if the local has some `intermediate` value then we can simply use said value for comparison (but only if the provided source is also `intermediate`)
         // FIXME: OR maybe even if not?
-        if !self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+        if !self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
             return Err(new);
         }
         let intermediate = self.intermediate_ptr.load(Ordering::Acquire);
@@ -463,30 +463,30 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
             intermediate.cast_const() == old
         };
         if !cmp_result {
-            self.intermediate_ref_cnt.fetch_and(!(Self::UPDATE | Self::OTHER_UPDATE), Ordering::SeqCst);
+            self.intermediate_ref_cnt.fetch_and(!(Self::UPDATE | Self::OTHER_UPDATE), Ordering::AcqRel);
             return Ok(false);
         }
         // forget `new` in order to create a `virtual reference`
         let new = ManuallyDrop::new(new);
         let new = new.as_ptr();
         // clear out old updates to make sure our update won't be overwritten by them in the future
-        let old_update = self.updated.swap(null_mut(), Ordering::SeqCst);
+        let old_update = self.updated.swap(null_mut(), Ordering::AcqRel);
         let metadata = Self::get_metadata(intermediate);
         let new = Self::merge_ptr_and_metadata(new, metadata).cast_mut();
         self.intermediate_ptr.store(new, Ordering::Release);
         // unset the update flag
-        self.intermediate_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
+        self.intermediate_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
         if !old_update.is_null() {
             // drop the `virtual reference` we hold to the Arc
             D::from(old_update);
         }
-        match self.curr_ref_cnt.compare_exchange(0, Self::UPDATE, Ordering::SeqCst, Ordering::Relaxed) {
+        match self.curr_ref_cnt.compare_exchange(0, Self::UPDATE, Ordering::AcqRel, Ordering::Relaxed) {
             Ok(_) => {
-                let prev = self.ptr.swap(new, Ordering::SeqCst);
+                let prev = self.ptr.swap(new, Ordering::AcqRel);
                 // unset the update flag
-                self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
+                self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                 // unset the `weak` update flag from the intermediate ref cnt
-                self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::SeqCst);
+                self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
                 // drop the `virtual reference` we hold to the Arc
                 D::from(Self::strip_metadata(prev));
             }
@@ -496,45 +496,45 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     }*/
 
     // FIXME: this causes "deadlocks" if there are any other references alive
-    unsafe fn try_compare_exchange_with_meta(&self, old: *const T, new: *const T) -> bool {
+    pub unsafe fn try_compare_exchange_with_meta(&self, old: *const T, new: *const T) -> bool {
         let backoff = Backoff::new();
-        while !self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+        while !self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
             // back-off
             backoff.snooze();
         }
         let intermediate = self.intermediate_ptr.load(Ordering::Acquire);
         if intermediate.cast_const() != old {
-            self.intermediate_ref_cnt.fetch_and(!(Self::UPDATE | Self::OTHER_UPDATE), Ordering::SeqCst);
+            self.intermediate_ref_cnt.fetch_and(!(Self::UPDATE | Self::OTHER_UPDATE), Ordering::AcqRel);
             return false;
         }
         // clear out old updates to make sure our update won't be overwritten by them in the future
-        let old_update = self.updated.swap(null_mut(), Ordering::SeqCst);
+        let old_update = self.updated.swap(null_mut(), Ordering::AcqRel);
         // increase the ref count
         let tmp = ManuallyDrop::new(D::from(Self::strip_metadata(new)));
         mem::forget(tmp.clone());
         self.intermediate_ptr.store(new.cast_mut(), Ordering::Release);
         // unset the update flag
-        self.intermediate_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
+        self.intermediate_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
         if !old_update.is_null() {
             // drop the `virtual reference` we hold to the Arc
             D::from(old_update);
         }
         loop {
             let mut curr = 0;
-            match self.curr_ref_cnt.compare_exchange(curr, Self::UPDATE, Ordering::SeqCst, Ordering::Relaxed) {
+            match self.curr_ref_cnt.compare_exchange(curr, Self::UPDATE, Ordering::AcqRel, Ordering::Relaxed) {
                 Ok(_) => {
-                    let prev = self.ptr.swap(new.cast_mut(), Ordering::SeqCst/*Ordering::Release*/);
+                    let prev = self.ptr.swap(new.cast_mut(), Ordering::AcqRel/*Ordering::Release*/);
                     // unset the update flag
-                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
+                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                     // unset the `weak` update flag from the intermediate ref cnt
-                    self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::SeqCst);
+                    self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
                     // drop the `virtual reference` we hold to the Arc
                     D::from(Self::strip_metadata(prev));
                     break;
                 }
                 Err(_) => {
                     // signal that it's allowed to implicitly update this now
-                    if self.curr_ref_cnt.fetch_or(Self::OTHER_UPDATE, Ordering::SeqCst) == 0 {
+                    if self.curr_ref_cnt.fetch_or(Self::OTHER_UPDATE, Ordering::AcqRel) == 0 {
                         curr = Self::OTHER_UPDATE;
                         // retry update, as no implicit update can occur anymore
                         continue;
@@ -561,8 +561,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     pub fn try_update_meta(&self, old: *const T, metadata: usize) -> bool {
         let prefix = metadata & Self::META_MASK;
         // FIXME: use this once strict provenance got stabilized
-        // self.intermediate_ptr.compare_exchange(old.cast_mut(), old.map_addr(|x| (x & !Self::META_MASK) | prefix).cast_mut(), Ordering::SeqCst, Ordering::Relaxed).is_ok()
-        self.intermediate_ptr.compare_exchange(old.cast_mut(), ((old as usize & !Self::META_MASK) | prefix) as *mut T, Ordering::SeqCst, Ordering::Relaxed).is_ok()
+        // self.intermediate_ptr.compare_exchange(old.cast_mut(), old.map_addr(|x| (x & !Self::META_MASK) | prefix).cast_mut(), Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        self.intermediate_ptr.compare_exchange(old.cast_mut(), ((old as usize & !Self::META_MASK) | prefix) as *mut T, Ordering::AcqRel, Ordering::Relaxed).is_ok()
     }
 
     pub fn set_in_metadata(&self, active_bits: usize) {
@@ -571,8 +571,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
             let curr = self.intermediate_ptr.load(Ordering::Acquire);
             let prefix = active_bits & Self::META_MASK;
             // FIXME: use this once strict provenance got stabilized
-            // if self.intermediate_ptr.compare_exchange(curr, curr.map_addr(|x| x | prefix), Ordering::SeqCst, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
-            if self.intermediate_ptr.compare_exchange(curr, (curr as usize | prefix) as *mut T, Ordering::SeqCst, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
+            // if self.intermediate_ptr.compare_exchange(curr, curr.map_addr(|x| x | prefix), Ordering::AcqRel, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
+            if self.intermediate_ptr.compare_exchange(curr, (curr as usize | prefix) as *mut T, Ordering::AcqRel, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
                 break;
             }
             backoff.spin(); // FIXME: should we really backoff here? the other thread will make progress anyways and we will only have to spin once more if it makes progress again
@@ -585,8 +585,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
             let curr = self.intermediate_ptr.load(Ordering::Acquire);
             let prefix = inactive_bits & Self::META_MASK;
             // FIXME: use this once strict provenance got stabilized!
-            //if self.intermediate_ptr.compare_exchange(curr, curr.map_addr(|x| x & !prefix), Ordering::SeqCst, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
-            if self.intermediate_ptr.compare_exchange(curr, (curr as usize & !prefix) as *mut T, Ordering::SeqCst, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
+            //if self.intermediate_ptr.compare_exchange(curr, curr.map_addr(|x| x & !prefix), Ordering::AcqRel, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
+            if self.intermediate_ptr.compare_exchange(curr, (curr as usize & !prefix) as *mut T, Ordering::AcqRel, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
                 break;
             }
             backoff.spin(); // FIXME: should we really backoff here? the other thread will make progress anyways and we will only have to spin once more if it makes progress again
@@ -633,13 +633,13 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     /// is queued this will block new readers for a short
     /// amount of time, until failure got detected
     fn force_update(&self) -> UpdateResult {
-        let curr = self.ref_cnt.fetch_or(Self::FORCE_UPDATE, Ordering::SeqCst);
+        let curr = self.ref_cnt.fetch_or(Self::FORCE_UPDATE, Ordering::AcqRel);
         if curr & Self::UPDATE != 0 {
             return UpdateResult::AlreadyUpdating;
         }
-        if self.updated.load(Ordering::SeqCst).is_null() {
+        if self.updated.load(Ordering::AcqRel).is_null() {
             // unset the flag, as there are no upcoming updates
-            self.ref_cnt.fetch_and(!Self::UPDATE, Ordering::SeqCst);
+            self.ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
             return UpdateResult::NoUpdate;
         }
         UpdateResult::Ok
@@ -705,7 +705,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
                                 data.new = mem::take(&mut data.intermediate).make_drop();
                                 // increase the ref count of the new value
                                 mem::forget(data.new.val().clone());
-                                self.parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                                self.parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                             }/* else if !data.intermediate.ptr.is_null() {
                                 // FIXME: add a fallback case for this!
                             }*/
@@ -725,13 +725,13 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
                         data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
                         // increase the ref count of the new value
                         mem::forget(data.new.val().clone());
-                        parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                        parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
             } else {
                 data.intermediate.ref_cnt -= 1;
                 if data.intermediate.ref_cnt == 0 {
-                    parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                    parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                 }
             }
         }
@@ -772,7 +772,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
                                 data.new = mem::take(&mut data.intermediate).make_drop();
                                 // increase the ref count of the new value
                                 mem::forget(data.new.val().clone());
-                                self.parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                                self.parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                             }/* else if !data.intermediate.ptr.is_null() {
                                 // FIXME: add a fallback case for this!
                             }*/
@@ -792,13 +792,13 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
                         data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
                         // increase the ref count of the new value
                         mem::forget(data.new.val().clone());
-                        parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                        parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
             } else {
                 data.intermediate.ref_cnt -= 1;
                 if data.intermediate.ref_cnt == 0 {
-                    parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                    parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                 }
             }
         }
@@ -854,13 +854,13 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
         // release the reference we hold
         match self.ref_src {
             RefSource::Curr => {
-                let ref_cnt = self.parent.curr_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                let ref_cnt = self.parent.curr_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                 if ref_cnt == SwapArcIntermediateTLS::<T, D, METADATA_BITS>::OTHER_UPDATE + 1/*1*/ { // FIXME: is it okay to do nothing on 1?
                     self.parent.try_update_curr();
                 }
             }
             RefSource::Intermediate => {
-                let ref_cnt = self.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::SeqCst);
+                let ref_cnt = self.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                 // fast-rejection path to ensure we are only trying to update if it's worth it
                 // FIXME: this probably isn't correct: Note: UPDATE is set (seldom) on the immediate ref_cnt if there is a forced update waiting in the queue - this comment is pretty outdated as at this point in time forced updating isn't really relevant at all anymore.
                 if (ref_cnt == 1/* || ref_cnt == SwapArcIntermediate::<T>::UPDATE*/) && !self.parent.updated.load(Ordering::Acquire).is_null() {
