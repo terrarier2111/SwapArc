@@ -137,6 +137,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         let updated = Self::strip_metadata(parent.parent().ptr.load(Ordering::Acquire)) == data.curr.ptr;
         if likely(updated && data.new.ref_cnt == 0) {
             data.curr.ref_cnt += 1;
+            // SAFETY: this is safe because the pointer contained inside `curr.ptr` is guaranteed to always be valid
             let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
             return SwapArcIntermediateGuard {
                 parent,
@@ -174,6 +175,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
             // the following conditional relies on preconditions provided by the caller (`load`)
             if data.new.ref_cnt == 0 {
                 let (ptr, gen_cnt) = load_new_slow(this, data);
+                // SAFETY: this is safe because we know that `load_new_slow` returns a pointer that
+                // was acquired through `D::as_ptr` and points to a valid instance of `D`.
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
                 return SwapArcIntermediateGuard {
                     parent,
@@ -182,6 +185,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                 };
             } else if unlikely(data.new.ref_cnt == usize::MAX) {
                 data.new.ref_cnt = 0;
+                // SAFETY: this is safe because we know that the pointer inside `data.curr.ptr`
+                // was acquired through `D::as_ptr` and points to a valid instance of `D`
+                // this is because the instance of `D` this pointer points to has to
+                // have a `virtual reference` that points to it "stored" inside
+                // `data.curr` i.e it has a reference to it leaked on `data.curr`'s
+                // creation.
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
                 return SwapArcIntermediateGuard {
                     parent,
@@ -196,10 +205,15 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                 // and this allows us to save many branches on drop
                 data.curr = mem::take(&mut data.new);
                 if data.intermediate.ref_cnt != 0 {
-                    data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
                     // increase the ref count of the new value
-                    mem::forget(data.new.val().clone());
+                    mem::forget(data.intermediate.val().clone());
+                    // SAFETY: we know that the reference count for the stored `D` got
+                    // increased by us and thus we can decrease it again when
+                    // it isn't needed anymore.
+                    data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
                     parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
+                    // SAFETY: this is safe because `data.new` was just updated by us and thus we know that it
+                    // contains a valid ptr inside its `ptr` field.
                     let fake_ref = ManuallyDrop::new(unsafe { D::from(data.new.ptr) });
                     return SwapArcIntermediateGuard {
                         parent,
@@ -233,6 +247,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                     data.new.ref_cnt += 1;
                     (data.new.ptr, data.new.gen_cnt)
                 };
+                // FIXME: add safety comment!
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
                 return SwapArcIntermediateGuard {
                     parent,
@@ -241,6 +256,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                 };
             } else {
                 data.intermediate.ref_cnt += 1;
+                // SAFETY: we just checked that the ref count of `intermediate` is greater than 0
+                // and thus we know that `intermediate.ptr` has to be a valid value.
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(data.intermediate.ptr) });
                 return SwapArcIntermediateGuard {
                     parent: &parent,
@@ -291,6 +308,9 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         };
         // create a fake reference to the Arc to ensure so that the borrow checker understands
         // that the reference returned from the guard will point to valid memory
+
+        // SAFETY: this is safe because the pointers are protected by their reference counts
+        // and the flags contained inside them.
         let fake_ref = ManuallyDrop::new(unsafe { D::from(Self::strip_metadata(ptr)) });
         SwapArcIntermediateInternalGuard {
             parent: self,
@@ -310,7 +330,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                     self.ptr.store(intermediate, Ordering::Release);
                     // unset the update flag
                     self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
-                    // drop the `virtual reference` we hold to the Arc
+                    // drop the `virtual reference` we hold to the `D`
+
+                    // SAFETY: we know that we hold a `virtual reference` to the `D`
+                    // which `prev` points to and thus we are allowed to drop
+                    // this `virtual reference`, once we replace `self.ptr` (or in other
+                    // words `prev`)
                     unsafe { D::from(Self::strip_metadata(prev)); }
                 } else {
                     // unset the update flag
@@ -345,7 +370,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                             self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                             // unset the `weak` update flag from the intermediate ref cnt
                             self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
-                            // drop the `virtual reference` we hold to the Arc
+                            // drop the `virtual reference` we hold to the `D`
+
+                            // SAFETY: we know that we hold a `virtual reference` to the `D`
+                            // which `prev` points to and thus we are allowed to drop
+                            // this `virtual reference`, once we replace `self.ptr` (or in other
+                            // word `prev`)
                             unsafe { D::from(Self::strip_metadata(prev)); }
                         }
                         Err(_) => {}
@@ -360,12 +390,17 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     }
 
     pub fn update(&self, updated: D) {
+        // SAFETY: we know that `updated` is an instance of `D`, so we can generate a valid ptr to its content.
         unsafe { self.update_raw(updated.as_ptr()); }
     }
 
+    /// SAFETY: `updated` has to be a pointer that points to a valid instance
+    /// of `T` and has to be acquired by calling `D::as_ptr` or via similar means.
     pub unsafe fn update_raw(&self, updated: *const T) {
+        // FIXME: add safety comments to this function!
         let updated = Self::strip_metadata(updated);
         let new = updated.cast_mut();
+        // SAFETY: this is safe because the caller promises that `updated` is valid.
         let tmp = ManuallyDrop::new(D::from(new));
         // increase the ref count
         mem::forget(tmp.clone());
@@ -381,7 +416,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                     // unset the update flag
                     self.intermediate_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                     if !old.is_null() {
-                        // drop the `virtual reference` we hold to the Arc
+                        // drop the `virtual reference` we hold to the `D`
                         D::from(old);
                     }
                     // try finishing the update up!
@@ -394,7 +429,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                                 self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                                 // unset the `weak` update flag from the intermediate ref cnt
                                 self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
-                                // drop the `virtual reference` we hold to the Arc
+                                // drop the `virtual reference` we hold to the `D`
                                 D::from(Self::strip_metadata(prev));
                                 break;
                             }
@@ -421,7 +456,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                     let old = self.updated.swap(new, Ordering::AcqRel); // FIXME: should we add some sort of update counter
                     // FIXME: to determine which update is the most recent?
                     if !old.is_null() {
-                        // drop the `virtual reference` we hold to the Arc
+                        // drop the `virtual reference` we hold to the `D`
                         D::from(old);
                     }
                     break;
@@ -497,6 +532,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
 
     // FIXME: this causes "deadlocks" if there are any other references alive
     pub unsafe fn try_compare_exchange_with_meta(&self, old: *const T, new: *const T) -> bool {
+        // FIXME: add safety comments!
         let backoff = Backoff::new();
         while !self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
             // back-off
@@ -652,6 +688,9 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
         // FIXME: how should we handle intermediate inside drop?
         let updated = *self.updated.get_mut();
         if !updated.is_null() {
+            // SAFETY: we know that we hold a `virtual reference` to the `D`
+            // which `updated` points to and thus we are allowed to drop
+            // this `virtual reference`, once we drop the `SwapArc`.
             unsafe { D::from(updated); }
         }
         let curr = Self::strip_metadata(*self.ptr.get_mut());
@@ -660,7 +699,11 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
             // FIXME: the reason why we have to do this currently is because the update function doesn't work properly, fix the root cause!
             unsafe { D::from(intermediate); }
         }
-        // drop the current arc
+        // drop the current `D`
+
+        // SAFETY: we know that we hold a `virtual reference` to the `D`
+        // which `curr` points to and thus we are allowed to drop
+        // this `virtual reference`, once we drop the `SwapArc`.
         unsafe { D::from(curr); }
     }
 }
@@ -682,7 +725,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediatePtrGu
 
 impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Clone for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
     fn clone(&self) -> Self {
-        unsafe { self.parent.parent().load_raw() }
+        self.parent.parent().load_raw()
     }
 }
 
@@ -694,25 +737,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
         let data = unsafe { self.parent.inner.get().as_mut().unwrap_unchecked() };
         // release the reference we hold
         if likely(self.gen_cnt == data.curr.gen_cnt) {
-            /*if data.curr.ref_cnt == 0 {
-                println!("1: {} | 2: {} | 3: {} | 4: {}", self.fake_ref.as_ptr() == data.new.ptr, data.new.ref_cnt, self.fake_ref.as_ptr() == data.intermediate.ptr, data.intermediate.ref_cnt);
-            }*/
             data.curr.ref_cnt -= 1;
-            /*if data.curr.ref_cnt == 0 {
-                    if data.new.ref_cnt != 0 {
-                        data.curr = mem::take(&mut data.new);
-                            if data.intermediate.ref_cnt != 0 {
-                                data.new = mem::take(&mut data.intermediate).make_drop();
-                                // increase the ref count of the new value
-                                mem::forget(data.new.val().clone());
-                                self.parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
-                            }/* else if !data.intermediate.ptr.is_null() {
-                                // FIXME: add a fallback case for this!
-                            }*/
-                    }/* else if !data.new.ptr.is_null() {
-                        // FIXME: add a fallback case for this!
-                    }*/
-            }*/
         } else {
             slow_drop(self.parent, data, self.gen_cnt);
         }
@@ -722,9 +747,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
                 data.new.ref_cnt -= 1;
                 if data.new.ref_cnt == 0 {
                     if data.intermediate.ref_cnt != 0 {
-                        data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
                         // increase the ref count of the new value
-                        mem::forget(data.new.val().clone());
+                        mem::forget(data.intermediate.val().clone());
+                        // SAFETY: we know that the reference count for the stored `D` got
+                        // increased by us and thus we can decrease it again when
+                        // it isn't needed anymore.
+                        data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
                         parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
@@ -761,25 +789,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
         let data = unsafe { self.parent.inner.get().as_mut().unwrap_unchecked() };
         // release the reference we hold
         if likely(self.gen_cnt == data.curr.gen_cnt) {
-            /*if data.curr.ref_cnt == 0 {
-                println!("1: {} | 2: {} | 3: {} | 4: {}", self.fake_ref.as_ptr() == data.new.ptr, data.new.ref_cnt, self.fake_ref.as_ptr() == data.intermediate.ptr, data.intermediate.ref_cnt);
-            }*/
             data.curr.ref_cnt -= 1;
-            /*if data.curr.ref_cnt == 0 {
-                    if data.new.ref_cnt != 0 {
-                        data.curr = mem::take(&mut data.new);
-                            if data.intermediate.ref_cnt != 0 {
-                                data.new = mem::take(&mut data.intermediate).make_drop();
-                                // increase the ref count of the new value
-                                mem::forget(data.new.val().clone());
-                                self.parent.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
-                            }/* else if !data.intermediate.ptr.is_null() {
-                                // FIXME: add a fallback case for this!
-                            }*/
-                    }/* else if !data.new.ptr.is_null() {
-                        // FIXME: add a fallback case for this!
-                    }*/
-            }*/
         } else {
             slow_drop(self.parent, data, self.gen_cnt);
         }
@@ -789,9 +799,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
                 data.new.ref_cnt -= 1;
                 if data.new.ref_cnt == 0 {
                     if data.intermediate.ref_cnt != 0 {
-                        data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
                         // increase the ref count of the new value
-                        mem::forget(data.new.val().clone());
+                        mem::forget(data.intermediate.val().clone());
+                        // SAFETY: we know that the reference count for the stored `D` got
+                        // increased by us and thus we can decrease it again when
+                        // it isn't needed anymore.
+                        data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
                         parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
@@ -892,8 +905,8 @@ enum RefSource {
 
 struct LocalData<T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
     parent: *const SwapArcIntermediateTLS<T, D, METADATA_BITS>, // this acts as a reference with hidden lifetime that only we know is safe because
-                                                                                   // `parent` won't be used in the drop impl and `LocalData` can only be accessed
-                                                                                   // through `parent`
+                                                                // `parent` won't be used in the drop impl and `LocalData` can only be accessed
+                                                                // through `parent`
     inner: UnsafeCell<LocalDataInner<T, D>>,
 }
 
@@ -908,8 +921,6 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> LocalData<T, D, METADATA
 
 }
 
-// FIXME: add safety comment (the gist is that this will only ever be used when `parent` is dropped)
-unsafe impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Sync for LocalData<T, D, METADATA_BITS> {}
 // SAFETY: this is safe because `parent` has to be alive when `LocalData` gets used
 // as it is only reachable through a valid reference to `SwapArc`
 unsafe impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Send for LocalData<T, D, METADATA_BITS> {}
@@ -930,12 +941,14 @@ struct LocalCounted<T, D: DataPtrConvert<T> = Arc<T>, const DROP: bool = false> 
 
 impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
 
-    fn new(parent: &mut LocalDataInner<T, D>, ptr: *const T) -> Self {
+    /// SAFETY: The caller has to ensure that the safety invariants relied upon
+    /// in the `val`, `refill_unchecked` and `drop` methods are valid.
+    unsafe fn new(parent: &mut LocalDataInner<T, D>, ptr: *const T) -> Self {
         let gen_cnt = parent.next_gen_cnt;
         let res = parent.next_gen_cnt.overflowing_add(1);
         // if an overflow occurs, we add an additional 1 to the result in order to never
         // reach 0
-        parent.next_gen_cnt = res.0 + unsafe { transmute::<bool, u8>(res.1) } as usize;
+        parent.next_gen_cnt = res.0 + res.1 as usize;
         Self {
             gen_cnt,
             ptr,
@@ -946,6 +959,8 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
 
     #[inline]
     fn val(&self) -> ManuallyDrop<D> {
+        // SAFETY: this is safe because we know that the pointer
+        // we hold has to be valid as long as our `gen_cnt` isn't `0`.
         ManuallyDrop::new(unsafe { D::from(self.ptr) })
     }
 
@@ -975,6 +990,9 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
 
 impl<T, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
 
+    /// SAFETY: callers have to make sure that the value behind the `ptr`
+    /// contained inside this struct may be dropped as soon as this struct
+    /// gets dropped.
     #[inline]
     unsafe fn make_drop(mut self) -> LocalCounted<T, D, true> {
         LocalCounted {
@@ -1030,7 +1048,10 @@ pub trait DataPtrConvert<T>: RefCnt + Sized {
     /// reference counted "object" indirectly, by automatically
     /// decrementing it on drop inside the "object"'s drop
     /// implementation.
-    fn into(self) -> *const T;
+    #[inline]
+    fn into(self) -> *const T {
+        self.as_ptr()
+    }
 
     /// This function should NOT decrement the reference count of the
     /// reference counted "object" in any way, shape or form.
@@ -1054,13 +1075,6 @@ impl<T> DataPtrConvert<T> for Arc<T> {
         Arc::from_raw(ptr)
     }
 
-    fn into(self) -> *const T {
-        let ret = Arc::into_raw(self);
-        // decrement the reference count
-        unsafe { <Self as DataPtrConvert<T>>::from(ret); }
-        ret
-    }
-
     #[inline]
     fn as_ptr(&self) -> *const T {
         Arc::as_ptr(self)
@@ -1076,18 +1090,6 @@ impl<T> DataPtrConvert<T> for Option<Arc<T>> {
             Some(Arc::from_raw(ptr))
         } else {
             None
-        }
-    }
-
-    fn into(self) -> *const T {
-        match self {
-            None => null(),
-            Some(val) => {
-                let ret = Arc::into_raw(val);
-                // decrement the reference count
-                unsafe { <Self as DataPtrConvert<T>>::from(ret); }
-                ret
-            },
         }
     }
 
