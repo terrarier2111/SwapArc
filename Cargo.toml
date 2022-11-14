@@ -19,7 +19,12 @@ static_assertions = "1.1.0"
 rand = "0.8.5"
 crossbeam-utils = "0.8.12"
 likely_stable = "0.1.2"
-arc-swap = "1.5.1"
+# arc-swap = "1.5.1"
+arc-swap = { version = "1.5.1", optional = true }
 
 [dev-dependencies]
-arc-swap = "1.5.1"
+
+[[bench]]
+name = "swap_arc"
+required-features = ["arc-swap"]
+harness = false

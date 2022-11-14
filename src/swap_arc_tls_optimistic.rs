@@ -162,7 +162,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                 if data.new.gen_cnt != 0 {
                     data.new.refill_unchecked(new_ptr);
                 } else {
-                    let new = LocalCounted::new(data, new_ptr);
+                    let new = unsafe { LocalCounted::new(data, new_ptr) };
                     data.new = new;
                 }
                 data.new.gen_cnt
@@ -234,7 +234,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                         if data.intermediate.gen_cnt != 0 {
                             data.intermediate.refill_unchecked(loaded);
                         } else {
-                            let new = LocalCounted::new(data, loaded);
+                            let new = unsafe { LocalCounted::new(data, loaded) };
                             data.intermediate = new;
                         }
                         (loaded, data.intermediate.gen_cnt)
