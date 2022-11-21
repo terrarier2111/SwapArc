@@ -183,7 +183,6 @@ impl<T: Send + Sync> CachedLocalArc<T> {
 impl<T: Send + Sync> Clone for CachedLocalArc<T> {
     #[inline]
     fn clone(&self) -> Self {
-        let curr = self.inner;
         let curr = unsafe { self.inner().cache.get().unwrap_unchecked() };
         let cnts = unsafe { &mut *curr.cached_cnt.get() };
         cnts.ref_cnt += 1;
