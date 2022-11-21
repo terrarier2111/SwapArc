@@ -9,6 +9,7 @@ mod swap_arc_tls;
 mod swap_arc;
 mod swap_arc_tls_less_fence;
 mod swap_arc_tls_optimistic;
+mod cached_arc;
 
 use std::{mem, thread};
 use std::hint::{black_box, spin_loop};
@@ -25,6 +26,7 @@ extern crate test;
 use test::Bencher;
 #[cfg(test)]
 use arc_swap::ArcSwap;
+use crate::cached_arc::CachedArc;
 
 fn main() {
     /*for _ in 0..10 {
@@ -113,7 +115,7 @@ fn main() {
     }
     threads.into_iter().for_each(|thread| thread.join().unwrap());*/
     // let tmp = Arc::new(ArcSwap::new(Arc::new(3)));
-    let tmp: Arc<SwapArcIntermediateTLS<i32, Arc<i32>, 0>> = Arc::new(SwapArcIntermediateTLS::new(Arc::new(3)));
+    let tmp = CachedArc::new(3);
     let mut threads = vec![];
     for _ in 0..20/*5*//*1*/ {
         let tmp = tmp.clone();
@@ -129,7 +131,7 @@ fn main() {
                 black_box(l3);
                 black_box(l4);
                 black_box(l5);*/
-                let l1 = tmp.load();
+                let l1 = tmp.clone();
                 black_box(l1);
             }
         }));
@@ -502,6 +504,146 @@ fn bench_arc_read_light_single(bencher: &mut Bencher) {
                 for _ in 0..200000/*200*/ {
                     let l1 = tmp.clone();
                     black_box(l1);
+                }
+            }));
+        }
+        threads.into_iter().for_each(|thread| thread.join().unwrap());
+    });
+}
+
+#[bench]
+fn bench_arc_read_heavy_multi(bencher: &mut Bencher) {
+    let tmp = Arc::new(3);
+    bencher.iter(|| {
+        let mut threads = vec![];
+        for _ in 0..20/*5*//*1*/ {
+            let tmp = tmp.clone();
+            threads.push(thread::spawn(move || {
+                for _ in 0..200000/*200*/ {
+                    let l1 = tmp.clone();
+                    let l2 = tmp.clone();
+                    let l3 = tmp.clone();
+                    let l4 = tmp.clone();
+                    let l5 = tmp.clone();
+                    black_box(l1);
+                    black_box(l2);
+                    black_box(l3);
+                    black_box(l4);
+                    black_box(l5);
+                }
+            }));
+        }
+        threads.into_iter().for_each(|thread| thread.join().unwrap());
+    });
+}
+
+#[bench]
+fn bench_arc_read_light_multi(bencher: &mut Bencher) {
+    let tmp = Arc::new(3);
+    bencher.iter(|| {
+        let mut threads = vec![];
+        for _ in 0..1/*5*//*1*/ {
+            let tmp = tmp.clone();
+            threads.push(thread::spawn(move || {
+                for _ in 0..200000/*200*/ {
+                    let l1 = tmp.clone();
+                    let l2 = tmp.clone();
+                    let l3 = tmp.clone();
+                    let l4 = tmp.clone();
+                    let l5 = tmp.clone();
+                    black_box(l1);
+                    black_box(l2);
+                    black_box(l3);
+                    black_box(l4);
+                    black_box(l5);
+                }
+            }));
+        }
+        threads.into_iter().for_each(|thread| thread.join().unwrap());
+    });
+}
+
+#[bench]
+fn bench_cached_read_heavy_single(bencher: &mut Bencher) {
+    let tmp = CachedArc::new(3);
+    bencher.iter(|| {
+        let mut threads = vec![];
+        for _ in 0..20/*5*//*1*/ {
+            let tmp = tmp.clone();
+            threads.push(thread::spawn(move || {
+                for _ in 0..200000/*200*/ {
+                    let l1 = tmp.clone();
+                    black_box(l1);
+                }
+            }));
+        }
+        threads.into_iter().for_each(|thread| thread.join().unwrap());
+    });
+}
+
+#[bench]
+fn bench_cached_read_light_single(bencher: &mut Bencher) {
+    let tmp = CachedArc::new(3);
+    bencher.iter(|| {
+        let mut threads = vec![];
+        for _ in 0..1/*5*//*1*/ {
+            let tmp = tmp.clone();
+            threads.push(thread::spawn(move || {
+                for _ in 0..200000/*200*/ {
+                    let l1 = tmp.clone();
+                    black_box(l1);
+                }
+            }));
+        }
+        threads.into_iter().for_each(|thread| thread.join().unwrap());
+    });
+}
+
+#[bench]
+fn bench_cached_read_heavy_multi_local(bencher: &mut Bencher) {
+    let tmp = CachedArc::new(3);
+    bencher.iter(|| {
+        let mut threads = vec![];
+        for _ in 0..20/*5*//*1*/ {
+            let tmp = tmp.clone();
+            threads.push(thread::spawn(move || {
+                for _ in 0..200000/*200*/ {
+                    let l1 = tmp.downgrade_cloned();
+                    let l2 = l1.clone();
+                    let l3 = l1.clone();
+                    let l4 = l1.clone();
+                    let l5 = l1.clone();
+                    black_box(l1);
+                    black_box(l2);
+                    black_box(l3);
+                    black_box(l4);
+                    black_box(l5);
+                }
+            }));
+        }
+        threads.into_iter().for_each(|thread| thread.join().unwrap());
+    });
+}
+
+#[bench]
+fn bench_cached_read_light_multi_local(bencher: &mut Bencher) {
+    let tmp = CachedArc::new(3);
+    bencher.iter(|| {
+        let mut threads = vec![];
+        for _ in 0..1/*5*//*1*/ {
+            let tmp = tmp.clone();
+            threads.push(thread::spawn(move || {
+                for _ in 0..200000/*200*/ {
+                    let l1 = tmp.downgrade_cloned();
+                    let l2 = l1.clone();
+                    let l3 = l1.clone();
+                    let l4 = l1.clone();
+                    let l5 = l1.clone();
+                    black_box(l1);
+                    black_box(l2);
+                    black_box(l3);
+                    black_box(l4);
+                    black_box(l5);
                 }
             }));
         }
