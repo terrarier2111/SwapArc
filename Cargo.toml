@@ -5,6 +5,9 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+ptr-ops = []
+
 [profile.release]
 debug = true
 
@@ -15,13 +18,16 @@ rustflags = ["-Clink-arg=-fuse-ld=lld", "-Clink-arg=-Wl,--no-rosegment"]
 [dependencies]
 # thread_local = "1.1.4"
 # thread_local = { git = "https://github.com/terrarier2111/thread_local-rs", branch = "improve-safely" }
-thread_local = { git = "https://github.com/terrarier2111/thread_local-rs" }
+thread_local = { git = "https://github.com/terrarier2111/thread_local-rs", branch = "stable", features = ["nightly"] }
+#thread_local = { git = "https://github.com/terrarier2111/thread_local-rs" }
+# thread_local = "1.1.4"
 static_assertions = "1.1.0"
 rand = "0.8.5"
 crossbeam-utils = "0.8.12"
 likely_stable = "0.1.2"
-# arc-swap = "1.5.1"
-arc-swap = { version = "1.5.1", optional = true }
+cfg-if = "1.0.0"
+arc-swap = "1.5.1"
+# arc-swap = { version = "1.5.1", optional = true }
 
 [dev-dependencies]
 

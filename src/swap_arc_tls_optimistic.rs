@@ -9,6 +9,7 @@ use std::ops::Deref;
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, fence, Ordering};
+use cfg_if::cfg_if;
 use crossbeam_utils::{Backoff, CachePadded};
 use thread_local::ThreadLocal;
 
@@ -36,24 +37,28 @@ const fn most_sig_set_bit(val: usize) -> Option<u32> {
 /// In order to achieve this, an internal reference count
 /// scheme is used which allows for very quick, low overhead
 /// reads in the common case (no update) and will sill be
-/// decently fast when an update is performed, as updates
-/// only consist of 3 atomic instructions. When a new
+/// decently fast when an update is performed. When a new
 /// `Arc` is to be stored in the `SwapArc`, it first tries to
-/// immediately update the current pointer (the one all readers will see)
+/// immediately update the current pointer (the one all readers will see in the uncontended case)
 /// (this is possible, if no other update is being performed and if there are no readers left)
-/// if this fails, it will `push` the update so that it will
-/// be performed by the last reader to finish reading.
+/// if this fails, it will try to do the same thing with the `intermediate` pointer
+/// and if even that fails, it will `push` the update so that it will
+/// be performed by the last `intermediate` reader to finish reading.
 /// A read consists of loading the current pointer and
 /// performing a clone operation on the `Arc`, thus
-/// readers are very short-lived and shouldn't block
-/// updates for very long, although writer starvation
-/// is possible in theory, it probably won't every be
-/// observed in practice because of the short-lived
-/// nature of readers.
+/// readers are very short-lived and can't block
+/// updates for very long.
+/// A `read` in this case refers to the process of acquiring
+/// the shared pointer which gets handled by the `SwapArc`
+/// itself internally. Note that such a `read` isn't what would
+/// typically happen when `load` gets called as such a call
+/// usually (in the case of no update) will only result
+/// in a single `Relaxed` atomic load and a couple of
+/// non-atomic bookkeeping operations utilizing TLS
+/// to cache atomic accesses.
 
-/// This variant of `SwapArc` has wait-free reads (although
-/// this is at the cost of additional atomic instructions
-/// (at least 1 additional load - this will never be more than 1 load if there are no updates happening).
+/// This variant of `SwapArc` has wait-free reads.
+///
 pub struct SwapArcIntermediateTLS<T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
     curr_ref_cnt: AtomicUsize, // the last bit is the `update` bit
     ptr: AtomicPtr<T>,
@@ -92,6 +97,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
 
     /// SAFETY: this is only safe to call if the caller increments the
     /// reference count of the "object" `val` points to.
+    #[cfg(feature = "ptr-ops")]
     pub unsafe fn new_raw(val: *const T) -> Self {
         let free_bits = most_sig_set_bit(align_of::<T>()).unwrap_or(0);
         if free_bits < METADATA_BITS { // FIXME: make sure this check is optimized away at compile time!
@@ -135,8 +141,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
 
         // ORDERING: `ptr` doesn't have to care about anything other than itself
         // as it, itself is protected by other atomics, so we can use `Relaxed`
-        let updated = Self::strip_metadata(parent.parent().ptr.load(Ordering::Relaxed)) == data.curr.ptr;
-        if likely(updated && data.new.ref_cnt == 0) {
+        let no_update = Self::strip_metadata(parent.parent().ptr.load(Ordering::Relaxed)) == data.curr.ptr;
+        if likely(no_update && data.new.ref_cnt == 0) {
             data.curr.ref_cnt += 1;
             // SAFETY: this is safe because the pointer contained inside `curr.ptr` is guaranteed to always be valid
             let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
@@ -148,32 +154,32 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         }
 
         #[cold]
-        fn load_new_slow<'a, T, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(this: &'a SwapArcIntermediateTLS<T, D, { META_DATA_BITS }>, data: &'a mut LocalDataInner<T, D>) -> (*const T, usize) {
-            let curr = this.load_internal();
-            // increase the strong reference count
-            mem::forget(curr.fake_ref.clone());
-            let new_ptr = curr.fake_ref.as_ptr();
-
-            let gen_cnt = if data.curr.ref_cnt == 0 {
-                // don't modify the gen_cnt
-                data.curr.refill_unchecked(new_ptr);
-                data.curr.gen_cnt
-            } else {
-                // data.new.refill(data, new_ptr);
-                if data.new.gen_cnt != 0 {
-                    data.new.refill_unchecked(new_ptr);
-                } else {
-                    let new = unsafe { LocalCounted::new(data, new_ptr) };
-                    data.new = new;
-                }
-                data.new.gen_cnt
-            };
-            (new_ptr, gen_cnt)
-        }
-
-        #[cold]
         fn load_slow<'a, T, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(this: &'a SwapArcIntermediateTLS<T, D, { META_DATA_BITS }>, parent: &'a LocalData<T, D, META_DATA_BITS>, data: &mut LocalDataInner<T, D>) -> SwapArcIntermediateGuard<'a, T, D, META_DATA_BITS> {
+            fn load_new_slow<'a, T, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(this: &'a SwapArcIntermediateTLS<T, D, { META_DATA_BITS }>, data: &'a mut LocalDataInner<T, D>) -> (*const T, usize) {
+                let curr = this.load_internal();
+                // increase the strong reference count
+                mem::forget(curr.fake_ref.clone());
+                let new_ptr = curr.fake_ref.as_ptr();
+
+                let gen_cnt = if data.curr.ref_cnt == 0 {
+                    // don't modify the gen_cnt
+                    data.curr.refill_unchecked(new_ptr);
+                    data.curr.gen_cnt
+                } else {
+                    // data.new.refill(data, new_ptr);
+                    if data.new.gen_cnt != 0 {
+                        data.new.refill_unchecked(new_ptr);
+                    } else {
+                        let new = unsafe { LocalCounted::new(data, new_ptr) };
+                        data.new = new;
+                    }
+                    data.new.gen_cnt
+                };
+                (new_ptr, gen_cnt)
+            }
+
             // the following conditional relies on preconditions provided by the caller (`load`)
+            // to be precise we rely on `parent.ptr` to be different from `curr.ptr`
             if data.new.ref_cnt == 0 {
                 let (ptr, gen_cnt) = load_new_slow(this, data);
                 // SAFETY: this is safe because we know that `load_new_slow` returns a pointer that
@@ -185,6 +191,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                     gen_cnt,
                 };
             } else if unlikely(data.new.ref_cnt == usize::MAX) {
+                // we now know that we are the first load to occur on the current thread
                 data.new.ref_cnt = 0;
                 // SAFETY: this is safe because we know that the pointer inside `data.curr.ptr`
                 // was acquired through `D::as_ptr` and points to a valid instance of `D`
@@ -283,6 +290,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     }
 
     /// Loads the pointer with metadata into a guard which protects it partially.
+    #[cfg(feature = "ptr-ops")]
     pub fn load_raw<'a>(&'a self) -> SwapArcIntermediatePtrGuard<'a, T, D, METADATA_BITS> {
         let guard = ManuallyDrop::new(self.load());
         // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
@@ -418,12 +426,19 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     /// Update the value inside the SwapArc to value passed in `updated`.
     pub fn update(&self, updated: D) {
         // SAFETY: we know that `updated` is an instance of `D`, so we can generate a valid ptr to its content.
-        unsafe { self.update_raw(updated.as_ptr()); }
+        unsafe { self._update_raw(updated.as_ptr()); }
     }
 
     /// SAFETY: `updated` has to be a pointer that points to a valid instance
     /// of `T` and has to be acquired by calling `D::as_ptr` or via similar means.
+    #[cfg(feature = "ptr-ops")]
     pub unsafe fn update_raw(&self, updated: *const T) {
+        self._update_raw(updated);
+    }
+
+    /// SAFETY: `updated` has to be a pointer that points to a valid instance
+    /// of `T` and has to be acquired by calling `D::as_ptr` or via similar means.
+    unsafe fn _update_raw(&self, updated: *const T) {
         // FIXME: add safety comments to this function!
         let updated = Self::strip_metadata(updated);
         let new = updated.cast_mut();
@@ -466,7 +481,9 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                             }
                             Err(_) => {
                                 // signal that it's allowed to implicitly update this now
-                                // FIXME: are we sure this can't race even if we are using Relaxed for the failure load of the above cmp_exchg?
+
+                                // ORDERING: the failure ordering of `Relaxed` can't race because we are performing an `Acquire`
+                                // ordered atomic operation right here.
                                 if self.curr_ref_cnt.fetch_or(Self::OTHER_UPDATE, Ordering::AcqRel) == 0 {
                                     curr = Self::OTHER_UPDATE;
                                     // retry update, as no implicit update can occur anymore
@@ -484,7 +501,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                         // somebody else already updates the current ptr, so we wait until they finish their update
                         continue;
                     }
-                    // this links with the cmp_exchg above as we only need syncing if we are actually doing something
+                    // ORDERING: this links with the cmp_exchg above as we only need syncing if we are actually doing something
                     // other than spinning
                     fence(Ordering::Acquire);
                     // push our update up, so it will be applied in the future
@@ -573,11 +590,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
             // back-off
             backoff.snooze();
         }
+        // This load may be `Relaxed` because it is guarded by the `intermediate_ref_cnt`.
         let intermediate = self.intermediate_ptr.load(Ordering::Relaxed);
         if intermediate.cast_const() != old {
-            // We use Acquire here because we have a Release above with which we can establish a happens-before relationship with the RMW (compare_exchange)
-            // above
-            self.intermediate_ref_cnt.fetch_and(!(Self::UPDATE | Self::OTHER_UPDATE), Ordering::AcqRel/*Ordering::Acquire*/); // FIXME: is it okay if the load directly above isn't synced? - it's probably okay!
+            // ORDERING: We use Acquire here because we have a Release above with which we can establish
+            // a happens-before relationship with the RMW (compare_exchange) above
+            self.intermediate_ref_cnt.fetch_and(!(Self::UPDATE | Self::OTHER_UPDATE), Ordering::AcqRel/*Ordering::Acquire*/);
             return false;
         }
         // clear out old updates to make sure our update won't be overwritten by them in the future
@@ -596,7 +614,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
             let mut curr = 0;
             match self.curr_ref_cnt.compare_exchange(curr, Self::UPDATE, Ordering::AcqRel, Ordering::Relaxed) {
                 Ok(_) => {
-                    // FIXME: Relaxed should be okay because curr_ref_cnt guards `ptr`
+                    // ORDERING: Relaxed should be okay because curr_ref_cnt guards `ptr`
                     // and ensures that other threads see the update because
                     // of the happens-before-relationship between
                     let prev = self.ptr.swap(new.cast_mut(), Ordering::Relaxed);
@@ -726,19 +744,19 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         self.intermediate_ptr.load(Ordering::Relaxed) as usize & Self::META_MASK
     }
 
-    #[inline]
+    #[inline(always)]
     fn get_metadata(ptr: *const T) -> usize {
         ptr as usize & Self::META_MASK
     }
 
-    #[inline]
+    #[inline(always)]
     fn strip_metadata(ptr: *const T) -> *const T {
         // FIXME: use this once strict_provenance has been stabilized
         // ptr.map_addr(|x| x & !Self::META_MASK)
         (ptr as usize & !Self::META_MASK) as *const T
     }
 
-    #[inline]
+    #[inline(always)]
     fn merge_ptr_and_metadata(ptr: *const T, metadata: usize) -> *const T {
         // FIXME: use this once strict_provenance has been stabilized
         // ptr.map_addr(|x| x | metadata)
@@ -801,68 +819,72 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
     }
 }
 
-pub struct SwapArcIntermediatePtrGuard<'a, T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
-    parent: &'a LocalData<T, D, METADATA_BITS>,
-    ptr: *const T,
-    gen_cnt: usize,
-}
-
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
-
-    #[inline]
-    pub fn as_raw(&self) -> *const T {
-        self.ptr
-    }
-
-}
-
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Clone for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
-    fn clone(&self) -> Self {
-        self.parent.parent().load_raw()
-    }
-}
-
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
-    fn drop(&mut self) {
-        // SAFETY: This is safe because we know that we are the only thread that
-        // is able to access the thread local data at this time and said data has to be initialized
-        // and we also know, that the pointer has to be non-null
-        let data = unsafe { self.parent.inner.get().as_mut().unwrap_unchecked() };
-        // release the reference we hold
-        if likely(self.gen_cnt == data.curr.gen_cnt) {
-            data.curr.ref_cnt -= 1;
-        } else {
-            slow_drop(self.parent, data, self.gen_cnt);
+cfg_if! {
+    if #[cfg(feature = "ptr-ops")] {
+        pub struct SwapArcIntermediatePtrGuard<'a, T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
+            parent: &'a LocalData<T, D, METADATA_BITS>,
+            ptr: *const T,
+            gen_cnt: usize,
         }
-        #[cold]
-        fn slow_drop<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>(parent: &LocalData<T, D, METADATA_BITS>, data: &mut LocalDataInner<T, D>, gen_cnt: usize) {
-            if gen_cnt == data.new.gen_cnt {
-                data.new.ref_cnt -= 1;
-                if data.new.ref_cnt == 0 {
-                    if data.intermediate.ref_cnt != 0 {
-                        // increase the ref count of the new value
-                        mem::forget(data.intermediate.val().clone());
-                        // SAFETY: we know that the reference count for the stored `D` got
-                        // increased by us and thus we can decrease it again when
-                        // it isn't needed anymore.
-                        data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
-                        parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
-                    }
+
+        impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
+
+            #[inline]
+            pub fn as_raw(&self) -> *const T {
+                self.ptr
+            }
+
+        }
+
+        impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Clone for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
+            fn clone(&self) -> Self {
+                self.parent.parent().load_raw()
+            }
+        }
+
+        impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
+            fn drop(&mut self) {
+                // SAFETY: This is safe because we know that we are the only thread that
+                // is able to access the thread local data at this time and said data has to be initialized
+                // and we also know, that the pointer has to be non-null
+                let data = unsafe { self.parent.inner.get().as_mut().unwrap_unchecked() };
+                // release the reference we hold
+                if likely(self.gen_cnt == data.curr.gen_cnt) {
+                    data.curr.ref_cnt -= 1;
+                } else {
+                    slow_drop(self.parent, data, self.gen_cnt);
                 }
-            } else {
-                data.intermediate.ref_cnt -= 1;
-                if data.intermediate.ref_cnt == 0 {
-                    parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
+                #[cold]
+                fn slow_drop<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>(parent: &LocalData<T, D, METADATA_BITS>, data: &mut LocalDataInner<T, D>, gen_cnt: usize) {
+                    if gen_cnt == data.new.gen_cnt {
+                        data.new.ref_cnt -= 1;
+                        if data.new.ref_cnt == 0 {
+                            if data.intermediate.ref_cnt != 0 {
+                                // increase the ref count of the new value
+                                mem::forget(data.intermediate.val().clone());
+                                // SAFETY: we know that the reference count for the stored `D` got
+                                // increased by us and thus we can decrease it again when
+                                // it isn't needed anymore.
+                                data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
+                                parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
+                            }
+                        }
+                    } else {
+                        data.intermediate.ref_cnt -= 1;
+                        if data.intermediate.ref_cnt == 0 {
+                            parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
                 }
             }
         }
-    }
-}
 
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Debug for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let tmp = format!("{:?}", self.ptr);
-        f.write_str(tmp.as_str())
+        impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Debug for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                let tmp = format!("{:?}", self.ptr);
+                f.write_str(tmp.as_str())
+            }
+        }
     }
 }
 
@@ -968,26 +990,11 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermed
             RefSource::Intermediate => {
                 let ref_cnt = self.parent.intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
                 // fast-rejection path to ensure we are only trying to update if it's worth it
-                // FIXME: this probably isn't correct: Note: UPDATE is set (seldom) on the immediate ref_cnt if there is a forced update waiting in the queue - this comment is pretty outdated as at this point in time forced updating isn't really relevant at all anymore.
-                if (ref_cnt == 1/* || ref_cnt == SwapArcIntermediate::<T>::UPDATE*/) && !self.parent.updated.load(Ordering::Acquire).is_null() {
+                if ref_cnt == 1 && !self.parent.updated.load(Ordering::Relaxed).is_null() {
                     self.parent.try_update_intermediate();
                 }
             }
         }
-    }
-}
-
-impl<T, D: DataPtrConvert<T> + Display, const METADATA_BITS: u32> Display for SwapArcIntermediateInternalGuard<'_, T, D, METADATA_BITS> {
-    #[inline]
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        D::fmt(self.fake_ref.deref(), f)
-    }
-}
-
-impl<T, D: DataPtrConvert<T> + Debug, const METADATA_BITS: u32> Debug for SwapArcIntermediateInternalGuard<'_, T, D, METADATA_BITS> {
-    #[inline]
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        D::fmt(self.fake_ref.deref(), f)
     }
 }
 
@@ -1129,6 +1136,9 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCounted<T, D, DROP
 
 /// SAFETY: Types implementing this trait are expected to perform
 /// reference counting through cloning/dropping internally.
+/// To be precise, the `RefCnt` is expected to increment
+/// the reference count on `clone` calls, and decrement
+/// it on `drop`.
 pub unsafe trait RefCnt: /*Send + Sync + */Clone {} // FIXME: is not having a Send + Sync bound correct here?
 
 pub trait DataPtrConvert<T>: RefCnt + Sized {
@@ -1194,12 +1204,18 @@ impl<T> DataPtrConvert<T> for Option<Arc<T>> {
     }
 }
 
+/// This function indicates whether the current target does really
+/// have a weak compare exchange method.
+/// NOTE: It **Must not** be relied upon for correctness.
 #[inline(always)]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const fn is_cmp_exchg_really_weak() -> bool {
     false
 }
 
+/// This function indicates whether the current target does really
+/// have a weak compare exchange method.
+/// NOTE: It **Must not** be relied upon for correctness.
 #[inline(always)]
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 const fn is_cmp_exchg_really_weak() -> bool {
