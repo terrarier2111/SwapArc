@@ -120,7 +120,7 @@ fn main() {
     }
     threads.into_iter().for_each(|thread| thread.join().unwrap());*/
     // let tmp = Arc::new(ArcSwap::new(Arc::new(3)));
-    let tmp = CachedArc::new(3);
+    let tmp = AutoLocalArc::new(3);
     let mut threads = vec![];
     for _ in 0..20/*5*//*1*/ {
         let tmp = tmp.clone();

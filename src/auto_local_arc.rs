@@ -103,7 +103,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
     fn drop(&mut self) {
         let cache = unsafe { &**self.cache.get() };
         if cache.thread_id == thread_id() {
-            let ref_cnt = cache.ref_cnt.load(Ordering::Relaxed);
+            let ref_cnt = cache.ref_cnt.load(Ordering::Relaxed); // FIXME: for some reason in some cases ref_cnt underflows
             cache.ref_cnt.store(ref_cnt - 1, Ordering::Relaxed);
             if ref_cnt == cache.debt.load(Ordering::Relaxed) {
                 // there are no external refs alive
