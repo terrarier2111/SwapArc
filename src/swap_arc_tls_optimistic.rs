@@ -610,8 +610,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
             // drop the `virtual reference` we hold to the Arc
             D::from(old_update);
         }
+        let mut curr = 0;
         loop {
-            let mut curr = 0;
             match self.curr_ref_cnt.compare_exchange(curr, Self::UPDATE, Ordering::AcqRel, Ordering::Relaxed) {
                 Ok(_) => {
                     // ORDERING: Relaxed should be okay because curr_ref_cnt guards `ptr`
