@@ -33,7 +33,6 @@ impl<T: Send + Sync> AutoLocalArc<T> {
                 debt: Default::default(),
                 thread_id: thread_id(),
                 src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
-                detached: AtomicBool::new(false),
             }))))
         }).0;
         let ret = Self {
@@ -50,26 +49,18 @@ impl<T: Send + Sync> AutoLocalArc<T> {
 
 }
 
-const MAX_REFCOUNT: usize = (isize::MAX) as usize / 2;
-const MAX_HARD_REFCOUNT: usize = (isize::MAX) as usize;
+/// We have to choose a lower highest ref cnt than the std lib as we are using the last bit to store metadata
+const MAX_REFCOUNT: usize = MAX_HARD_REFCOUNT / 2;
+const MAX_HARD_REFCOUNT: usize = (isize::MAX) as usize / 2;
 
 impl<T: Send + Sync> Clone for AutoLocalArc<T> {
+    #[inline]
     fn clone(&self) -> Self {
         let cache = unsafe { &**self.cache.get() };
         let cache = if cache.thread_id == thread_id() {
             let ref_cnt = cache.ref_cnt.load(Ordering::Relaxed);
             if ref_cnt > MAX_REFCOUNT {
-                #[cold]
-                fn handle_large_ref_count<T: Send + Sync>(cache: &CachePadded<Cache<T>>, ref_cnt: usize) {
-                    // try to recover by decrementing the `debt` count from the `ref_cnt` and setting the `debt` count to 0
-                    let debt = cache.debt.swap(0, Ordering::Relaxed);
-                    let ref_cnt = ref_cnt - debt;
-                    cache.ref_cnt.store(ref_cnt, Ordering::Relaxed);
-                    if ref_cnt > MAX_HARD_REFCOUNT {
-                        abort();
-                    }
-                }
-                handle_large_ref_count(cache, ref_cnt);
+                unsafe { handle_large_ref_count(cache, ref_cnt); }
             }
             cache.ref_cnt.store(ref_cnt + 1, Ordering::Relaxed);
             unsafe { *self.cache.get() }
@@ -81,13 +72,28 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     src: AtomicPtr::new((cache as *const CachePadded<Cache<T>>).cast_mut()),
                     debt: Default::default(),
                     thread_id: thread_id(),
-                    ref_cnt: AtomicUsize::new(1),
-                    detached: AtomicBool::new(false),
+                    ref_cnt: AtomicUsize::new(0),
                 }))))
             }).0 };
-            local_cache.src.store((cache as *const CachePadded<Cache<T>>).cast_mut(), Ordering::Relaxed);
-            // remove the reference to the external cache, as we moved it to our own cache instead
-            *unsafe { &mut *self.cache.get() } = local_cache as *const _;
+            if local_cache.ref_cnt.load(Ordering::Relaxed) == strip_flags(local_cache.debt.load(Ordering::Relaxed)) {
+                // the local cache has no valid references anymore
+                local_cache.src.store((cache as *const CachePadded<Cache<T>>).cast_mut(), Ordering::Relaxed); // FIXME: can the lack of synchronization between these three updates lead to race conditions?
+                local_cache.debt.store(0, Ordering::Relaxed);
+                local_cache.ref_cnt.store(1, Ordering::Relaxed);
+                // remove the reference to the external cache, as we moved it to our own cache instead
+                *unsafe { &mut *self.cache.get() } = local_cache as *const _;
+            } else {
+                // the local cache is still in use
+                let ref_cnt = local_cache.ref_cnt.load(Ordering::Relaxed);
+                if ref_cnt > MAX_REFCOUNT {
+                    unsafe { handle_large_ref_count(local_cache, ref_cnt); }
+                }
+                local_cache.ref_cnt.store(ref_cnt + 1, Ordering::Relaxed);
+                // FIXME: here is probably a possibility for a race condition (what if we have one of the instances on another thread and it gets freed right
+                // FIXME: after we check if ref_cnt == debt?) this can probably be fixed by checking again right after increasing the ref_count and
+                // FIXME: handling failure by doing what we would have done if the local cache had no valid references to begin with.
+            }
+
             local_cache as *const _
         };
 
@@ -98,25 +104,42 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
     }
 }
 
+/// Safety: this method may only be called with the local cache as the `cache` parameter.
+#[cold]
+unsafe fn handle_large_ref_count<T: Send + Sync>(cache: &CachePadded<Cache<T>>, ref_cnt: usize) {
+    // try to recover by decrementing the `debt` count from the `ref_cnt` and setting the `debt` count to 0
+    // note: the `detached` flag can't be set because this method is only called with the `local_cache` as the `cache` parameter
+    let debt = cache.debt.swap(0, Ordering::Relaxed); // FIXME: can the lack of synchronization between these two updates lead to race conditions?
+    let ref_cnt = ref_cnt - debt;
+    cache.ref_cnt.store(ref_cnt, Ordering::Relaxed);
+    if ref_cnt > MAX_HARD_REFCOUNT {
+        abort();
+    }
+}
+
 impl<T: Send + Sync> Drop for AutoLocalArc<T> {
     #[inline]
     fn drop(&mut self) {
         let cache = unsafe { &**self.cache.get() };
         if cache.thread_id == thread_id() {
-            let ref_cnt = cache.ref_cnt.load(Ordering::Relaxed); // FIXME: for some reason in some cases ref_cnt underflows
+            let ref_cnt = cache.ref_cnt.load(Ordering::Relaxed);
             cache.ref_cnt.store(ref_cnt - 1, Ordering::Relaxed);
-            if ref_cnt == cache.debt.load(Ordering::Relaxed) {
+            // `ref_cnt` can't race with `debt` here because we are the only ones who are able to update `ref_cnt`
+            let debt = cache.debt.load(Ordering::Relaxed);
+            if ref_cnt == strip_flags(debt) {
                 // there are no external refs alive
-                cache.cleanup();
+                cache.cleanup(is_detached(debt));
             }
         } else {
-            let new_refs = cache.debt.fetch_add(1, Ordering::Relaxed);
+            let new_refs = strip_flags(cache.debt.fetch_add(1, Ordering::Relaxed));
             if new_refs > MAX_HARD_REFCOUNT {
                 abort();
             }
-            if new_refs == cache.ref_cnt.load(Ordering::Relaxed) {
+            if new_refs == cache.ref_cnt.load(Ordering::Relaxed) { // FIXME: ref_cnt can probably race with `debt` here
+                                                                         // FIXME: so what we need to do is add further validation after this check
+                                                                         // FIXME: this is probably in form of HazardPointers or the like
                 // there are no external refs alive
-                cache.cleanup();
+                cache.cleanup(is_detached(new_refs));
             }
         }
     }
@@ -141,25 +164,25 @@ impl<T: Send + Sync> Deref for AutoLocalArc<T> {
 #[repr(C)]
 struct InnerCachedArc<T: Send + Sync> {
     val: T,
-    cache: ThreadLocal<DetachablePtr<T>>, // FIXME: only store a pointer to a `CachePadded<Cache<T>>` in here.
+    cache: ThreadLocal<DetachablePtr<T>>,
 }
 
 struct Cache<T: Send + Sync> {
     parent: *const InnerCachedArc<T>,
     thread_id: u64,
     src: AtomicPtr<CachePadded<Cache<T>>>,
-    debt: AtomicUsize, // this debt count may only be updated by threads other than the current one.
+    debt: AtomicUsize, // this debt count may only be updated by threads other than the current one - this has a `detached` flag as its last bit
     ref_cnt: AtomicUsize, // this ref cnt may only be updated by the current thread
-    detached: AtomicBool,
 }
 
 impl<T: Send + Sync> Cache<T> {
 
-    fn cleanup(&self) {
+    fn cleanup(self: &CachePadded<Self>, detached: bool) {
+        // FIXME: check for `detached` and deallocate own memory if detached
         // there are no external refs alive
         if self.src.load(Ordering::Relaxed).is_null() {
             // we are the first "(cache) node", so we need to free the memory
-            fence(Ordering::AcqRel);
+            fence(Ordering::AcqRel); // FIXME: make sure this fence is coupled with some other atomic operation!
             unsafe { drop_slow::<T>(self.parent.cast_mut()); }
 
             #[cold]
@@ -169,12 +192,23 @@ impl<T: Send + Sync> Cache<T> {
         } else {
             // FIXME: we have other caches above us, so release a reference to them - this has to happen recursively tho as they could have to release their last reference as well.
             // FIXME: this should work - now make it iterative instead of recursive!
-            let cache = unsafe { &*self.src.load(Ordering::Relaxed) };
-            let ref_cnt = cache.debt.fetch_add(1, Ordering::Relaxed);
-            if ref_cnt == cache.ref_cnt.load(Ordering::Relaxed) {
-                cache.cleanup();
+            let super_cache = unsafe { &*self.src.load(Ordering::Relaxed) };
+            let ref_cnt = super_cache.debt.fetch_add(1, Ordering::Relaxed);
+            // `ref_cnt` can't be updated after the cache was detached, so we can safely test for the `detached` flag
+            let super_detached = ref_cnt & DETACHED_FLAG != 0;
+            if strip_flags(ref_cnt) == super_cache.ref_cnt.load(Ordering::Relaxed) {
+                super_cache.cleanup(super_detached);
             }
         }
+        if detached {
+            fence(Ordering::AcqRel); // FIXME: make sure this fence is coupled with some other atomic operation!
+            unsafe { Box::from_raw((self as *const CachePadded<Self>).cast_mut()) };
+        }
+    }
+
+    #[inline]
+    fn get_debt_no_meta(&self, ordering: Ordering) -> usize {
+        self.debt.load(ordering) & !DETACHED_FLAG
     }
 
 }
@@ -201,7 +235,19 @@ impl<T: Send + Sync> DetachablePtr<T> {
 impl<T: Send + Sync> Drop for DetachablePtr<T> {
     #[inline]
     fn drop(&mut self) {
-        unsafe { &*self.0 }.detached.store(true, Ordering::Relaxed);
+        // FIXME: only detach if there are external references left! - this could be a bit tricky but we can probably use HazardPointers or reference counter
+        // FIXME: tagging if there's no other good option!
+        if !self.0.is_null() {
+            println!("dropping detachable ptr!");
+            // unsafe { &*self.0 }.detached.store(true, Ordering::Relaxed);
+            let cache = unsafe { &*self.0 };
+            let ref_cnt = cache.ref_cnt.load(Ordering::Relaxed);
+            let debt = cache.debt.fetch_or(DETACHED_FLAG, Ordering::Relaxed); // FIXME: this probably wants some different ordering
+            // here no race condition can occur because we are the only ones who can update `ref_cnt` // FIXME: but can `debt`'s orderings still make data races possible?
+            if debt == ref_cnt {
+                cache.cleanup(true);
+            }
+        }
     }
 }
 
@@ -211,4 +257,16 @@ unsafe impl<T: Send + Sync> Send for DetachablePtr<T> {}
 fn thread_id() -> u64 {
     // thread::current().id().as_u64().get()
     thread_id::get() as u64
+}
+
+const DETACHED_FLAG: usize = 1 << (usize::BITS - 1);
+
+#[inline(always)]
+const fn strip_flags(debt: usize) -> usize {
+    debt & !DETACHED_FLAG
+}
+
+#[inline(always)]
+const fn is_detached(debt: usize) -> bool {
+    debt & DETACHED_FLAG != 0
 }

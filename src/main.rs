@@ -1,4 +1,5 @@
 #![feature(core_intrinsics)]
+#![feature(arbitrary_self_types)]
 // only for testing!
 #![allow(soft_unstable)]
 #![feature(test)]
@@ -122,10 +123,10 @@ fn main() {
     // let tmp = Arc::new(ArcSwap::new(Arc::new(3)));
     let tmp = AutoLocalArc::new(3);
     let mut threads = vec![];
-    for _ in 0..20/*5*//*1*/ {
+    for _ in 0..5/*20*//*5*//*1*/ {
         let tmp = tmp.clone();
         threads.push(thread::spawn(move || {
-            for _ in 0..20000/*200*/ {
+            for _ in 0..200/*20000*//*200*/ {
                 /*let l1 = tmp.load();
                 let l2 = tmp.load();
                 let l3 = tmp.load();
