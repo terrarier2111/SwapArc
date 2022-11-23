@@ -1,9 +1,10 @@
 use std::cell::UnsafeCell;
-use std::mem::ManuallyDrop;
+use std::mem::{align_of, ManuallyDrop, size_of};
 use std::ops::Deref;
 use std::process::abort;
 use std::{mem, ptr, thread};
-use std::ptr::null_mut;
+use std::alloc::{alloc, dealloc, Layout, LayoutError};
+use std::ptr::{NonNull, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, fence, Ordering};
 use crossbeam_utils::CachePadded;
 use thread_local::ThreadLocal;
@@ -21,19 +22,18 @@ unsafe impl<T: Send + Sync> Sync for AutoLocalArc<T> {}
 impl<T: Send + Sync> AutoLocalArc<T> {
 
     pub fn new(val: T) -> Self {
-        let tmp = Box::new(InnerCachedArc {
+        let inner = SizedBox::new(InnerCachedArc {
             val,
             cache: Default::default(),
-        });
-        let inner = Box::into_raw(tmp) as *mut InnerCachedArc<T>;
+        }).into_ptr().as_ptr();
         let cache = unsafe { &*inner }.cache.get_or(|| {
-            DetachablePtr(Box::into_raw(Box::new(CachePadded::new(Cache {
+            DetachablePtr(SizedBox::new(CachePadded::new(Cache {
                 parent: inner,
                 ref_cnt: AtomicUsize::new(1),
                 debt: Default::default(),
                 thread_id: thread_id(),
                 src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
-            }))))
+            })).into_ptr().as_ptr())
         }).0;
         let ret = Self {
             inner,
@@ -67,13 +67,13 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
         } else {
             let inner = self.inner;
             let local_cache = unsafe { &*self.inner().cache.get_or(|| {
-                DetachablePtr(Box::into_raw(Box::new(CachePadded::new(Cache {
+                DetachablePtr(SizedBox::new(CachePadded::new(Cache {
                     parent: inner,
                     src: AtomicPtr::new((cache as *const CachePadded<Cache<T>>).cast_mut()),
                     debt: Default::default(),
                     thread_id: thread_id(),
                     ref_cnt: AtomicUsize::new(0),
-                }))))
+                })).into_ptr().as_ptr())
             }).0 };
             if local_cache.ref_cnt.load(Ordering::SeqCst) == local_cache.debt.load(Ordering::SeqCst) {
                 // the local cache has no valid references anymore
@@ -192,7 +192,7 @@ impl<T: Send + Sync> Cache<T> {
 
             #[cold]
             unsafe fn drop_slow<T: Send + Sync>(ptr: *mut InnerCachedArc<T>) {
-                drop(unsafe { Box::from_raw(ptr) });
+                drop(unsafe { SizedBox::from_ptr(NonNull::new_unchecked(ptr)) });
             }
         } else {
             // FIXME: we have other caches above us, so release a reference to them - this has to happen recursively tho as they could have to release their last reference as well.
@@ -207,7 +207,7 @@ impl<T: Send + Sync> Cache<T> {
         }
         if detached {
             fence(Ordering::AcqRel); // FIXME: make sure this fence is coupled with some other atomic operation!
-            unsafe { Box::from_raw((self as *const CachePadded<Self>).cast_mut()) };
+            unsafe { SizedBox::from_ptr(NonNull::new_unchecked((self as *const CachePadded<Self>).cast_mut())) };
         }
     }
 
@@ -254,7 +254,7 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
             }
         } else {
             // we are being dropped after the main struct got dropped, clean up!
-            unsafe { Box::from_raw(self.0.cast_mut()) };
+            unsafe { SizedBox::from_ptr(NonNull::new_unchecked(self.0.cast_mut())) };
         }
     }
 }
@@ -277,4 +277,70 @@ const fn strip_flags(debt: usize) -> usize {
 #[inline(always)]
 const fn is_detached(debt: usize) -> bool {
     debt & DETACHED_FLAG != 0
+}
+
+struct SizedBox<T> {
+    alloc_ptr: NonNull<T>,
+}
+
+impl<T> SizedBox<T> {
+    const LAYOUT: Layout = {
+        match Layout::from_size_align(size_of::<T>(), align_of::<T>()) {
+            Ok(layout) => layout,
+            Err(_) => panic!("Layout error!"),
+        }
+    }; // FIXME: can we somehow retain the error message?
+
+    fn new(val: T) -> Self {
+        // SAFETY: The layout we provided was checked at compiletime, so it has to be initialized correctly
+        let alloc = unsafe { alloc(Self::LAYOUT) }.cast::<T>();
+        // FIXME: add safety comment
+        unsafe {
+            alloc.write(val);
+        }
+        Self {
+            alloc_ptr: NonNull::new(alloc).unwrap(), // FIXME: can we make this unchecked?
+        }
+    }
+
+    fn as_ref(&self) -> &T {
+        // SAFETY: This is safe because we know that alloc_ptr can't be zero
+        // and because we know that alloc_ptr has to point to a valid
+        // instance of T in memory
+        unsafe { &*self.alloc_ptr.as_ptr() }
+    }
+
+    fn as_mut(&mut self) -> &mut T {
+        // SAFETY: This is safe because we know that alloc_ptr can't be zero
+        // and because we know that alloc_ptr has to point to a valid
+        // instance of T in memory
+        unsafe { &mut *self.alloc_ptr.as_ptr() }
+    }
+
+    #[inline]
+    fn into_ptr(self) -> NonNull<T> {
+        let ret = self.alloc_ptr;
+        mem::forget(self);
+        ret
+    }
+
+    #[inline]
+    unsafe fn from_ptr(ptr: NonNull<T>) -> Self {
+        Self {
+            alloc_ptr: ptr,
+        }
+    }
+}
+
+impl<T> Drop for SizedBox<T> {
+    fn drop(&mut self) {
+        // SAFETY: This is safe to call because SizedBox can only be dropped once
+        unsafe {
+            ptr::drop_in_place(self.alloc_ptr.as_ptr());
+        }
+        // FIXME: add safety comment
+        unsafe {
+            dealloc(self.alloc_ptr.as_ptr().cast::<u8>(), SizedBox::<T>::LAYOUT);
+        }
+    }
 }
