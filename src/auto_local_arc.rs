@@ -25,9 +25,9 @@ impl<T: Send + Sync> AutoLocalArc<T> {
             val,
             cache: Default::default(),
         });
-        let inner = Box::leak(tmp) as *mut InnerCachedArc<T>;
+        let inner = Box::into_raw(tmp) as *mut InnerCachedArc<T>;
         let cache = unsafe { &*inner }.cache.get_or(|| {
-            DetachablePtr(Box::leak(Box::new(CachePadded::new(Cache {
+            DetachablePtr(Box::into_raw(Box::new(CachePadded::new(Cache {
                 parent: inner,
                 ref_cnt: AtomicUsize::new(1),
                 debt: Default::default(),
@@ -67,7 +67,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
         } else {
             let inner = self.inner;
             let local_cache = unsafe { &*self.inner().cache.get_or(|| {
-                DetachablePtr(Box::leak(Box::new(CachePadded::new(Cache {
+                DetachablePtr(Box::into_raw(Box::new(CachePadded::new(Cache {
                     parent: inner,
                     src: AtomicPtr::new((cache as *const CachePadded<Cache<T>>).cast_mut()),
                     debt: Default::default(),
@@ -185,6 +185,7 @@ impl<T: Send + Sync> Cache<T> {
         // FIXME: check for `detached` and deallocate own memory if detached
         // there are no external refs alive
         if self.src.load(Ordering::SeqCst).is_null() {
+            self.ref_cnt.fetch_or(DETACHED_FLAG, Ordering::SeqCst);
             // we are the first "(cache) node", so we need to free the memory
             fence(Ordering::AcqRel); // FIXME: make sure this fence is coupled with some other atomic operation!
             unsafe { drop_slow::<T>(self.parent.cast_mut()); }
@@ -241,16 +242,19 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
     fn drop(&mut self) {
         // FIXME: only detach if there are external references left! - this could be a bit tricky but we can probably use HazardPointers or reference counter
         // FIXME: tagging if there's no other good option!
-        if !self.0.is_null() {
+        let cache = unsafe { &*self.0 };
+        if !is_detached(cache.ref_cnt.load(Ordering::SeqCst)) {
             println!("dropping detachable ptr!");
             // unsafe { &*self.0 }.detached.store(true, Ordering::SeqCst);
-            let cache = unsafe { &*self.0 };
             let ref_cnt = cache.ref_cnt.load(Ordering::SeqCst);
             let debt = cache.debt.fetch_or(DETACHED_FLAG, Ordering::SeqCst); // FIXME: this probably wants some different ordering
             // here no race condition can occur because we are the only ones who can update `ref_cnt` // FIXME: but can `debt`'s orderings still make data races possible?
             if debt == ref_cnt {
                 cache.cleanup(true);
             }
+        } else {
+            // we are being dropped after the main struct got dropped, clean up!
+            unsafe { Box::from_raw(self.0.cast_mut()) };
         }
     }
 }
