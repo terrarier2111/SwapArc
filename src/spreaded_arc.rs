@@ -51,13 +51,14 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 
 impl<T: Send + Sync> Clone for SpreadedArc<T> {
     fn clone(&self) -> Self {
-        let inner = self.inner();
+        let inner = self.inner;
         let cache = unsafe { self.inner.as_ref().unwrap_unchecked() }.cache.get_or(|| {
             Cache {
                 parent: inner,
                 cached_cnt: CachePadded::new(AtomicUsize::new(0)),
             }
         });
+        // FIXME: only do local counting if it's worth it!
         if unlikely(cache.cached_cnt.fetch_add(1, Ordering::Relaxed) == 0) {
             // fence(Ordering::Acquire);
             unsafe { self.cache.as_ref().unwrap_unchecked().parent.as_ref().unwrap_unchecked() }.global_cnt.fetch_add(1, Ordering::Relaxed);
