@@ -56,22 +56,44 @@ server.config.update(Arc::new(Config {
 
 ### Benchmarks
 
-``Date: 09.11.2022``
+``Date: 21.11.2022``
 
-<details><summary>CPU: AMD Ryzen 5 3600 6-Core Processor</summary>
+<details><summary>CPU: AMD Ryzen 7 2700 (16) @ 3.200GHz </summary>
 <p>
 
 ```jsx
-test bench_other_multi             ... bench: 337,077,090 ns/iter (+/- 13,378,624)
-test bench_other_read_heavy_multi  ... bench:  26,604,620 ns/iter (+/- 2,268,690)
-test bench_other_read_heavy_single ... bench:   4,744,525 ns/iter (+/- 347,515)
-test bench_other_single            ... bench: 338,127,170 ns/iter (+/- 12,416,516)
-test bench_us_multi                ... bench:  29,804,930 ns/iter (+/- 1,830,429)
-test bench_us_read_heavy_multi     ... bench:  24,220,320 ns/iter (+/- 410,629)
-test bench_us_read_heavy_single    ... bench:   4,989,780 ns/iter (+/- 128,699)
-test bench_us_single               ... bench:  25,904,060 ns/iter (+/- 973,951)
-```
+test bench_arc_read_heavy_single   ... bench: 113,045,390 ns/iter (+/- 3,037,919)
+test bench_arc_read_light_single   ... bench:   5,993,131 ns/iter (+/- 1,097,352)
+test bench_other_read_heavy_multi  ... bench:  42,352,095 ns/iter (+/- 10,582,939)
+test bench_other_read_heavy_single ... bench:   7,240,837 ns/iter (+/- 225,284)
+test bench_other_read_light_single ... bench:   7,513,911 ns/iter (+/- 2,107,815)
+test bench_us_multi                ... bench:  24,163,411 ns/iter (+/- 1,379,801)
+test bench_us_read_heavy_multi     ... bench:  24,132,540 ns/iter (+/- 6,651,946)
+test bench_us_read_heavy_single    ... bench:   4,151,779 ns/iter (+/- 352,967)
+test bench_us_read_light_single    ... bench:   2,646,784 ns/iter (+/- 444,961)
+test bench_us_single               ... bench:  18,519,491 ns/iter (+/- 703,753)
+```    
+    
+</p>
+</details>
 
+
+<details><summary>CPU: Intel i5-7200U (4) @ 3.100GHz </summary>
+<p>
+
+```jsx
+test bench_arc_read_heavy_single   ... bench: 151,675,598 ns/iter (+/- 22,690,925)
+test bench_arc_read_light_single   ... bench:   2,526,499 ns/iter (+/- 116,747)
+test bench_other_read_heavy_multi  ... bench: 145,097,272 ns/iter (+/- 6,514,778)
+test bench_other_read_heavy_single ... bench:  32,727,815 ns/iter (+/- 4,309,793)
+test bench_other_read_light_single ... bench:   3,696,212 ns/iter (+/- 169,270)
+test bench_us_multi                ... bench:  36,482,013 ns/iter (+/- 2,250,393)
+test bench_us_read_heavy_multi     ... bench:  62,337,136 ns/iter (+/- 6,026,757)
+test bench_us_read_heavy_single    ... bench:  14,542,977 ns/iter (+/- 2,224,343)
+test bench_us_read_light_single    ... bench:   1,429,254 ns/iter (+/- 289,592)
+test bench_us_single               ... bench:  29,470,658 ns/iter (+/- 2,413,649)
+```    
+    
 </p>
 </details>
 
@@ -144,8 +166,6 @@ test bench_us_single               ... bench: 11,651,460 ns/iter (+/- 366,257)
 </p>
 </details>
 
----
-
 <details><summary>CPU: Intel i3-3110M (4) @ 2.4GHz</summary>
 <p>
 
@@ -202,43 +222,21 @@ test bench_us_single               ... bench: 24,220,657 ns/iter (+/- 1,698,348)
 </p>
 </details>    
 
-``Date: 21.11.2022``
+``Date: 09.11.2022``
 
-<details><summary>CPU: AMD Ryzen 7 2700 (16) @ 3.200GHz </summary>
+<details><summary>CPU: AMD Ryzen 5 3600 6-Core Processor</summary>
 <p>
 
 ```jsx
-test bench_arc_read_heavy_single   ... bench: 113,045,390 ns/iter (+/- 3,037,919)
-test bench_arc_read_light_single   ... bench:   5,993,131 ns/iter (+/- 1,097,352)
-test bench_other_read_heavy_multi  ... bench:  42,352,095 ns/iter (+/- 10,582,939)
-test bench_other_read_heavy_single ... bench:   7,240,837 ns/iter (+/- 225,284)
-test bench_other_read_light_single ... bench:   7,513,911 ns/iter (+/- 2,107,815)
-test bench_us_multi                ... bench:  24,163,411 ns/iter (+/- 1,379,801)
-test bench_us_read_heavy_multi     ... bench:  24,132,540 ns/iter (+/- 6,651,946)
-test bench_us_read_heavy_single    ... bench:   4,151,779 ns/iter (+/- 352,967)
-test bench_us_read_light_single    ... bench:   2,646,784 ns/iter (+/- 444,961)
-test bench_us_single               ... bench:  18,519,491 ns/iter (+/- 703,753)
-```    
-    
-</p>
-</details>
+test bench_other_multi             ... bench: 337,077,090 ns/iter (+/- 13,378,624)
+test bench_other_read_heavy_multi  ... bench:  26,604,620 ns/iter (+/- 2,268,690)
+test bench_other_read_heavy_single ... bench:   4,744,525 ns/iter (+/- 347,515)
+test bench_other_single            ... bench: 338,127,170 ns/iter (+/- 12,416,516)
+test bench_us_multi                ... bench:  29,804,930 ns/iter (+/- 1,830,429)
+test bench_us_read_heavy_multi     ... bench:  24,220,320 ns/iter (+/- 410,629)
+test bench_us_read_heavy_single    ... bench:   4,989,780 ns/iter (+/- 128,699)
+test bench_us_single               ... bench:  25,904,060 ns/iter (+/- 973,951)
+```
 
-
-<details><summary>CPU: Intel i5-7200U (4) @ 3.100GHz </summary>
-<p>
-
-```jsx
-test bench_arc_read_heavy_single   ... bench: 151,675,598 ns/iter (+/- 22,690,925)
-test bench_arc_read_light_single   ... bench:   2,526,499 ns/iter (+/- 116,747)
-test bench_other_read_heavy_multi  ... bench: 145,097,272 ns/iter (+/- 6,514,778)
-test bench_other_read_heavy_single ... bench:  32,727,815 ns/iter (+/- 4,309,793)
-test bench_other_read_light_single ... bench:   3,696,212 ns/iter (+/- 169,270)
-test bench_us_multi                ... bench:  36,482,013 ns/iter (+/- 2,250,393)
-test bench_us_read_heavy_multi     ... bench:  62,337,136 ns/iter (+/- 6,026,757)
-test bench_us_read_heavy_single    ... bench:  14,542,977 ns/iter (+/- 2,224,343)
-test bench_us_read_light_single    ... bench:   1,429,254 ns/iter (+/- 289,592)
-test bench_us_single               ... bench:  29,470,658 ns/iter (+/- 2,413,649)
-```    
-    
 </p>
 </details>
