@@ -5,6 +5,7 @@
 #![feature(test)]
 #![feature(bench_black_box)]
 #![feature(thread_id_value)]
+#![feature(pointer_byte_offsets)]
 
 mod swap_arc_intermediate;
 mod swap_arc_tls;
@@ -121,7 +122,19 @@ fn main() {
     }
     threads.into_iter().for_each(|thread| thread.join().unwrap());*/
     // let tmp = Arc::new(ArcSwap::new(Arc::new(3)));
+    // let tmp = AutoLocalArc::new(3);
     let tmp = AutoLocalArc::new(3);
+    let mut threads = vec![];
+    for _ in 0..8/*20*//*5*//*1*/ {
+        let tmp = tmp.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..4000/*200000*//*200*/ {
+                let l1 = tmp.clone();
+                black_box(l1);
+            }
+        }));
+    }
+    threads.into_iter().for_each(|thread| thread.join().unwrap());
     /*let mut threads = vec![];
     for _ in 0..5/*20*//*5*//*1*/ {
         let tmp = tmp.clone();
@@ -142,7 +155,21 @@ fn main() {
             }
         }));
     }
-    /*for _ in 0..200/*20000*//*200*/ {
+    /*for _ in 0..20/*5*//*1*/ {
+        let tmp = tmp.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..20000/*200*/ {
+                tmp.update(Arc::new(rand::random()));
+            }
+        }));
+    }*/
+    threads.into_iter().for_each(|thread| thread.join().unwrap());*/
+    /*let tmp1 = tmp.clone();
+    thread::spawn(move || {
+        let l1 = tmp1.clone();
+        black_box(l1);
+    });
+    for _ in 0..200/*20000*//*200*/ {
         /*let l1 = tmp.load();
         let l2 = tmp.load();
         let l3 = tmp.load();
@@ -156,15 +183,6 @@ fn main() {
         let l1 = tmp.clone();
         black_box(l1);
     }*/
-    /*for _ in 0..20/*5*//*1*/ {
-        let tmp = tmp.clone();
-        threads.push(thread::spawn(move || {
-            for _ in 0..20000/*200*/ {
-                tmp.update(Arc::new(rand::random()));
-            }
-        }));
-    }*/
-    threads.into_iter().for_each(|thread| thread.join().unwrap());*/
 }
 
 fn bad_bench_us_multi() {
