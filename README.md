@@ -73,6 +73,8 @@ test bench_us_read_heavy_single    ... bench:   4,151,779 ns/iter (+/- 352,967)
 test bench_us_read_light_single    ... bench:   2,646,784 ns/iter (+/- 444,961)
 test bench_us_single               ... bench:  18,519,491 ns/iter (+/- 703,753)
 ```    
+
+![](https://i.imgur.com/nb2SRae.png)    
     
 </p>
 </details>
@@ -93,6 +95,8 @@ test bench_us_read_heavy_single    ... bench:  14,542,977 ns/iter (+/- 2,224,343
 test bench_us_read_light_single    ... bench:   1,429,254 ns/iter (+/- 289,592)
 test bench_us_single               ... bench:  29,470,658 ns/iter (+/- 2,413,649)
 ```    
+    
+![](https://i.imgur.com/WizxTJq.png)    
     
 </p>
 </details>
@@ -144,8 +148,10 @@ test bench_us_multi                ... bench:  28,347,380 ns/iter (+/- 1,399,337
 test bench_us_read_heavy_multi     ... bench:  21,812,110 ns/iter (+/- 178,127)
 test bench_us_read_heavy_single    ... bench:   4,378,230 ns/iter (+/- 68,019)
 test bench_us_single               ... bench:  26,188,510 ns/iter (+/- 1,103,597)
-```
-
+```    
+    
+![]()    
+    
 </p>
 </details>
 
@@ -161,8 +167,10 @@ test bench_us_multi                ... bench: 12,212,070 ns/iter (+/- 563,605)
 test bench_us_read_heavy_multi     ... bench: 6,732,108 ns/iter (+/- 2,508,756)
 test bench_us_read_heavy_single    ... bench: 1,475,758 ns/iter (+/- 196,761)
 test bench_us_single               ... bench: 11,651,460 ns/iter (+/- 366,257)
-```
-
+```    
+    
+![](https://i.imgur.com/44UDbat.png)    
+    
 </p>
 </details>
 
@@ -178,8 +186,10 @@ test bench_us_multi                ... bench: 43,881,707 ns/iter (+/- 3,118,934)
 test bench_us_read_heavy_multi     ... bench: 99,083,670 ns/iter (+/- 9,962,635)
 test bench_us_read_heavy_single    ... bench: 19,858,851 ns/iter (+/- 2,966,487)
 test bench_us_single               ... bench: 33,062,356 ns/iter (+/- 2,483,705) 
-```
-
+```    
+    
+![](https://i.imgur.com/9ZWhi1e.png)    
+    
 </p>
 </details>
 
@@ -217,8 +227,10 @@ test bench_us_multi                ... bench: 29,255,190 ns/iter (+/- 4,420,725)
 test bench_us_read_heavy_multi     ... bench: 25,457,460 ns/iter (+/- 2,809,383)
 test bench_us_read_heavy_single    ... bench: 5,675,088 ns/iter (+/- 543,492)
 test bench_us_single               ... bench: 24,220,657 ns/iter (+/- 1,698,348) 
-```
-
+```    
+    
+![]()    
+    
 </p>
 </details>    
 
@@ -236,7 +248,9 @@ test bench_us_multi                ... bench:  29,804,930 ns/iter (+/- 1,830,429
 test bench_us_read_heavy_multi     ... bench:  24,220,320 ns/iter (+/- 410,629)
 test bench_us_read_heavy_single    ... bench:   4,989,780 ns/iter (+/- 128,699)
 test bench_us_single               ... bench:  25,904,060 ns/iter (+/- 973,951)
-```
-
+```    
+    
+![](https://i.imgur.com/WVcEkX7.png)    
+    
 </p>
 </details>
