@@ -134,6 +134,8 @@ fn main() {
             }
         }));
     }
+    // drop(tmp);
+    println!("awaiting stuff!");
     threads.into_iter().for_each(|thread| thread.join().unwrap());
     /*let mut threads = vec![];
     for _ in 0..5/*20*//*5*//*1*/ {
