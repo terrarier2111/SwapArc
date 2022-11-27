@@ -33,7 +33,7 @@ impl<T: Send + Sync> AutoLocalArc<T> {
             DetachablePtr(SizedBox::new(CachePadded::new(Cache {
                 parent: inner,
                 ref_cnt: AtomicUsize::new(1),
-                debt: Default::default(),
+                debt: AtomicUsize::new(0),
                 thread_id: thread_id(),
                 src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
             })).into_ptr().as_ptr())
@@ -67,14 +67,14 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 unsafe { handle_large_ref_count(cache, ref_cnt); }
             }
             cache.ref_cnt.store(ref_cnt + 1, Ordering::Relaxed);
-            (cache as *const CachePadded<Cache<T>>).cast_mut()
+            cache_ptr
         } else {
             let inner = self.inner;
             let local_cache_ptr = self.inner().cache.get_or(|| {
                 DetachablePtr(SizedBox::new(CachePadded::new(Cache {
                     parent: inner,
-                    src: AtomicPtr::new((cache as *const CachePadded<Cache<T>>).cast_mut()),
-                    debt: Default::default(),
+                    src: AtomicPtr::new(cache_ptr),
+                    debt: AtomicUsize::new(0),
                     thread_id: thread_id(),
                     ref_cnt: AtomicUsize::new(0),
                 })).into_ptr().as_ptr())
@@ -100,7 +100,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 // FIXME: here is probably a possibility for a race condition (what if we have one of the instances on another thread and it gets freed right
                 // FIXME: after we check if ref_cnt == debt?) this can probably be fixed by checking again right after increasing the ref_count and
                 // FIXME: handling failure by doing what we would have done if the local cache had no valid references to begin with.
-                if local_cache.debt.load(Ordering::Relaxed) == ref_cnt {
+                if local_cache.debt.load(Ordering::Acquire) == ref_cnt {
                     // FIXME: fallback
                     println!("racing load!");
                 }
