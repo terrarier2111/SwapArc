@@ -399,7 +399,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                         Ok(_) => {
                             // `ptr` doesn't have to care about anything other than itself
                             // as it, itself is protected by other atomics, so we can use `Relaxed`
-                            let prev = self.ptr.swap(update, Ordering::Relaxed);
+                            let prev = self.ptr.load(Ordering::Relaxed);
+                            self.ptr.store(update, Ordering::Relaxed);
                             // unset the update flag
                             self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                             // unset the `weak` update flag from the intermediate ref cnt
@@ -470,7 +471,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                             Ok(_) => {
                                 // `ptr` doesn't have to care about anything other than itself
                                 // as it, itself is protected by other atomics, so we can use `Relaxed`
-                                let prev = self.ptr.swap(new, Ordering::Relaxed);
+                                let prev = self.ptr.load(Ordering::Relaxed);
+                                self.ptr.store(new, Ordering::Relaxed);
                                 // unset the update flag
                                 self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                                 // unset the `weak` update flag from the intermediate ref cnt
@@ -617,7 +619,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                     // ORDERING: Relaxed should be okay because curr_ref_cnt guards `ptr`
                     // and ensures that other threads see the update because
                     // of the happens-before-relationship between
-                    let prev = self.ptr.swap(new.cast_mut(), Ordering::Relaxed);
+                    let prev = self.ptr.load(Ordering::Relaxed);
+                    self.ptr.store(new.cast_mut(), Ordering::Relaxed);
                     // unset the update flag
                     self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                     // unset the `weak` update flag from the intermediate ref cnt

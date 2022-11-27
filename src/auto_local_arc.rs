@@ -36,6 +36,7 @@ impl<T: Send + Sync> AutoLocalArc<T> {
                 debt: AtomicUsize::new(0),
                 thread_id: thread_id(),
                 src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
+                finish_cnt: AtomicUsize::new(0),
             })).into_ptr().as_ptr())
         }).0;
         let ret = Self {
@@ -77,11 +78,14 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     debt: AtomicUsize::new(0),
                     thread_id: thread_id(),
                     ref_cnt: AtomicUsize::new(0),
+                    finish_cnt: AtomicUsize::new(0),
                 })).into_ptr().as_ptr())
             }).0;
             let local_cache = unsafe { &*local_cache_ptr };
             let ref_cnt = local_cache.ref_cnt.load(Ordering::Relaxed);
             if ref_cnt == local_cache.debt.load(Ordering::Relaxed) {
+                // we have a retry loop here in case the debt's updater hasn't finished yet
+                while ref_cnt != local_cache.finish_cnt.load(Ordering::Acquire) {} // FIXME: can this be Relaxed?
                 // the local cache has no valid references anymore
                 local_cache.src.store(cache_ptr, Ordering::Relaxed); // FIXME: can the lack of synchronization between these three updates lead to race conditions?
                 // this is `2` because we need a reference for the current thread's instance and
@@ -100,9 +104,18 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 // FIXME: here is probably a possibility for a race condition (what if we have one of the instances on another thread and it gets freed right
                 // FIXME: after we check if ref_cnt == debt?) this can probably be fixed by checking again right after increasing the ref_count and
                 // FIXME: handling failure by doing what we would have done if the local cache had no valid references to begin with.
-                if local_cache.debt.load(Ordering::Acquire) == ref_cnt {
-                    // FIXME: fallback
+                if local_cache.debt.load(Ordering::Acquire) == ref_cnt { // FIXME: is Acquire here even required?
+                    while ref_cnt != local_cache.finish_cnt.load(Ordering::Acquire) {} // FIXME: can this be Relaxed?
                     println!("racing load!");
+                    // the local cache has no valid references anymore
+                    local_cache.src.store(cache_ptr, Ordering::Relaxed); // FIXME: can the lack of synchronization between these three updates lead to race conditions?
+                    // this is `2` because we need a reference for the current thread's instance and
+                    // because the newly created instance needs a reference as well.
+                    local_cache.ref_cnt.store(2, Ordering::Relaxed);
+                    // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
+                    local_cache.debt.store(0, Ordering::Release);
+                    // remove the reference to the external cache, as we moved it to our own cache instead
+                    *unsafe { &mut *self.cache.get() } = local_cache_ptr;
                 }
             }
 
@@ -144,6 +157,9 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             let debt = cache.debt.load(Ordering::Relaxed);
             // println!("debt: {}\nref_cnt: {}", strip_flags(debt), ref_cnt);
             if ref_cnt == strip_flags(debt) {
+                // we have a retry loop here in case the debt's updater hasn't finished yet
+                while strip_flags(debt) != cache.finish_cnt.load(Ordering::Relaxed) {}
+                // FIXME: determine whether the finisher thread dropped this thingy already
                 let guard = cache.guard();
                 drop(cache);
                 // there are no external refs alive
@@ -151,19 +167,22 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             }
         } else {
             println!("non-local cache ptr drop!");
-            // FIXME: add guard against race condition!
             let debt = cache.debt.fetch_add(1, Ordering::Acquire) + 1;
             if strip_flags(debt) > MAX_HARD_REFCOUNT {
                 abort();
             }
-            let ref_cnt = cache.ref_cnt.load(Ordering::Relaxed); // FIXME: this can cause a use-after-free
+            let ref_cnt = cache.ref_cnt.load(Ordering::Relaxed);
             if strip_flags(debt) == ref_cnt { // FIXME: ref_cnt can probably race with `debt` here
                                                                          // FIXME: so what we need to do is add further validation after this check
                                                                          // FIXME: this is probably in form of HazardPointers or the like
+                // we have a retry loop here in case the debt's updater hasn't finished yet
+                while strip_flags(debt) != cache.finish_cnt.load(Ordering::Relaxed) + 1 {}
                 let guard = cache.guard();
                 drop(cache);
                 // there are no external refs alive
                 cleanup_cache::<true, T>(cache_ptr, guard, is_detached(debt));
+            } else {
+                cache.finish_cnt.fetch_add(1, Ordering::Release);
             }
         }
     }
@@ -207,6 +226,7 @@ struct Cache<T: Send + Sync> {
     src: AtomicPtr<CachePadded<Cache<T>>>,
     debt: AtomicUsize, // this debt count may only be updated by threads other than the current one - this has a `detached` flag as its last bit
     ref_cnt: AtomicUsize, // this ref cnt may only be updated by the current thread
+    finish_cnt: AtomicUsize,
 }
 
 impl<T: Send + Sync> Cache<T> {
@@ -249,10 +269,18 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(cache: *const CachePa
             let debt = super_cache.debt.fetch_add(1, Ordering::AcqRel) + 1; // we add 1 at the end to make sure we use the post-update value
             // `ref_cnt` can't be updated after the cache was detached, so we can safely test for the `detached` flag
             let super_detached = is_detached(debt);
-            let ref_cnt = super_cache.ref_cnt.load(Ordering::Relaxed); // FIXME: this can cause a use-after-free
+            let ref_cnt = super_cache.ref_cnt.load(Ordering::Relaxed);
             if strip_flags(debt) == ref_cnt {
                 drop(super_cache);
+                // we have a retry loop here in case the debt's updater hasn't finished yet
+                while strip_flags(debt) != super_cache.finish_cnt.load(Ordering::Relaxed) + 1 {}
+
                 cleanup_cache::<UPDATE_SUPER, T>(super_cache_ptr, dropping_guard, super_detached);
+
+                super_cache.src.store(null_mut(), Ordering::Release);
+                super_cache.finish_cnt.store(strip_flags(debt), Ordering::Release);
+            } else {
+                super_cache.finish_cnt.fetch_add(1, Ordering::Release);
             }
         }
     }
@@ -292,6 +320,7 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
             let debt = cache.debt.fetch_or(DETACHED_FLAG, Ordering::Acquire); // FIXME: this probably wants some different ordering
             // here no race condition can occur because we are the only ones who can update `ref_cnt` // FIXME: but can `debt`'s orderings still make data races possible?
             if debt == ref_cnt {
+
                 let guard = cache.guard();
                 let cache_ptr = self.0;
                 drop(cache);
