@@ -9,20 +9,22 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, fence, Ordering};
 use crossbeam_utils::CachePadded;
 use thread_local::ThreadLocal;
 
+// Debt(t) <= Debt(t + 1)
+// Refs >= Debt
+// Refs(t + 1) >= Debt(t)
+
 pub struct AutoLocalArc<T: Send + Sync> {
-    inner: *const InnerCachedArc<T>,
+    inner: *const InnerArc<T>,
     cache: UnsafeCell<*mut CachePadded<Cache<T>>>,
 }
 
-// unsafe impl<T: Send> Send for CachedArc<T> {}
-// unsafe impl<T: Sync> Sync for CachedArc<T> {}
 unsafe impl<T: Send + Sync> Send for AutoLocalArc<T> {}
 unsafe impl<T: Send + Sync> Sync for AutoLocalArc<T> {}
 
 impl<T: Send + Sync> AutoLocalArc<T> {
 
     pub fn new(val: T) -> Self {
-        let inner = SizedBox::new(InnerCachedArc {
+        let inner = SizedBox::new(InnerArc {
             val,
             cache: Default::default(),
             dropping: AtomicBool::new(false),
@@ -44,7 +46,7 @@ impl<T: Send + Sync> AutoLocalArc<T> {
     }
 
     #[inline(always)]
-    fn inner(&self) -> &InnerCachedArc<T> {
+    fn inner(&self) -> &InnerArc<T> {
         unsafe { &*self.inner }
     }
 
@@ -131,7 +133,8 @@ unsafe fn handle_large_ref_count<T: Send + Sync>(cache: &CachePadded<Cache<T>>, 
 impl<T: Send + Sync> Drop for AutoLocalArc<T> {
     #[inline]
     fn drop(&mut self) {
-        let cache = unsafe { &**self.cache.get() };
+        let cache_ptr = unsafe { *self.cache.get() };
+        let cache = unsafe { &*cache_ptr };
         if cache.thread_id == thread_id() {
             let ref_cnt = cache.ref_cnt.load(Ordering::Relaxed);
             // println!("dropping {}", ref_cnt);
@@ -142,23 +145,22 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             // println!("debt: {}\nref_cnt: {}", strip_flags(debt), ref_cnt);
             if ref_cnt == strip_flags(debt) {
                 let guard = cache.guard();
-                let cache_ptr = cache as *const _;
                 drop(cache);
                 // there are no external refs alive
                 cleanup_cache::<true, T>(cache_ptr, guard, is_detached(debt));
             }
         } else {
             println!("non-local cache ptr drop!");
+            // FIXME: add guard against race condition!
             let debt = cache.debt.fetch_add(1, Ordering::Acquire) + 1;
             if strip_flags(debt) > MAX_HARD_REFCOUNT {
                 abort();
             }
-            let ref_cnt = cache.ref_cnt.load(Ordering::Relaxed);
+            let ref_cnt = cache.ref_cnt.load(Ordering::Relaxed); // FIXME: this can cause a use-after-free
             if strip_flags(debt) == ref_cnt { // FIXME: ref_cnt can probably race with `debt` here
                                                                          // FIXME: so what we need to do is add further validation after this check
                                                                          // FIXME: this is probably in form of HazardPointers or the like
                 let guard = cache.guard();
-                let cache_ptr = cache as *const _;
                 drop(cache);
                 // there are no external refs alive
                 cleanup_cache::<true, T>(cache_ptr, guard, is_detached(debt));
@@ -184,13 +186,13 @@ impl<T: Send + Sync> Deref for AutoLocalArc<T> {
 }
 
 #[repr(C)]
-struct InnerCachedArc<T: Send + Sync> {
+struct InnerArc<T: Send + Sync> {
     val: T,
     cache: ThreadLocal<DetachablePtr<T>>,
     dropping: AtomicBool,
 }
 
-impl<T: Send + Sync> Drop for InnerCachedArc<T> {
+impl<T: Send + Sync> Drop for InnerArc<T> {
     #[inline]
     fn drop(&mut self) {
         self.dropping.store(true, Ordering::Release);
@@ -200,7 +202,7 @@ impl<T: Send + Sync> Drop for InnerCachedArc<T> {
 }
 
 struct Cache<T: Send + Sync> {
-    parent: *const InnerCachedArc<T>,
+    parent: *const InnerArc<T>,
     thread_id: u64,
     src: AtomicPtr<CachePadded<Cache<T>>>,
     debt: AtomicUsize, // this debt count may only be updated by threads other than the current one - this has a `detached` flag as its last bit
@@ -211,7 +213,7 @@ impl<T: Send + Sync> Cache<T> {
 
     #[inline(always)]
     fn guard(&self) -> *const AtomicBool {
-        unsafe { self.parent.byte_add(memoffset::offset_of!(InnerCachedArc<T>, dropping)).cast::<AtomicBool>() }
+        unsafe { self.parent.byte_add(memoffset::offset_of!(InnerArc<T>, dropping)).cast::<AtomicBool>() }
     }
 
     #[inline]
@@ -235,7 +237,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(cache: *const CachePa
         unsafe { drop_slow::<T>(unsafe { &*cache }.parent.cast_mut()); }
 
         #[cold]
-        unsafe fn drop_slow<T: Send + Sync>(ptr: *mut InnerCachedArc<T>) {
+        unsafe fn drop_slow<T: Send + Sync>(ptr: *mut InnerArc<T>) {
             drop(unsafe { SizedBox::from_ptr(NonNull::new_unchecked(ptr)) });
         }
     } else if UPDATE_SUPER {
@@ -243,11 +245,11 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(cache: *const CachePa
         // FIXME: this should work - now make it iterative instead of recursive!
         if !unsafe { &*dropping_guard }.load(Ordering::Acquire) {
             let super_cache_ptr = src;
-            let super_cache = unsafe { &*super_cache_ptr }; // FIXME: this can cause a use-after-free
+            let super_cache = unsafe { &*super_cache_ptr };
             let debt = super_cache.debt.fetch_add(1, Ordering::AcqRel) + 1; // we add 1 at the end to make sure we use the post-update value
             // `ref_cnt` can't be updated after the cache was detached, so we can safely test for the `detached` flag
             let super_detached = is_detached(debt);
-            let ref_cnt = super_cache.ref_cnt.load(Ordering::Relaxed);
+            let ref_cnt = super_cache.ref_cnt.load(Ordering::Relaxed); // FIXME: this can cause a use-after-free
             if strip_flags(debt) == ref_cnt {
                 drop(super_cache);
                 cleanup_cache::<UPDATE_SUPER, T>(super_cache_ptr, dropping_guard, super_detached);
