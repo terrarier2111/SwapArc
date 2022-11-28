@@ -158,12 +158,16 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             // println!("debt: {}\nref_cnt: {}", strip_flags(debt), ref_cnt);
             if ref_cnt == strip_flags(debt) {
                 // we have a retry loop here in case the debt's updater hasn't finished yet
-                while strip_flags(debt) != cache.finish_cnt.load(Ordering::Relaxed) {}
-                // FIXME: determine whether the finisher thread dropped this thingy already
-                let guard = cache.guard();
-                drop(cache);
-                // there are no external refs alive
-                cleanup_cache::<true, T>(cache_ptr, guard, is_detached(debt));
+                while strip_flags(debt) != cache.finish_cnt.load(Ordering::Acquire) {}
+                if !cache.src.load(Ordering::Relaxed).is_null() {
+                    // we know that the thread we waited on freed the reference
+                    let guard = cache.guard();
+                    drop(cache);
+                    // there are no external refs alive
+                    cleanup_cache::<true, T>(cache_ptr, guard, is_detached(debt));
+                } else {
+                    // FIXME: do we have to do smth here?
+                }
             }
         } else {
             println!("non-local cache ptr drop!");
@@ -320,7 +324,6 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
             let debt = cache.debt.fetch_or(DETACHED_FLAG, Ordering::Acquire); // FIXME: this probably wants some different ordering
             // here no race condition can occur because we are the only ones who can update `ref_cnt` // FIXME: but can `debt`'s orderings still make data races possible?
             if debt == ref_cnt {
-
                 let guard = cache.guard();
                 let cache_ptr = self.0;
                 drop(cache);
