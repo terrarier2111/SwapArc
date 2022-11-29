@@ -22,7 +22,7 @@ use std::mem::transmute;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::swap_arc_tls_optimistic::SwapArcIntermediateTLS;
 
 #[cfg(test)]
@@ -132,11 +132,16 @@ fn main() {
                 let l1 = tmp.clone();
                 black_box(l1);
             }
+            let tmp1 = tmp.clone();
+            thread::spawn(move || {
+                tmp1.clone()
+            });
         }));
     }
     // drop(tmp);
     println!("awaiting stuff!");
     threads.into_iter().for_each(|thread| thread.join().unwrap());
+    thread::sleep(Duration::from_secs(10));
     /*let mut threads = vec![];
     for _ in 0..5/*20*//*5*//*1*/ {
         let tmp = tmp.clone();

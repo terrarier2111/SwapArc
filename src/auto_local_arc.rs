@@ -85,7 +85,8 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             let ref_cnt = local_cache.ref_cnt.load(Ordering::Relaxed);
             if ref_cnt == local_cache.debt.load(Ordering::Relaxed) {
                 // we have a retry loop here in case the debt's updater hasn't finished yet
-                while ref_cnt != local_cache.finish_cnt.load(Ordering::Acquire) {} // FIXME: can this be Relaxed?
+                while ref_cnt != strip_flags(local_cache.finish_cnt.load(Ordering::Acquire)) {} // FIXME: can this be Relaxed?
+                // FIXME: did the other thread see our increment or not?
                 // the local cache has no valid references anymore
                 local_cache.src.store(cache_ptr, Ordering::Relaxed); // FIXME: can the lack of synchronization between these three updates lead to race conditions?
                 // this is `2` because we need a reference for the current thread's instance and
@@ -93,6 +94,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 local_cache.ref_cnt.store(2, Ordering::Relaxed);
                 // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
                 local_cache.debt.store(0, Ordering::Release);
+                local_cache.finish_cnt.store(0, Ordering::Release);
                 // remove the reference to the external cache, as we moved it to our own cache instead
                 *unsafe { &mut *self.cache.get() } = local_cache_ptr;
             } else {
@@ -105,7 +107,8 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 // FIXME: after we check if ref_cnt == debt?) this can probably be fixed by checking again right after increasing the ref_count and
                 // FIXME: handling failure by doing what we would have done if the local cache had no valid references to begin with.
                 if local_cache.debt.load(Ordering::Acquire) == ref_cnt { // FIXME: is Acquire here even required?
-                    while ref_cnt != local_cache.finish_cnt.load(Ordering::Acquire) {} // FIXME: can this be Relaxed?
+                    while ref_cnt != strip_flags(local_cache.finish_cnt.load(Ordering::Acquire)) {} // FIXME: can this be Relaxed?
+                    // FIXME: did the other thread see our increment or not?
                     println!("racing load!");
                     // the local cache has no valid references anymore
                     local_cache.src.store(cache_ptr, Ordering::Relaxed); // FIXME: can the lack of synchronization between these three updates lead to race conditions?
@@ -114,6 +117,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     local_cache.ref_cnt.store(2, Ordering::Relaxed);
                     // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
                     local_cache.debt.store(0, Ordering::Release);
+                    local_cache.finish_cnt.store(0, Ordering::Release);
                     // remove the reference to the external cache, as we moved it to our own cache instead
                     *unsafe { &mut *self.cache.get() } = local_cache_ptr;
                 }
@@ -158,8 +162,11 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             // println!("debt: {}\nref_cnt: {}", strip_flags(debt), ref_cnt);
             if ref_cnt == strip_flags(debt) {
                 // we have a retry loop here in case the debt's updater hasn't finished yet
-                while strip_flags(debt) != cache.finish_cnt.load(Ordering::Acquire) {}
-                if !cache.src.load(Ordering::Relaxed).is_null() {
+                let mut finish_cnt = cache.finish_cnt.load(Ordering::Acquire);
+                while strip_flags(debt) != strip_flags(finish_cnt) {
+                    finish_cnt = cache.finish_cnt.load(Ordering::Acquire);
+                }
+                if !is_deleted(finish_cnt) {
                     // we know that the thread we waited on freed the reference
                     let guard = cache.guard();
                     drop(cache);
@@ -171,7 +178,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             }
         } else {
             println!("non-local cache ptr drop!");
-            let debt = cache.debt.fetch_add(1, Ordering::Acquire) + 1;
+            let debt = cache.debt.fetch_add(1, Ordering::AcqRel) + 1;
             if strip_flags(debt) > MAX_HARD_REFCOUNT {
                 abort();
             }
@@ -185,6 +192,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
                 drop(cache);
                 // there are no external refs alive
                 cleanup_cache::<true, T>(cache_ptr, guard, is_detached(debt));
+                cache.finish_cnt.store(strip_flags(debt) | DELETION_FLAG, Ordering::Release);
             } else {
                 cache.finish_cnt.fetch_add(1, Ordering::Release);
             }
@@ -224,6 +232,7 @@ impl<T: Send + Sync> Drop for InnerArc<T> {
     }
 }
 
+#[repr(C)]
 struct Cache<T: Send + Sync> {
     parent: *const InnerArc<T>,
     thread_id: u64,
@@ -238,11 +247,6 @@ impl<T: Send + Sync> Cache<T> {
     #[inline(always)]
     fn guard(&self) -> *const AtomicBool {
         unsafe { self.parent.byte_add(memoffset::offset_of!(InnerArc<T>, dropping)).cast::<AtomicBool>() }
-    }
-
-    #[inline]
-    fn get_debt_no_meta(&self, ordering: Ordering) -> usize {
-        self.debt.load(ordering) & !DETACHED_FLAG
     }
 
 }
@@ -281,9 +285,9 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(cache: *const CachePa
 
                 cleanup_cache::<UPDATE_SUPER, T>(super_cache_ptr, dropping_guard, super_detached);
 
-                super_cache.src.store(null_mut(), Ordering::Release);
-                super_cache.finish_cnt.store(strip_flags(debt), Ordering::Release);
+                super_cache.finish_cnt.store(strip_flags(debt) | DELETION_FLAG, Ordering::Release);
             } else {
+                println!("other add for thread {}", super_cache.thread_id);
                 super_cache.finish_cnt.fetch_add(1, Ordering::Release);
             }
         }
@@ -344,8 +348,8 @@ fn thread_id() -> u64 {
     thread_id::get() as u64
 }
 
-const DETACHED_FLAG: usize = 1 << (usize::BITS - 1);
-const DELETION_FLAG: usize = 1 << (usize::BITS - 2);
+const DETACHED_FLAG: usize = 1 << (usize::BITS - 1); // this is for `debt`
+const DELETION_FLAG: usize = 1 << (usize::BITS - 1); // this is for `finish_cnt`
 
 #[inline(always)]
 const fn strip_flags(debt: usize) -> usize {
@@ -358,8 +362,8 @@ const fn is_detached(debt: usize) -> bool {
 }
 
 #[inline(always)]
-const fn is_deleted(debt: usize) -> bool {
-    debt & DELETION_FLAG != 0
+const fn is_deleted(finish_cnt: usize) -> bool {
+    finish_cnt & DELETION_FLAG != 0
 }
 
 struct SizedBox<T> {
