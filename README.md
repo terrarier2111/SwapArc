@@ -107,28 +107,6 @@ test bench_us_single               ... bench:  29,470,658 ns/iter (+/- 2,413,649
 <p>
 
 ```jsx
-test bench_other_multi             ... bench: 286,886,920 ns/iter (+/- 31,744,594)
-test bench_other_read_heavy_multi  ... bench:  26,334,210 ns/iter (+/- 1,016,207)
-test bench_other_read_heavy_single ... bench:   4,599,380 ns/iter (+/- 188,476)
-test bench_other_single            ... bench: 284,633,540 ns/iter (+/- 6,663,107)
-test bench_us_multi                ... bench:  28,592,890 ns/iter (+/- 1,699,613)
-test bench_us_read_heavy_multi     ... bench:  21,874,820 ns/iter (+/- 203,017)
-test bench_us_read_heavy_single    ... bench:   4,388,770 ns/iter (+/- 74,011)
-test bench_us_single               ... bench:  25,560,430 ns/iter (+/- 1,717,332)
-```
-
-```jsx
-test bench_other_multi             ... bench: 281,094,410 ns/iter (+/- 8,515,881)
-test bench_other_read_heavy_multi  ... bench:  26,095,060 ns/iter (+/- 555,046)
-test bench_other_read_heavy_single ... bench:   4,605,400 ns/iter (+/- 333,495)
-test bench_other_single            ... bench: 278,551,080 ns/iter (+/- 6,233,614)
-test bench_us_multi                ... bench:  26,216,680 ns/iter (+/- 806,433)
-test bench_us_read_heavy_multi     ... bench:  21,806,780 ns/iter (+/- 261,765)
-test bench_us_read_heavy_single    ... bench:   4,373,490 ns/iter (+/- 99,582)
-test bench_us_single               ... bench:  25,527,940 ns/iter (+/- 1,576,593)
-```
-
-```jsx
 test bench_other_multi             ... bench: 286,954,300 ns/iter (+/- 42,713,448)
 test bench_other_read_heavy_multi  ... bench:  26,317,190 ns/iter (+/- 748,813)
 test bench_other_read_heavy_single ... bench:   4,635,690 ns/iter (+/- 226,496)
@@ -137,20 +115,9 @@ test bench_us_multi                ... bench:  28,405,350 ns/iter (+/- 1,223,287
 test bench_us_read_heavy_multi     ... bench:  21,873,610 ns/iter (+/- 577,473)
 test bench_us_read_heavy_single    ... bench:   4,418,590 ns/iter (+/- 804,933)
 test bench_us_single               ... bench:  25,439,660 ns/iter (+/- 1,911,437)
-```
-
-```jsx
-test bench_other_multi             ... bench: 259,917,990 ns/iter (+/- 14,681,041)
-test bench_other_read_heavy_multi  ... bench:  26,056,590 ns/iter (+/- 738,703)
-test bench_other_read_heavy_single ... bench:   4,587,115 ns/iter (+/- 195,985)
-test bench_other_single            ... bench: 260,428,840 ns/iter (+/- 4,843,635)
-test bench_us_multi                ... bench:  28,347,380 ns/iter (+/- 1,399,337)
-test bench_us_read_heavy_multi     ... bench:  21,812,110 ns/iter (+/- 178,127)
-test bench_us_read_heavy_single    ... bench:   4,378,230 ns/iter (+/- 68,019)
-test bench_us_single               ... bench:  26,188,510 ns/iter (+/- 1,103,597)
-```    
+```  
     
-![]()    
+![](https://i.imgur.com/OWYCKPw.png)    
     
 </p>
 </details>
@@ -197,28 +164,6 @@ test bench_us_single               ... bench: 33,062,356 ns/iter (+/- 2,483,705)
 <p>
 
 ```jsx
-test bench_other_multi             ... bench: 455,407,497 ns/iter (+/- 105,855,108)
-test bench_other_read_heavy_multi  ... bench: 75,012,985 ns/iter (+/- 24,828,287)
-test bench_other_read_heavy_single ... bench: 15,306,724 ns/iter (+/- 3,694,570)
-test bench_other_single            ... bench: 445,768,474 ns/iter (+/- 41,304,643)
-test bench_us_multi                ... bench: 33,029,626 ns/iter (+/- 4,227,672)
-test bench_us_read_heavy_multi     ... bench: 36,337,792 ns/iter (+/- 3,656,744)
-test bench_us_read_heavy_single    ... bench: 7,816,087 ns/iter (+/- 951,896)
-test bench_us_single               ... bench: 25,390,250 ns/iter (+/- 3,131,246) 
-```
-
-```jsx
-test bench_other_multi             ... bench: 415,349,961 ns/iter (+/- 2,692,847)
-test bench_other_read_heavy_multi  ... bench: 67,739,327 ns/iter (+/- 1,781,835)
-test bench_other_read_heavy_single ... bench: 14,646,336 ns/iter (+/- 1,042,389)
-test bench_other_single            ... bench: 409,009,813 ns/iter (+/- 23,341,306)
-test bench_us_multi                ... bench: 32,178,438 ns/iter (+/- 2,969,374)
-test bench_us_read_heavy_multi     ... bench: 31,844,988 ns/iter (+/- 1,063,819)
-test bench_us_read_heavy_single    ... bench: 7,314,487 ns/iter (+/- 473,510)
-test bench_us_single               ... bench: 27,780,288 ns/iter (+/- 1,178,594)
-```
-
-```jsx
 test bench_other_multi             ... bench: 455,367,374 ns/iter (+/- 34,010,803)
 test bench_other_read_heavy_multi  ... bench: 71,258,479 ns/iter (+/- 14,277,451)
 test bench_other_read_heavy_single ... bench: 14,738,168 ns/iter (+/- 1,603,971)
@@ -229,7 +174,7 @@ test bench_us_read_heavy_single    ... bench: 5,675,088 ns/iter (+/- 543,492)
 test bench_us_single               ... bench: 24,220,657 ns/iter (+/- 1,698,348) 
 ```    
     
-![]()    
+![](https://i.imgur.com/OVCssWV.png)    
     
 </p>
 </details>    
