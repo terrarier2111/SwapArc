@@ -405,8 +405,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                             // `ptr` doesn't have to care about anything other than itself
                             // as it, itself is protected by other atomics, so we can use `Relaxed`
                             let prev = self.ptr.load(Ordering::Relaxed);
-                            // FIXME: add comment explaining `Release`
-                            self.ptr.store(update, Ordering::Release);
+                            self.ptr.store(update, Ordering::Relaxed);
                             // unset the update flag
                             self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                             // unset the `weak` update flag from the intermediate ref cnt
@@ -620,6 +619,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     /// Tries to replace the current metadata with the new one if there was no update in between.
     /// `old` is the previous pointer and should contain the previous metadata.
     /// `metadata` is the new metadata, the old one will be replaced with.
+    #[cfg(feature = "ptr-ops")]
     pub fn try_update_meta(&self, old: *const T, metadata: usize) -> bool {
         let prefix = metadata & Self::META_MASK;
         // TODO: use this once strict provenance got stabilized
