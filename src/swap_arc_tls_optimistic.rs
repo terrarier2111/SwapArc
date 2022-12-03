@@ -13,25 +13,6 @@ use cfg_if::cfg_if;
 use crossbeam_utils::{Backoff, CachePadded};
 use thread_local::ThreadLocal;
 
-#[derive(Copy, Clone, Debug)]
-pub enum UpdateResult {
-    Ok,
-    AlreadyUpdating,
-    NoUpdate,
-}
-
-const fn most_sig_set_bit(val: usize) -> Option<u32> {
-    let mut i = 0;
-    let mut ret = None;
-    while i < usize::BITS {
-        if val & (1 << i) != 0 {
-            ret = Some(i);
-        }
-        i += 1;
-    }
-    ret
-}
-
 /// A `SwapArc` is a data structure that allows for an `Arc`
 /// to be passed around and swapped out with other `Arc`s.
 /// In order to achieve this, an internal reference count
@@ -68,17 +49,27 @@ pub struct SwapArcIntermediateTLS<T, D: DataPtrConvert<T> = Arc<T>, const METADA
     thread_local: ThreadLocal<CachePadded<LocalData<T, D, METADATA_BITS>>>,
 }
 
+const fn most_sig_set_bit(val: usize) -> Option<u32> {
+    let mut i = 0;
+    let mut ret = None;
+    while i < usize::BITS {
+        if val & (1 << i) != 0 {
+            ret = Some(i);
+        }
+        i += 1;
+    }
+    ret
+}
+
 impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T, D, METADATA_BITS> {
 
     const UPDATE: usize = 1 << (usize::BITS - 1);
     const OTHER_UPDATE: usize = 1 << (usize::BITS - 2);
-    // const FORCE_UPDATE: usize = 1 << (usize::BITS - 3); // FIXME: do we actually need a separate flag? - we probably do
-    // FIXME: implement force updating!
 
     /// Creates a new `SwapArc` instance with `val` as the initial value.
     pub fn new(val: D) -> Self {
         let free_bits = most_sig_set_bit(align_of::<T>()).unwrap_or(0);
-        if free_bits < METADATA_BITS { // FIXME: make sure this check is optimized away at compile time!
+        if free_bits < METADATA_BITS {
             let expected = 1 << METADATA_BITS;
             let found = 1 << free_bits;
             panic!("The alignment of T is insufficient, expected `{}`, but found `{}`", expected, found);
@@ -89,7 +80,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
             curr_ref_cnt: Default::default(),
             ptr: AtomicPtr::new(virtual_ref.cast_mut()),
             intermediate_ref_cnt: Default::default(),
-            intermediate_ptr: AtomicPtr::new(virtual_ref.cast_mut()/*null_mut()*/),
+            intermediate_ptr: AtomicPtr::new(virtual_ref.cast_mut()),
             updated: AtomicPtr::new(null_mut()),
             thread_local: ThreadLocal::new(),
         }
@@ -100,7 +91,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     #[cfg(feature = "ptr-ops")]
     pub unsafe fn new_raw(val: *const T) -> Self {
         let free_bits = most_sig_set_bit(align_of::<T>()).unwrap_or(0);
-        if free_bits < METADATA_BITS { // FIXME: make sure this check is optimized away at compile time!
+        if free_bits < METADATA_BITS {
             let expected = 1 << METADATA_BITS;
             let found = 1 << free_bits;
             panic!("The alignment of T is insufficient, expected `{}`, but found `{}`", expected, found);
@@ -109,7 +100,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
             curr_ref_cnt: Default::default(),
             ptr: AtomicPtr::new(val.cast_mut()),
             intermediate_ref_cnt: Default::default(),
-            intermediate_ptr: AtomicPtr::new(val.cast_mut()/*null_mut()*/),
+            intermediate_ptr: AtomicPtr::new(val.cast_mut()),
             updated: AtomicPtr::new(null_mut()),
             thread_local: ThreadLocal::new(),
         }
@@ -162,11 +153,11 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                 let new_ptr = curr.fake_ref.as_ptr();
 
                 let gen_cnt = if data.curr.ref_cnt == 0 {
-                    // don't modify the gen_cnt
+                    // don't modify the gen_cnt because we know that there are no references
+                    // left to this (thread-)local instance
                     data.curr.refill_unchecked(new_ptr);
                     data.curr.gen_cnt
                 } else {
-                    // data.new.refill(data, new_ptr);
                     if data.new.gen_cnt != 0 {
                         data.new.refill_unchecked(new_ptr);
                     } else {
@@ -237,12 +228,19 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                 let intermediate = SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(parent.parent().intermediate_ptr.load(Ordering::Relaxed));
                 // check if there is a new intermediate value and that the intermediate value has been verified to be usable
                 let (ptr, gen_cnt) = if intermediate != data.new.ptr {
+                    // there's a new value so we have to update our (thread-)local representation
+
+                    // we have to make sure we observe the update of `intermediate_ref_cnt` correctly
+                    fence(Ordering::Acquire);
+                    // increment the reference count in order to avoid race conditions and act as a guard for our load
                     let loaded = parent.parent().intermediate_ref_cnt.fetch_add(1, Ordering::AcqRel);
+                    // check if the update is still on-going or if the update is complete and we can thus use the
+                    // new value
                     if loaded & SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::UPDATE == 0 {
                         // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                        // as it, itself is protected by other atomics, so we can use `Relaxed`
+                        // as it, itself is protected by other atomics, but  we need to make sure we never
+                        // observe its guards' updates after its update, so we have to use `Acquire`
                         let loaded = SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(parent.parent().intermediate_ptr.load(Ordering::Relaxed));
-                        // data.intermediate.refill(data, loaded);
                         if data.intermediate.gen_cnt != 0 {
                             data.intermediate.refill_unchecked(loaded);
                         } else {
@@ -251,15 +249,19 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                         }
                         (loaded, data.intermediate.gen_cnt)
                     } else {
-                        parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
+                        // the update is on-going, so we have to fallback to our locally most recent value
+                        // and signal that the update finished.
+                        parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::Relaxed);
                         data.new.ref_cnt += 1;
                         (data.new.ptr, data.new.gen_cnt)
                     }
                 } else {
+                    // there's no new value so we can just return the newest one we have
                     data.new.ref_cnt += 1;
                     (data.new.ptr, data.new.gen_cnt)
                 };
-                // FIXME: add safety comment!
+                // SAFETY: we loaded the `ptr` right before this and used local and global guards in order
+                // to ensure that it's safe to dereference
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
                 return SwapArcIntermediateGuard {
                     parent,
@@ -298,7 +300,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         let curr_meta = Self::get_metadata(self.intermediate_ptr.load(Ordering::Relaxed));
         SwapArcIntermediatePtrGuard {
             parent: guard.parent,
-            // FIXME: use this once strict provenance got stabilized!
+            // TODO: use this once strict provenance got stabilized!
             // ptr: guard.fake_ref.as_ptr().map_addr(|x| x | curr_meta),
             ptr: (guard.fake_ref.as_ptr() as usize | curr_meta) as *const T,
             gen_cnt: guard.gen_cnt,
@@ -344,7 +346,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     fn try_update_curr(&self) -> bool {
         let ret = match self.curr_ref_cnt.compare_exchange(Self::OTHER_UPDATE, Self::UPDATE, Ordering::AcqRel, Ordering::Relaxed) {
             Ok(_) => {
-                // FIXME: can we somehow bypass intermediate if we have a new update upcoming - we probably can't because this would probably cause memory leaks and other funny things that we don't like
+                // TODO: can we somehow bypass intermediate if we have a new update upcoming - we probably can't because this would probably cause memory leaks and other funny things that we don't like
                 // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
                 // as it, itself is protected by other atomics, so we can use `Relaxed`
                 let intermediate = self.intermediate_ptr.load(Ordering::Relaxed);
@@ -390,8 +392,11 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                     let metadata = Self::get_metadata(self.intermediate_ptr.load(Ordering::Relaxed));
                     let update = Self::merge_ptr_and_metadata(update, metadata).cast_mut();
                     // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                    // as it, itself is protected by other atomics, so we can use `Relaxed`
-                    self.intermediate_ptr.store(update, Ordering::Relaxed);
+                    // as it, itself is protected by other atomics, but when performing a load we have be
+                    // able to ensure that we never observe the update of `intermediate_ptr`
+                    // before the update of `intermediate_ref_cnt` in order to make the protection
+                    // of it by the other atomics effective, so we have to use `Release`
+                    self.intermediate_ptr.store(update, Ordering::Release);
                     // unset the update flag
                     self.intermediate_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                     // try finishing the update up!
@@ -400,7 +405,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
                             // `ptr` doesn't have to care about anything other than itself
                             // as it, itself is protected by other atomics, so we can use `Relaxed`
                             let prev = self.ptr.load(Ordering::Relaxed);
-                            self.ptr.store(update, Ordering::Relaxed);
+                            // FIXME: add comment explaining `Release`
+                            self.ptr.store(update, Ordering::Release);
                             // unset the update flag
                             self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                             // unset the `weak` update flag from the intermediate ref cnt
@@ -519,70 +525,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         }
     }
 
-    /*
-    unsafe fn try_compare_exchange<const IGNORE_META: bool>(&self, old: *const T, new: D) -> Result<bool, D> {
-        // FIXME: what should be compared against? `curr`? or is `update` to be taken into account as well?
-        // FIXME: a good solution could be to compare against both `curr` and `intermediate` of the "main struct"(`ArcSwapIntermediateTLSLessFence`)
-        // FIXME: this could lead to a problem tho because it doesn't seem very bulletproof to simply compare against 2 values that could point to two entirely different allocations
-        // FIXME: if not done with careful consideration this could defeat the whole purpose of implementing compare_exchange for the data structure
-        // FIXME: because this could lead to clients of this function to get unreliable feedback and weird updates to be performed which is the worst case scenario and should be avoided at all costs
-        // FIXME: another solution could be to let the caller provide whether to check for the intermediate or curr value which is okay because then this
-        // FIXME: compare_exchange function would check if the state the caller last saw is still up to date or not which would (probably) solve all problems
-        // FIXME: we had before - the only problem that remains is that this will (probably) not work for thread locals because 1.
-        // FIXME: their states are inconsistent across different threads and because something loaded as `RefSource::Curr` can become `RefSource::Intermediate`
-        // FIXME: without notice - although if the first point could be neglected, the second one can be solved, the only problem remaining is that once
-        // FIXME: we compared the thread local states, we have to perform a global update that is propagated down to the source of the compare
-        // FIXME: if we do that we have replaced the global state source and have replaced the local one, the only problem remaining still
-        // FIXME: is if another thread tries to perform a compare_exchange, but this could be solved by using compare_exchange on the global state source
-        // FIXME: and acquiring the update lock. but if the update failed we have to somehow update the local state because otherwise we could
-        // FIXME: run into an infinite loop (QUESTION: is this really true? because if we load the most recent value from local, we won't get an expired one -
-        // FIXME: the only possible thing that i can think of right now is when intermediate is not null but even then intermediate should always contain
-        // FIXME: the most recent value and there shouldn't be a more recent one in global state sources (except for `updated` - but only if that is to be
-        // FIXME: considered a "global state source")
-        // FIXME: also what is to be considered the "global state source"? is it `curr` or `updated` - or both in some weird way?
-        // FIXME: if the local has some `intermediate` value then we can simply use said value for comparison (but only if the provided source is also `intermediate`)
-        // FIXME: OR maybe even if not?
-        if !self.intermediate_ref_cnt.compare_exchange(0, Self::UPDATE | Self::OTHER_UPDATE, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-            return Err(new);
-        }
-        let intermediate = self.intermediate_ptr.load(Ordering::Acquire);
-        let cmp_result = if IGNORE_META {
-            Self::strip_metadata(intermediate) == old
-        } else {
-            intermediate.cast_const() == old
-        };
-        if !cmp_result {
-            self.intermediate_ref_cnt.fetch_and(!(Self::UPDATE | Self::OTHER_UPDATE), Ordering::AcqRel);
-            return Ok(false);
-        }
-        // forget `new` in order to create a `virtual reference`
-        let new = ManuallyDrop::new(new);
-        let new = new.as_ptr();
-        // clear out old updates to make sure our update won't be overwritten by them in the future
-        let old_update = self.updated.swap(null_mut(), Ordering::AcqRel);
-        let metadata = Self::get_metadata(intermediate);
-        let new = Self::merge_ptr_and_metadata(new, metadata).cast_mut();
-        self.intermediate_ptr.store(new, Ordering::Release);
-        // unset the update flag
-        self.intermediate_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
-        if !old_update.is_null() {
-            // drop the `virtual reference` we hold to the Arc
-            D::from(old_update);
-        }
-        match self.curr_ref_cnt.compare_exchange(0, Self::UPDATE, Ordering::AcqRel, Ordering::Relaxed) {
-            Ok(_) => {
-                let prev = self.ptr.swap(new, Ordering::AcqRel);
-                // unset the update flag
-                self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
-                // unset the `weak` update flag from the intermediate ref cnt
-                self.intermediate_ref_cnt.fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
-                // drop the `virtual reference` we hold to the Arc
-                D::from(Self::strip_metadata(prev));
-            }
-            Err(_) => {}
-        }
-        Ok(true)
-    }*/
+    // TODO: maybe add some method along the lines of:
+    // unsafe fn try_compare_exchange<const IGNORE_META: bool>(&self, old: *const T, new: D) -> Result<bool, D>
 
     // FIXME: this causes "deadlocks" if there are any other references alive
     pub unsafe fn try_compare_exchange_with_meta(&self, old: *const T, new: *const T) -> bool {
@@ -653,8 +597,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         loop {
             let prefix = metadata & Self::META_MASK;
 
-            // FIXME: use this once strict provenance got stabilized
-            // if self.intermediate_ptr.compare_exchange(curr, curr.map_addr(|x| x | prefix), Ordering::AcqRel, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
+            // TODO: use this once strict provenance got stabilized
+            // match self.intermediate_ptr.compare_exchange_weak(curr, curr.map_addr(|x| (x & !Self::META_MASK) | prefix), Ordering::Relaxed, Ordering::Relaxed) {
 
             // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
             // as it, itself is protected by other atomics, so we can use `Relaxed`
@@ -678,8 +622,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
     /// `metadata` is the new metadata, the old one will be replaced with.
     pub fn try_update_meta(&self, old: *const T, metadata: usize) -> bool {
         let prefix = metadata & Self::META_MASK;
-        // FIXME: use this once strict provenance got stabilized
-        // self.intermediate_ptr.compare_exchange(old.cast_mut(), old.map_addr(|x| (x & !Self::META_MASK) | prefix).cast_mut(), Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        // TODO: use this once strict provenance got stabilized
+        // self.intermediate_ptr.compare_exchange(old.cast_mut(), old.map_addr(|x| (x & !Self::META_MASK) | prefix).cast_mut(), Ordering::Relaxed, Ordering::Relaxed).is_ok()
 
         // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
         // as it, itself is protected by other atomics, so we can use `Relaxed`
@@ -694,8 +638,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         let mut curr = self.intermediate_ptr.load(Ordering::Relaxed);
         loop {
             let prefix = active_bits & Self::META_MASK;
-            // FIXME: use this once strict provenance got stabilized
-            // if self.intermediate_ptr.compare_exchange(curr, curr.map_addr(|x| x | prefix), Ordering::AcqRel, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
+            // TODO: use this once strict provenance got stabilized
+            // match self.intermediate_ptr.compare_exchange_weak(curr, curr.map_addr(|x| x | prefix), Ordering::Relaxed, Ordering::Relaxed) {
 
             // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
             // as it, itself is protected by other atomics, so we can use `Relaxed`
@@ -721,8 +665,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         let mut curr = self.intermediate_ptr.load(Ordering::Relaxed);
         loop {
             let prefix = inactive_bits & Self::META_MASK;
-            // FIXME: use this once strict provenance got stabilized!
-            //if self.intermediate_ptr.compare_exchange(curr, curr.map_addr(|x| x & !prefix), Ordering::AcqRel, Ordering::Relaxed).is_ok() { // FIXME: should this be a weak compare_exchange?
+            // TODO: use this once strict provenance got stabilized!
+            // match self.intermediate_ptr.compare_exchange_weak(curr, curr.map_addr(|x| x & !prefix), Ordering::Relaxed, Ordering::Relaxed) {
 
             // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
             // as it, itself is protected by other atomics, so we can use `Relaxed`
@@ -754,14 +698,14 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
 
     #[inline(always)]
     fn strip_metadata(ptr: *const T) -> *const T {
-        // FIXME: use this once strict_provenance has been stabilized
+        // TODO: use this once strict_provenance has been stabilized
         // ptr.map_addr(|x| x & !Self::META_MASK)
         (ptr as usize & !Self::META_MASK) as *const T
     }
 
     #[inline(always)]
     fn merge_ptr_and_metadata(ptr: *const T, metadata: usize) -> *const T {
-        // FIXME: use this once strict_provenance has been stabilized
+        // TODO: use this once strict_provenance has been stabilized
         // ptr.map_addr(|x| x | metadata)
         (ptr as usize | metadata) as *const T
     }
@@ -776,24 +720,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediateTLS<T
         result
     };
 
-    /*
-    /// This will force an update, this means that new
-    /// readers will have to wait for all old readers to
-    /// finish and to update the ptr, even when no update
-    /// is queued this will block new readers for a short
-    /// amount of time, until failure got detected
-    fn force_update(&self) -> UpdateResult {
-        let curr = self.ref_cnt.fetch_or(Self::FORCE_UPDATE, Ordering::AcqRel);
-        if curr & Self::UPDATE != 0 {
-            return UpdateResult::AlreadyUpdating;
-        }
-        if self.updated.load(Ordering::AcqRel).is_null() {
-            // unset the flag, as there are no upcoming updates
-            self.ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
-            return UpdateResult::NoUpdate;
-        }
-        UpdateResult::Ok
-    }*/
+    // TODO: MAYBE: introduce FORCE_UPDATEing into the data structure in order for the user to be able
+    // to ensure that there's NO update pending
 
 }
 
@@ -1036,7 +964,7 @@ struct LocalDataInner<T, D: DataPtrConvert<T> = Arc<T>> {
 }
 
 struct LocalCounted<T, D: DataPtrConvert<T> = Arc<T>, const DROP: bool = false> {
-    gen_cnt: usize, // FIXME: would it help somehow (the performance) if we were to make `gen_cnt` an `u8`?
+    gen_cnt: usize, // TODO: would it help somehow (the performance) if we were to make `gen_cnt` an `u8`?
     ptr: *const T,
     ref_cnt: usize,
     _phantom_data: PhantomData<D>,
@@ -1066,16 +994,6 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
         // we hold has to be valid as long as our `gen_cnt` isn't `0`.
         ManuallyDrop::new(unsafe { D::from(self.ptr) })
     }
-
-    /*
-    fn refill(&mut self, data: &mut LocalDataInner<T, D>, ptr: *const T) {
-        if self.gen_cnt != 0 {
-            self.refill_unchecked(ptr);
-        } else {
-            let new = LocalCounted::new(data, ptr);
-            drop(mem::replace(self, new));
-        }
-    }*/
 
     fn refill_unchecked(&mut self, ptr: *const T) {
         if DROP {
