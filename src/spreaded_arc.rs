@@ -1,11 +1,11 @@
+use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
+use std::intrinsics::{likely, unlikely};
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::process::abort;
+use std::sync::atomic::{fence, AtomicUsize, Ordering};
 use std::{mem, ptr};
-use std::intrinsics::{likely, unlikely};
-use std::sync::atomic::{AtomicUsize, fence, Ordering};
-use crossbeam_utils::CachePadded;
 use thread_local::ThreadLocal;
 
 pub struct SpreadedArc<T: Send + Sync> {
@@ -19,7 +19,6 @@ unsafe impl<T: Send + Sync> Send for SpreadedArc<T> {}
 unsafe impl<T: Send + Sync> Sync for SpreadedArc<T> {}
 
 impl<T: Send + Sync> SpreadedArc<T> {
-
     pub fn new(val: T) -> Self {
         let tmp = Box::new(InnerSpreadedArc {
             val,
@@ -28,23 +27,17 @@ impl<T: Send + Sync> SpreadedArc<T> {
         });
         let inner = Box::leak(tmp) as *const InnerSpreadedArc<T>;
         let tmp = unsafe { inner.as_ref().unwrap_unchecked() };
-        let cache = tmp.cache.get_or(|| {
-            Cache {
-                parent: inner,
-                cached_cnt: CachePadded::new(AtomicUsize::new(1)),
-            }
+        let cache = tmp.cache.get_or(|| Cache {
+            parent: inner,
+            cached_cnt: CachePadded::new(AtomicUsize::new(1)),
         }) as *const _;
-        Self {
-            inner,
-            cache,
-        }
+        Self { inner, cache }
     }
 
     #[inline(always)]
     fn inner(&self) -> &InnerSpreadedArc<T> {
         unsafe { &*self.inner }
     }
-
 }
 
 const MAX_REFCOUNT: usize = (isize::MAX) as usize;
@@ -52,16 +45,25 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 impl<T: Send + Sync> Clone for SpreadedArc<T> {
     fn clone(&self) -> Self {
         let inner = self.inner;
-        let cache = unsafe { self.inner.as_ref().unwrap_unchecked() }.cache.get_or(|| {
-            Cache {
+        let cache = unsafe { self.inner.as_ref().unwrap_unchecked() }
+            .cache
+            .get_or(|| Cache {
                 parent: inner,
                 cached_cnt: CachePadded::new(AtomicUsize::new(0)),
-            }
-        });
+            });
         // FIXME: only do local counting if it's worth it!
         if unlikely(cache.cached_cnt.fetch_add(1, Ordering::Relaxed) == 0) {
             // fence(Ordering::Acquire);
-            unsafe { self.cache.as_ref().unwrap_unchecked().parent.as_ref().unwrap_unchecked() }.global_cnt.fetch_add(1, Ordering::Relaxed);
+            unsafe {
+                self.cache
+                    .as_ref()
+                    .unwrap_unchecked()
+                    .parent
+                    .as_ref()
+                    .unwrap_unchecked()
+            }
+            .global_cnt
+            .fetch_add(1, Ordering::Relaxed);
         }
 
         Self {
@@ -74,7 +76,12 @@ impl<T: Send + Sync> Clone for SpreadedArc<T> {
 impl<T: Send + Sync> Drop for SpreadedArc<T> {
     #[inline]
     fn drop(&mut self) {
-        if likely(unsafe { self.cache.as_ref().unwrap_unchecked() }.cached_cnt.fetch_sub(1, Ordering::Relaxed) != 1) {
+        if likely(
+            unsafe { self.cache.as_ref().unwrap_unchecked() }
+                .cached_cnt
+                .fetch_sub(1, Ordering::Relaxed)
+                != 1,
+        ) {
             return;
         }
 
@@ -82,7 +89,9 @@ impl<T: Send + Sync> Drop for SpreadedArc<T> {
             return;
         }
         fence(Ordering::Acquire);
-        unsafe { drop_slow::<T>(self.inner.cast_mut()); }
+        unsafe {
+            drop_slow::<T>(self.inner.cast_mut());
+        }
 
         #[cold]
         unsafe fn drop_slow<T: Send + Sync>(ptr: *mut InnerSpreadedArc<T>) {
@@ -110,7 +119,7 @@ impl<T: Send + Sync> Deref for SpreadedArc<T> {
 #[repr(C)]
 struct InnerSpreadedArc<T: Send + Sync> {
     val: T,
-    global_cnt: /*CachePadded<*/AtomicUsize/*>*/,
+    global_cnt: AtomicUsize, /*>*/
     cache: ThreadLocal<Cache<T>>,
 }
 

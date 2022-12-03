@@ -1,13 +1,13 @@
 extern crate criterion;
 
+use criterion::Bencher;
 use std::ops::Sub;
 use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
-use criterion::Bencher;
 
-use thread_local::ThreadLocal;
 use swap_arc::SwapArc;
+use thread_local::ThreadLocal;
 
 /*
 fn main() {

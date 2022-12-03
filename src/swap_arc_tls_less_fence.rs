@@ -1,15 +1,15 @@
-use std::marker::PhantomData;
-use std::{mem, ptr, thread};
 use std::borrow::Borrow;
 use std::cell::UnsafeCell;
 use std::fmt::{Debug, Display, Formatter};
 use std::intrinsics::unlikely;
+use std::marker::PhantomData;
 use std::mem::{align_of, ManuallyDrop, MaybeUninit};
 use std::ops::Deref;
 use std::ptr::{null, null_mut};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{mem, ptr, thread};
 use thread_local::ThreadLocal;
 
 /*

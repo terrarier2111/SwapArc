@@ -1,10 +1,10 @@
+use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::process::abort;
+use std::sync::atomic::{fence, AtomicUsize, Ordering};
 use std::{mem, ptr};
-use std::sync::atomic::{AtomicUsize, fence, Ordering};
-use crossbeam_utils::CachePadded;
 use thread_local::ThreadLocal;
 
 pub struct CachedArc<T: Send + Sync> {
@@ -17,7 +17,6 @@ unsafe impl<T: Send + Sync> Send for CachedArc<T> {}
 unsafe impl<T: Send + Sync> Sync for CachedArc<T> {}
 
 impl<T: Send + Sync> CachedArc<T> {
-
     pub fn new(val: T) -> Self {
         let tmp = Box::new(InnerCachedArc {
             val,
@@ -34,7 +33,10 @@ impl<T: Send + Sync> CachedArc<T> {
         let curr = unsafe { &*self.inner }.cache.get_or(|| {
             CachePadded::new(Cache {
                 parent: curr,
-                cached_cnt: UnsafeCell::new(CachedCount { ref_cnt: 0, debt: 0 }),
+                cached_cnt: UnsafeCell::new(CachedCount {
+                    ref_cnt: 0,
+                    debt: 0,
+                }),
             })
         });
 
@@ -47,10 +49,7 @@ impl<T: Send + Sync> CachedArc<T> {
             mem::forget(self);
         }
 
-        CachedLocalArc {
-            inner,
-            cache: curr,
-        }
+        CachedLocalArc { inner, cache: curr }
     }
 
     pub fn downgrade_cloned(&self) -> CachedLocalArc<T> {
@@ -58,7 +57,10 @@ impl<T: Send + Sync> CachedArc<T> {
         let curr = self.inner().cache.get_or(|| {
             CachePadded::new(Cache {
                 parent: curr,
-                cached_cnt: UnsafeCell::new(CachedCount { ref_cnt: 0, debt: 0 }),
+                cached_cnt: UnsafeCell::new(CachedCount {
+                    ref_cnt: 0,
+                    debt: 0,
+                }),
             })
         });
 
@@ -81,7 +83,6 @@ impl<T: Send + Sync> CachedArc<T> {
     fn inner(&self) -> &InnerCachedArc<T> {
         unsafe { &*self.inner }
     }
-
 }
 
 const MAX_REFCOUNT: usize = (isize::MAX) as usize;
@@ -95,9 +96,7 @@ impl<T: Send + Sync> Clone for CachedArc<T> {
             abort();
         }
 
-        Self {
-            inner: self.inner,
-        }
+        Self { inner: self.inner }
     }
 }
 
@@ -117,11 +116,13 @@ impl<T: Send + Sync> Drop for CachedArc<T> {
             return;
         }
         fence(Ordering::Acquire);
-        unsafe { drop_slow::<T>(self.inner.cast_mut()); }
+        unsafe {
+            drop_slow::<T>(self.inner.cast_mut());
+        }
 
         #[cold]
         unsafe fn drop_slow<T: Send + Sync>(ptr: *mut InnerCachedArc<T>) {
-           drop(unsafe { Box::from_raw(ptr) });
+            drop(unsafe { Box::from_raw(ptr) });
         }
     }
 }
@@ -148,7 +149,6 @@ pub struct CachedLocalArc<T: Send + Sync> {
 }
 
 impl<T: Send + Sync> CachedLocalArc<T> {
-
     pub fn upgrade(self) -> CachedArc<T> {
         let cache = unsafe { &*self.cache };
         let cnt = unsafe { &mut *cache.cached_cnt.get() };
@@ -157,9 +157,7 @@ impl<T: Send + Sync> CachedLocalArc<T> {
             cnt.debt -= 1;
             let inner = self.inner;
             mem::forget(self);
-            return CachedArc {
-                inner,
-            };
+            return CachedArc { inner };
         }
 
         let old_size = self.inner().global_cnt.fetch_add(1, Ordering::Relaxed);
@@ -167,17 +165,14 @@ impl<T: Send + Sync> CachedLocalArc<T> {
         if old_size > MAX_REFCOUNT {
             abort();
         }
-        
-        CachedArc {
-            inner: self.inner,
-        }
+
+        CachedArc { inner: self.inner }
     }
 
     #[inline(always)]
     fn inner(&self) -> &InnerCachedArc<T> {
         unsafe { &*self.inner }
     }
-
 }
 
 impl<T: Send + Sync> Clone for CachedLocalArc<T> {
@@ -207,7 +202,9 @@ impl<T: Send + Sync> Drop for CachedLocalArc<T> {
                 return;
             }
             fence(Ordering::Acquire);
-            unsafe { drop_slow::<T>(self.inner.cast_mut()); }
+            unsafe {
+                drop_slow::<T>(self.inner.cast_mut());
+            }
         }
 
         #[cold]
@@ -236,7 +233,7 @@ impl<T: Send + Sync> Deref for CachedLocalArc<T> {
 #[repr(C)]
 struct InnerCachedArc<T: Send + Sync> {
     val: T,
-    global_cnt: /*CachePadded<*/AtomicUsize/*>*/,
+    global_cnt: AtomicUsize, /*>*/
     cache: ThreadLocal<CachePadded<Cache<T>>>,
 }
 
