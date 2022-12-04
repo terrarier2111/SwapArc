@@ -374,7 +374,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         } else {
             (self.ptr.load(Ordering::Relaxed), RefSource::Curr)
         };
-        // create a fake reference to the Arc to ensure so that the borrow checker understands
+        // create a fake reference to the `D` to ensure so that the borrow checker understands
         // that the reference returned from the guard will point to valid memory
 
         // SAFETY: this is safe because the pointers are protected by their reference counts
@@ -442,7 +442,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         ) {
             Ok(_) => {
                 // take the update
-                let update = self.updated.swap(null_mut(), Ordering::AcqRel);
+                let update = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
                 // check if we even have an update
                 if !update.is_null() {
                     // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
@@ -516,7 +516,6 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// SAFETY: `updated` has to be a pointer that points to a valid instance
     /// of `T` and has to be acquired by calling `D::as_ptr` or via similar means.
     unsafe fn _update_raw(&self, updated: *const T) {
-        // FIXME: add safety comments to this function!
         let updated = Self::strip_metadata(updated);
         let new = updated.cast_mut();
         // SAFETY: this is safe because the caller promises that `updated` is valid.
@@ -533,7 +532,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             ) {
                 Ok(_) => {
                     // clear out old updates to make sure our update won't be overwritten by them in the future
-                    let old = self.updated.swap(null_mut(), Ordering::AcqRel);
+                    let old = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
                     // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
                     // as it, itself is protected by other atomics, so we can use `Relaxed`
                     let metadata =
@@ -545,6 +544,11 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         .fetch_and(!Self::UPDATE, Ordering::AcqRel);
                     if !old.is_null() {
                         // drop the `virtual reference` we hold to the `D`
+
+                        // SAFETY: we know that we hold a `virtual reference` to the `D`
+                        // which `updated` pointed to before but we took it out of
+                        // `updated` and we know that the value in `updated` has to be valid
+                        // while it is in there.
                         D::from(old);
                     }
                     // try finishing the update up!
@@ -567,6 +571,11 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                                 self.intermediate_ref_cnt
                                     .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
                                 // drop the `virtual reference` we hold to the `D`
+
+                                // SAFETY: we know that we hold a `virtual reference` to the `D`
+                                // which `prev` points to and thus we are allowed to drop
+                                // this `virtual reference`, once we replace `self.ptr` (or in other
+                                // word `prev`)
                                 D::from(Self::strip_metadata(prev));
                                 break;
                             }
@@ -604,6 +613,11 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                                                                         // FIXME: to determine which update is the most recent?
                     if !old.is_null() {
                         // drop the `virtual reference` we hold to the `D`
+
+                        // SAFETY: we know that we hold a `virtual reference` to the `D`
+                        // which `updated` pointed to before but we took it out of
+                        // `updated` and we know that the value in `updated` has to be valid
+                        // while it is in there.
                         D::from(old);
                     }
                     break;
@@ -639,13 +653,19 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             // a happens-before relationship with the RMW (compare_exchange) above
             self.intermediate_ref_cnt.fetch_and(
                 !(Self::UPDATE | Self::OTHER_UPDATE),
-                Ordering::AcqRel, /*Ordering::Acquire*/
+                // ORDERING: This is `Acquire` because we only need to mak sure future writes happen
+                // after this and we don't have to care about anything that happened before this
+                // (as the only important thing happening in between these two modifications of
+                // `intermediate_ref_cnt` is the load of `intermediate_ptr` which is sequenced-before this)
+                Ordering::Acquire,
             );
             return false;
         }
         // clear out old updates to make sure our update won't be overwritten by them in the future
-        let old_update = self.updated.swap(null_mut(), Ordering::AcqRel);
+        let old_update = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
         // increase the ref count
+
+        // FIXME: add safety comment!
         let tmp = ManuallyDrop::new(D::from(Self::strip_metadata(new)));
         mem::forget(tmp.clone());
         self.intermediate_ptr
@@ -654,7 +674,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         self.intermediate_ref_cnt
             .fetch_and(!Self::UPDATE, Ordering::AcqRel);
         if !old_update.is_null() {
-            // drop the `virtual reference` we hold to the Arc
+            // drop the `virtual reference` we hold to the `D`
+
+            // SAFETY: we know that we hold a `virtual reference` to the `D`
+            // which `updated` pointed to before but we took it out of
+            // `updated` and we know that the value in `updated` has to be valid
+            // while it is in there.
             D::from(old_update);
         }
         let mut curr = 0;
@@ -676,7 +701,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // unset the `weak` update flag from the intermediate ref cnt
                     self.intermediate_ref_cnt
                         .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
-                    // drop the `virtual reference` we hold to the Arc
+                    // drop the `virtual reference` we hold to the `D`
+
+                    // SAFETY: we know that we hold a `virtual reference` to the `D`
+                    // which `prev` points to and thus we are allowed to drop
+                    // this `virtual reference`, once we replace `self.ptr` (or in other
+                    // word `prev`)
                     D::from(Self::strip_metadata(prev));
                     break;
                 }
