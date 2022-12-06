@@ -71,7 +71,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
         let cache = unsafe { &*cache_ptr };
         let cache = if cache.thread_id == thread_id() {
             // this is race-free!
-            let ref_cnt = cache.ref_cnt.load(Ordering::Acquire);
+            let ref_cnt = cache.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
             if ref_cnt > MAX_REFCOUNT {
                 unsafe {
                     handle_large_ref_count(cache, ref_cnt);
@@ -101,7 +101,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 .0;
             let local_cache = unsafe { &*local_cache_ptr };
             // the ref count here can't change, as we are the only thread which is able to access it.
-            let ref_cnt = local_cache.ref_cnt.load(Ordering::Acquire);
+            let ref_cnt = local_cache.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
             let debt = local_cache.debt.load(Ordering::Acquire);
             if ref_cnt == debt {
                 if debt > 0 {
@@ -114,7 +114,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     }
                 }
                 // the local cache has no valid references anymore
-                local_cache.src.store(cache_ptr, Ordering::Release); // FIXME: can the lack of synchronization between these three updates lead to race conditions?
+                local_cache.src.store(cache_ptr, Ordering::Relaxed/*Release*/); // FIXME: can the lack of synchronization between these three updates lead to race conditions?
                                                                      // this is `2` because we need a reference for the current thread's instance and
                                                                      // because the newly created instance needs a reference as well.
                 local_cache.ref_cnt.store(2, Ordering::Release);
@@ -148,7 +148,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     }
                     println!("racing load!");
                     // the local cache has no valid references anymore
-                    local_cache.src.store(cache_ptr, Ordering::Release); // FIXME: can the lack of synchronization between these three updates lead to race conditions?
+                    local_cache.src.store(cache_ptr, Ordering::Relaxed/*Release*/); // FIXME: can the lack of synchronization between these three updates lead to race conditions?
                                                                          // this is `2` because we need a reference for the current thread's instance and
                                                                          // because the newly created instance needs a reference as well.
                     local_cache.ref_cnt.store(2, Ordering::Release);
@@ -208,7 +208,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
                 );
             }
             // println!("debt: {}\nref_cnt: {}", strip_flags(debt), ref_cnt);
-            // FIXME: we could add a fastpath here for debt == 0
+            // TODO: we could add a fastpath here for debt == 0
             if ref_cnt == strip_flags(debt) {
                 // we have a retry loop here in case the debt's updater hasn't finished yet
                 let finish_cnt = cache.wait_for::<false>(ref_cnt);
@@ -319,57 +319,59 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
     dropping_guard: *const AtomicBool,
     detached: bool,
 ) {
-    // FIXME: when freeing the own memory, we still have a reference to it and thus UB
-    // FIXME: the same thing is the case when freeing the major allocation
-    // println!("cleanup cache: {}", unsafe { &*cache }.ref_cnt.load(Ordering::Relaxed));
-    // FIXME: check for `detached` and deallocate own memory if detached
-    let src = unsafe { &*cache }.src.load(Ordering::Acquire);
-    // there are no external refs alive
-    if src.is_null() {
-        println!("delete main thingy!");
-        unsafe { &*cache }
-            .debt
-            .fetch_or(DETACHED_FLAG, Ordering::AcqRel);
-        // we are the first "(cache) node", so we need to free the memory
-        fence(Ordering::AcqRel); // FIXME: make sure this fence is coupled with some other atomic operation!
-        unsafe {
-            drop_slow::<T>(unsafe { &*cache }.parent.cast_mut());
-        }
+    if UPDATE_SUPER {
+        // FIXME: when freeing the own memory, we still have a reference to it and thus UB
+        // FIXME: the same thing is the case when freeing the major allocation
+        // println!("cleanup cache: {}", unsafe { &*cache }.ref_cnt.load(Ordering::Relaxed));
+        // FIXME: check for `detached` and deallocate own memory if detached
+        let src = unsafe { &*cache }.src.load(Ordering::Relaxed/*Acquire*/);
+        // there are no external refs alive
+        if src.is_null() {
+            println!("delete main thingy!");
+            unsafe { &*cache }
+                .debt
+                .fetch_or(DETACHED_FLAG, Ordering::AcqRel);
+            // we are the first "(cache) node", so we need to free the memory
+            fence(Ordering::AcqRel); // FIXME: make sure this fence is coupled with some other atomic operation!
+            unsafe {
+                drop_slow::<T>(unsafe { &*cache }.parent.cast_mut());
+            }
 
-        #[cold]
-        unsafe fn drop_slow<T: Send + Sync>(ptr: *mut InnerArc<T>) {
-            drop(unsafe { SizedBox::from_ptr(NonNull::new_unchecked(ptr)) });
-        }
-    } else if UPDATE_SUPER {
-        // FIXME: we have other caches above us, so release a reference to them - this has to happen recursively tho as they could have to release their last reference as well.
-        // FIXME: this should work - now make it iterative instead of recursive!
-        if !unsafe { &*dropping_guard }.load(Ordering::Acquire) {
-            let super_cache_ptr = src;
-            let super_cache = unsafe { &*super_cache_ptr };
-            let debt = super_cache.debt.fetch_add(1, Ordering::AcqRel) + 1; // we add 1 at the end to make sure we use the post-update value
-                                                                            // when `DetachablePtr` gets dropped, it will check if it has to free the allocation itself and thus
-                                                                            // if we observe that `DetachablePtr` was dropped and because we are still alive it didn't free the allocation,
-                                                                            // we know that we have to free the allocation ourselves.
-            let super_detached = is_detached(debt);
-            let ref_cnt = super_cache.ref_cnt.load(Ordering::Acquire);
-            if strip_flags(debt) == ref_cnt {
-                // we have a retry loop here in case the debt's updater hasn't finished yet
-                let _finish_cnt = super_cache.wait_for::<true>(ref_cnt); // FIXME: can a data race occur here?
+            #[cold]
+            unsafe fn drop_slow<T: Send + Sync>(ptr: *mut InnerArc<T>) {
+                drop(unsafe { SizedBox::from_ptr(NonNull::new_unchecked(ptr)) });
+            }
+        } else {
+            // FIXME: we have other caches above us, so release a reference to them - this has to happen recursively tho as they could have to release their last reference as well.
+            // FIXME: this should work - now make it iterative instead of recursive!
+            if !unsafe { &*dropping_guard }.load(Ordering::Acquire) {
+                let super_cache_ptr = src;
+                let super_cache = unsafe { &*super_cache_ptr };
+                let debt = super_cache.debt.fetch_add(1, Ordering::AcqRel) + 1; // we add 1 at the end to make sure we use the post-update value
+                // when `DetachablePtr` gets dropped, it will check if it has to free the allocation itself and thus
+                // if we observe that `DetachablePtr` was dropped and because we are still alive it didn't free the allocation,
+                // we know that we have to free the allocation ourselves.
+                let super_detached = is_detached(debt);
+                let ref_cnt = super_cache.ref_cnt.load(Ordering::Acquire);
+                if strip_flags(debt) == ref_cnt {
+                    // we have a retry loop here in case the debt's updater hasn't finished yet
+                    let _finish_cnt = super_cache.wait_for::<true>(ref_cnt); // FIXME: can a data race occur here?
 
-                drop(super_cache);
+                    drop(super_cache);
 
-                cleanup_cache::<true, T>(super_cache_ptr, dropping_guard, super_detached);
+                    cleanup_cache::<true, T>(super_cache_ptr, dropping_guard, super_detached);
 
-                super_cache
-                    .finish_cnt
-                    .store(strip_flags(debt) | DELETION_FLAG, Ordering::Release);
-                // fence(Ordering::AcqRel);
-            } else {
-                // println!("other add from thread {} for thread {} refs {} debt {}", thread_id(), super_cache.thread_id, ref_cnt, debt);
-                // println!("other add for thread {} refs {} debt {}", super_cache.thread_id, ref_cnt, debt);
-                // println!("other add refs {} debt {}", ref_cnt, debt);
-                super_cache.finish_cnt.fetch_add(1, Ordering::AcqRel);
-                // fence(Ordering::AcqRel);
+                    super_cache
+                        .finish_cnt
+                        .store(strip_flags(debt) | DELETION_FLAG, Ordering::Release);
+                    // fence(Ordering::AcqRel);
+                } else {
+                    // println!("other add from thread {} for thread {} refs {} debt {}", thread_id(), super_cache.thread_id, ref_cnt, debt);
+                    // println!("other add for thread {} refs {} debt {}", super_cache.thread_id, ref_cnt, debt);
+                    // println!("other add refs {} debt {}", ref_cnt, debt);
+                    super_cache.finish_cnt.fetch_add(1, Ordering::AcqRel);
+                    // fence(Ordering::AcqRel);
+                }
             }
         }
     }
@@ -406,7 +408,7 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
         if !unsafe { &*cache.guard() }.load(Ordering::Acquire) {
             // println!("dropping detachable ptr!");
             // unsafe { &*self.0 }.detached.store(true, Ordering::Relaxed);
-            let ref_cnt = cache.ref_cnt.load(Ordering::Acquire);
+            let ref_cnt = cache.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
             let debt = cache.debt.fetch_or(DETACHED_FLAG, Ordering::AcqRel);
             // here no race condition can occur because we are the only ones who can update `ref_cnt` // FIXME: but can `debt`'s orderings still make data races possible?
             if debt == ref_cnt {
