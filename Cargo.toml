@@ -11,16 +11,17 @@ ptr-ops = []
 [profile.release]
 debug = true
 
-[target.x86_64-unknown-linux-gnu]
-linker = "/usr/bin/clang"
-rustflags = ["-Clink-arg=-fuse-ld=lld", "-Clink-arg=-Wl,--no-rosegment"]
+#[target.x86_64-unknown-linux-gnu]
+#linker = "/usr/bin/clang"
+#rustflags = ["-Clink-arg=-fuse-ld=lld", "-Clink-arg=-Wl,--no-rosegment"]
 
 [dependencies]
 # thread_local = "1.1.4"
 # thread_local = { git = "https://github.com/terrarier2111/thread_local-rs", branch = "improve-safely" }
-thread_local = { git = "https://github.com/terrarier2111/thread_local-rs", branch = "stable", features = ["nightly"] }
+thread_local = { git = "https://github.com/terrarier2111/thread_local-rs", branch = "stable_test", features = ["nightly"] }
 #thread_local = { git = "https://github.com/terrarier2111/thread_local-rs" }
 # thread_local = "1.1.4"
+# thread_local = { git = "https://github.com/Amanieu/thread_local-rs" }
 static_assertions = "1.1.0"
 rand = "0.8.5"
 crossbeam-utils = "0.8.12"
