@@ -10,10 +10,6 @@
 mod auto_local_arc;
 mod cached_arc;
 mod spreaded_arc;
-mod swap_arc;
-mod swap_arc_intermediate;
-mod swap_arc_tls;
-mod swap_arc_tls_less_fence;
 mod swap_arc_tls_optimistic;
 
 use crate::swap_arc_tls_optimistic::SwapArcIntermediateTLS;
