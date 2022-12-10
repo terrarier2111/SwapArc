@@ -9,6 +9,8 @@ use std::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::{mem, ptr, thread};
 use thread_local::ThreadLocal;
 
+// FIXME: NOTE: the version of thread_local that is used changes the behavior of this!
+
 // Debt(t) <= Debt(t + 1)
 // Refs >= Debt
 // Refs(t + 1) >= Debt(t)
@@ -237,6 +239,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             if strip_flags(debt) > MAX_HARD_REFCOUNT {
                 abort();
             }
+            fence(Ordering::Acquire);
             let ref_cnt = cache.ref_cnt.load(Ordering::Acquire);
             if strip_flags(debt) == ref_cnt {
                 // FIXME: ref_cnt can probably race with `debt` here
@@ -246,16 +249,17 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
                 let _finish_cnt = cache.wait_for::<true>(ref_cnt);
                 let guard = cache.guard();
                 drop(cache);
+                fence(Ordering::AcqRel);
                 // there are no external refs alive
                 if !cleanup_cache::<true, T>(cache_ptr, guard, is_detached(debt)) {
+                    fence(Ordering::AcqRel);
                     cache
                         .finish_cnt
                         .store(ref_cnt | DELETION_FLAG, Ordering::Release);
                 }
-                fence(Ordering::AcqRel);
             } else {
-                cache.finish_cnt.fetch_add(1, Ordering::AcqRel);
                 fence(Ordering::AcqRel);
+                cache.finish_cnt.fetch_add(1, Ordering::AcqRel);
             }
         }
     }
@@ -337,11 +341,12 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
         // there are no external refs alive
         if src.is_null() {
             println!("delete main thingy: {}", thread_id());
+            fence(Ordering::AcqRel); // FIXME: make sure this fence is coupled with some other atomic operation!
             unsafe { &*cache }
                 .debt
                 .fetch_or(DETACHED_FLAG, Ordering::AcqRel);
-            // we are the first "(cache) node", so we need to free the memory
             fence(Ordering::AcqRel); // FIXME: make sure this fence is coupled with some other atomic operation!
+            // we are the first "(cache) node", so we need to free the memory
             unsafe {
                 drop_slow::<T>(unsafe { &*cache }.parent.cast_mut());
             }
@@ -358,6 +363,8 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
                 let super_cache_ptr = src;
                 let super_cache = unsafe { &*super_cache_ptr };
                 let debt = super_cache.debt.fetch_add(1, Ordering::AcqRel) + 1; // we add 1 at the end to make sure we use the post-update value
+                // this fence protects the following load of `ref_cnt` from being moved before the guard increment.
+                fence(Ordering::Acquire);
                 // when `DetachablePtr` gets dropped, it will check if it has to free the allocation itself and thus
                 // if we observe that `DetachablePtr` was dropped and because we are still alive it didn't free the allocation,
                 // we know that we have to free the allocation ourselves.
@@ -366,10 +373,13 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
                 if strip_flags(debt) == ref_cnt {
                     // we have a retry loop here in case the debt's updater hasn't finished yet
                     let _finish_cnt = super_cache.wait_for::<true>(ref_cnt); // FIXME: can a data race occur here?
+                    // fence(Ordering::AcqRel);
 
                     drop(super_cache);
 
+                    fence(Ordering::AcqRel);
                     if !cleanup_cache::<true, T>(super_cache_ptr, dropping_guard, super_detached) {
+                        // fence(Ordering::AcqRel);
                         super_cache
                             .finish_cnt
                             .store(strip_flags(debt) | DELETION_FLAG, Ordering::Release);
@@ -379,6 +389,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
                     // println!("other add from thread {} for thread {} refs {} debt {}", thread_id(), super_cache.thread_id, ref_cnt, debt);
                     // println!("other add for thread {} refs {} debt {}", super_cache.thread_id, ref_cnt, debt);
                     // println!("other add refs {} debt {}", ref_cnt, debt);
+                    fence(Ordering::AcqRel);
                     super_cache.finish_cnt.fetch_add(1, Ordering::AcqRel);
                     // fence(Ordering::AcqRel);
                 }
@@ -425,11 +436,13 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
             let debt = cache.debt.fetch_or(DETACHED_FLAG, Ordering::AcqRel);
             // here no race condition can occur because we are the only ones who can update `ref_cnt` // FIXME: but can `debt`'s orderings still make data races possible?
             if debt == ref_cnt {
+                // fence(Ordering::AcqRel);
                 // we have a retry loop here in case the debt's updater hasn't finished yet
                 cache.wait_for::<false>(ref_cnt);
                 let guard = cache.guard();
                 let cache_ptr = self.0;
                 drop(cache);
+                fence(Ordering::AcqRel);
                 cleanup_cache::<false, T>(cache_ptr, guard, true);
             }
         } else {

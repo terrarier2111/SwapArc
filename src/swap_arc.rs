@@ -1,4 +1,3 @@
-
 // FIXME: add ability to load non-fully
 /*
 /// A `SwapArc` is a data structure that allows for an `Arc`
