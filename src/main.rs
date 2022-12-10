@@ -7,9 +7,6 @@
 #![feature(thread_id_value)]
 #![feature(pointer_byte_offsets)]
 
-mod auto_local_arc;
-mod cached_arc;
-mod spreaded_arc;
 mod swap_arc_tls_optimistic;
 
 use crate::swap_arc_tls_optimistic::SwapArcIntermediateTLS;
@@ -23,9 +20,6 @@ use std::{mem, thread};
 
 #[cfg(test)]
 extern crate test;
-use crate::auto_local_arc::AutoLocalArc;
-use crate::cached_arc::CachedArc;
-use crate::spreaded_arc::SpreadedArc;
 #[cfg(test)]
 use arc_swap::ArcSwap;
 #[cfg(test)]
@@ -39,11 +33,10 @@ fn main() {
         test_us_multi();
     }*/
     // bad_bench_us_multi();
-    /*
     let arc = Arc::new(4);
-    let tmp: Arc<SwapArcIntermediateTLS<i32, Arc<i32>, 0>> = SwapArcIntermediateTLS::new(arc);
+    let tmp: Arc<SwapArcIntermediateTLS<i32, Arc<i32>, 0>> = Arc::new(SwapArcIntermediateTLS::new(arc));
     let mut threads = vec![];
-    tmp.update(Arc::new(31));
+    tmp.store(Arc::new(31));
     println!("{}", tmp.load());
     let start = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -77,7 +70,7 @@ fn main() {
                 println!("{:?}", list.remove_head());
                 thread::sleep(Duration::from_millis(500));*/
                 // send.send(list.remove_head()).unwrap();
-                tmp.update(Arc::new(rand::random()));
+                tmp.store(Arc::new(rand::random()));
                 if x % 5 == 0 {
                     println!("completed removals: {x}");
                 }
@@ -92,9 +85,9 @@ fn main() {
     println!("test took: {}ms", time - start);
     // loop {}
     println!("{:?}", tmp.load().as_ref());
-    tmp.update(Arc::new(6));
+    tmp.store(Arc::new(6));
     println!("{:?}", tmp.load().as_ref());
-    println!("test! 0");*/
+    println!("test! 0");
     /*let tmp: Arc<SwapArcIntermediateTLS<i32, Arc<i32>, 0>> = SwapArcIntermediateTLS::new(Arc::new(0));
     let mut threads = vec![];
     for _ in 0..20/*5*//*1*/ {
@@ -117,82 +110,6 @@ fn main() {
         }));
     }
     threads.into_iter().for_each(|thread| thread.join().unwrap());*/
-    // let tmp = Arc::new(ArcSwap::new(Arc::new(3)));
-    // let tmp = AutoLocalArc::new(3);
-    let tmp = AutoLocalArc::new(3);
-    let mut threads = vec![];
-    for _ in 0../*1*//*6*//*8*/7
-    /*20*//*5*//*1*/
-    {
-        let tmp = tmp.clone();
-        threads.push(thread::spawn(move || {
-            for _ in 0..4000
-            /*200000*//*200*/
-            {
-                let l1 = tmp.clone();
-                black_box(l1);
-            }
-            let tmp1 = tmp.clone();
-            thread::spawn(move || {
-                /*tmp*/
-                black_box(tmp1.clone());
-            })
-        }));
-    }
-    // drop(tmp);
-    println!("awaiting stuff!");
-    threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap().join().unwrap());
-    thread::sleep(Duration::from_secs(10));
-    /*let mut threads = vec![];
-    for _ in 0..5/*20*//*5*//*1*/ {
-        let tmp = tmp.clone();
-        threads.push(thread::spawn(move || {
-            for _ in 0..200/*20000*//*200*/ {
-                /*let l1 = tmp.load();
-                let l2 = tmp.load();
-                let l3 = tmp.load();
-                let l4 = tmp.load();
-                let l5 = tmp.load();
-                black_box(l1);
-                black_box(l2);
-                black_box(l3);
-                black_box(l4);
-                black_box(l5);*/
-                let l1 = tmp.clone();
-                black_box(l1);
-            }
-        }));
-    }
-    /*for _ in 0..20/*5*//*1*/ {
-        let tmp = tmp.clone();
-        threads.push(thread::spawn(move || {
-            for _ in 0..20000/*200*/ {
-                tmp.update(Arc::new(rand::random()));
-            }
-        }));
-    }*/
-    threads.into_iter().for_each(|thread| thread.join().unwrap());*/
-    /*let tmp1 = tmp.clone();
-    thread::spawn(move || {
-        let l1 = tmp1.clone();
-        black_box(l1);
-    });
-    for _ in 0..200/*20000*//*200*/ {
-        /*let l1 = tmp.load();
-        let l2 = tmp.load();
-        let l3 = tmp.load();
-        let l4 = tmp.load();
-        let l5 = tmp.load();
-        black_box(l1);
-        black_box(l2);
-        black_box(l3);
-        black_box(l4);
-        black_box(l5);*/
-        let l1 = tmp.clone();
-        black_box(l1);
-    }*/
 }
 
 fn bad_bench_us_multi() {
