@@ -1,5 +1,3 @@
-#![feature(core_intrinsics)]
-
 use std::sync::Arc;
 
 use crate::swap_arc_tls_optimistic::SwapArcIntermediateTLS;

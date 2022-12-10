@@ -18,23 +18,20 @@ debug = true
 [dependencies]
 # thread_local = "1.1.4"
 # thread_local = { git = "https://github.com/terrarier2111/thread_local-rs", branch = "improve-safely" }
-thread_local = { git = "https://github.com/terrarier2111/thread_local-rs", branch = "stable_test", features = ["nightly"] }
+thread_local = { git = "https://github.com/terrarier2111/thread_local-rs", branch = "stable", features = ["nightly"] }
 #thread_local = { git = "https://github.com/terrarier2111/thread_local-rs" }
-# thread_local = "1.1.4"
 # thread_local = { git = "https://github.com/Amanieu/thread_local-rs" }
-static_assertions = "1.1.0"
-rand = "0.8.5"
 crossbeam-utils = "0.8.12"
 likely_stable = "0.1.2"
 cfg-if = "1.0.0"
-arc-swap = "1.5.1"
-# arc-swap = { version = "1.5.1", optional = true }
-thread-id = "4.0.0"
-memoffset = "0.7.1"
+arc-swap = { version = "1.5.1", optional = true }
+rand = { version = "0.8.5", optional = true }
 
 [dev-dependencies]
+rand = "0.8.5"
+arc-swap = "1.5.1"
 
 [[bench]]
 name = "swap_arc"
-required-features = ["arc-swap"]
+required-features = ["arc-swap", "rand"]
 harness = false

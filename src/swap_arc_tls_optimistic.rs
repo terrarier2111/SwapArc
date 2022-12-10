@@ -3,7 +3,7 @@ use crossbeam_utils::{Backoff, CachePadded};
 use std::borrow::Borrow;
 use std::cell::{RefCell, UnsafeCell};
 use std::fmt::{Debug, Display, Formatter};
-use std::intrinsics::{likely, unlikely};
+use likely_stable::{likely,unlikely};
 use std::marker::PhantomData;
 use std::mem;
 use std::mem::{align_of, ManuallyDrop};
@@ -552,8 +552,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         D::from(old);
                     }
                     // try finishing the update up!
+                    let mut curr = 0;
                     loop {
-                        let mut curr = 0;
                         match self.curr_ref_cnt.compare_exchange(
                             curr,
                             Self::UPDATE,
