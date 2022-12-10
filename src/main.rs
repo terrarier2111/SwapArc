@@ -585,6 +585,7 @@ fn bench_arc_read_light_multi(bencher: &mut Bencher) {
     });
 }
 
+/*
 #[bench]
 fn bench_alarc_read_heavy_single(bencher: &mut Bencher) {
     let tmp = AutoLocalArc::new(3);
@@ -923,7 +924,7 @@ fn bench_spreaded_read_light_multi_local(bencher: &mut Bencher) {
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
     });
-}
+}*/
 
 #[bench]
 fn bench_other_read_light_single(bencher: &mut Bencher) {
