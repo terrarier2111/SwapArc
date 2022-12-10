@@ -34,7 +34,7 @@ fn test_load_multi() {
         let tmp = tmp.clone();
         threads.push(thread::spawn(move || {
             for _ in 0..2000 {
-                tmp.update(Arc::new(rand::random()));
+                tmp.store(Arc::new(rand::random()));
             }
         }));
     }
@@ -52,5 +52,5 @@ fn test_load() {
 #[test]
 fn test_store() {
     let tmp = SwapArc::new(Arc::new(3));
-    tmp.update(Arc::new(-2));
+    tmp.store(Arc::new(-2));
 }

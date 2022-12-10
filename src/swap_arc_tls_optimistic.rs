@@ -499,23 +499,23 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     }
 
     /// Update the value inside the SwapArc to value passed in `updated`.
-    pub fn update(&self, updated: D) {
+    pub fn store(&self, updated: D) {
         // SAFETY: we know that `updated` is an instance of `D`, so we can generate a valid ptr to its content.
         unsafe {
-            self._update_raw(updated.as_ptr());
+            self._store_raw(updated.as_ptr());
         }
     }
 
     /// SAFETY: `updated` has to be a pointer that points to a valid instance
     /// of `T` and has to be acquired by calling `D::as_ptr` or via similar means.
     #[cfg(feature = "ptr-ops")]
-    pub unsafe fn update_raw(&self, updated: *const T) {
-        self._update_raw(updated);
+    pub unsafe fn store_raw(&self, updated: *const T) {
+        self._store_raw(updated);
     }
 
     /// SAFETY: `updated` has to be a pointer that points to a valid instance
     /// of `T` and has to be acquired by calling `D::as_ptr` or via similar means.
-    unsafe fn _update_raw(&self, updated: *const T) {
+    unsafe fn _store_raw(&self, updated: *const T) {
         let updated = Self::strip_metadata(updated);
         let new = updated.cast_mut();
         // SAFETY: this is safe because the caller promises that `updated` is valid.
@@ -630,8 +630,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     // unsafe fn try_compare_exchange<const IGNORE_META: bool>(&self, old: *const T, new: D) -> Result<bool, D>
 
     // FIXME: this causes "deadlocks" if there are any other references alive
+    #[cfg(feature = "ptr-ops")]
     pub unsafe fn try_compare_exchange_with_meta(&self, old: *const T, new: *const T) -> bool {
-        // FIXME: add safety comments!
         let backoff = Backoff::new();
         while !self
             .intermediate_ref_cnt
@@ -812,7 +812,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     curr = err;
                 }
             }
-            backoff.spin(); // FIXME: should we really backoff here? the other thread will make progress anyways and we will only have to spin once more if it makes progress again
+            backoff.spin(); // TODO: should we really backoff here? the other thread will make progress anyways and we will only have to spin once more if it makes progress again
         }
     }
 

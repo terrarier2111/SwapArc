@@ -125,7 +125,7 @@ fn main() {
     // let tmp = AutoLocalArc::new(3);
     let tmp = AutoLocalArc::new(3);
     let mut threads = vec![];
-    for _ in 0../*1*/8
+    for _ in 0../*1*//*6*//*8*/7
     /*20*//*5*//*1*/
     {
         let tmp = tmp.clone();
