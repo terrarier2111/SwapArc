@@ -610,7 +610,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     fence(Ordering::Acquire);
                     // push our update up, so it will be applied in the future
                     let old = self.updated.swap(new, Ordering::AcqRel); // FIXME: should we add some sort of update counter
-                                                                        // FIXME: to determine which update is the most recent?
+                                                                                         // FIXME: to determine which update is the most recent?
                     if !old.is_null() {
                         // drop the `virtual reference` we hold to the `D`
 
@@ -629,13 +629,17 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     // TODO: maybe add some method along the lines of:
     // unsafe fn try_compare_exchange<const IGNORE_META: bool>(&self, old: *const T, new: D) -> Result<bool, D>
 
-    // FIXME: this causes "deadlocks" if there are any other references alive
+    /// Note: this can cause "deadlocks" if there are any other (loaded) references alive.
+    /// SAFETY: `old` has to be a pointer that was acquired through
+    /// methods of this `SwapArc` instance. `old` may contain
+    /// metadata.
+    /// `new` has to be a pointer to a valid instance of `D`.
     #[cfg(feature = "ptr-ops")]
     pub unsafe fn try_compare_exchange_with_meta(&self, old: *const T, new: *const T) -> bool {
         let backoff = Backoff::new();
         while !self
             .intermediate_ref_cnt
-            .compare_exchange(
+            .compare_exchange_weak(
                 0,
                 Self::UPDATE | Self::OTHER_UPDATE,
                 Ordering::AcqRel,
@@ -759,7 +763,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 }
             }
 
-            backoff.spin(); // FIXME: should we really backoff here? the other thread will make progress anyways and we will only have to spin once more if it makes progress again
+            backoff.spin(); // TODO: should we really backoff here? the other thread will make progress anyways and we will only have to spin once more if it makes progress again
         }
     }
 
@@ -844,7 +848,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     curr = err;
                 }
             }
-            backoff.spin(); // FIXME: should we really backoff here? the other thread will make progress anyways and we will only have to spin once more if it makes progress again
+            backoff.spin(); // TODO: should we really backoff here? the other thread will make progress anyways and we will only have to spin once more if it makes progress again
         }
     }
 
