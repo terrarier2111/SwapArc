@@ -1,9 +1,9 @@
 use cfg_if::cfg_if;
 use crossbeam_utils::{Backoff, CachePadded};
+use likely_stable::{likely, unlikely};
 use std::borrow::Borrow;
 use std::cell::{RefCell, UnsafeCell};
 use std::fmt::{Debug, Display, Formatter};
-use likely_stable::{likely,unlikely};
 use std::marker::PhantomData;
 use std::mem;
 use std::mem::{align_of, ManuallyDrop};
@@ -345,9 +345,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         let curr_meta = Self::get_metadata(self.intermediate_ptr.load(Ordering::Relaxed));
         SwapArcIntermediatePtrGuard {
             parent: guard.parent,
-            // TODO: use this once strict provenance got stabilized!
-            // ptr: guard.fake_ref.as_ptr().map_addr(|x| x | curr_meta),
-            ptr: (guard.fake_ref.as_ptr() as usize | curr_meta) as *const T,
+            ptr: ptr::map_addr(guard.fake_ref.as_ptr(), |x| x | curr_meta),
             gen_cnt: guard.gen_cnt,
         }
     }
@@ -443,7 +441,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             Ok(_) => {
                 // take the update
                 let update = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
-                // check if we even have an update
+                                                                              // check if we even have an update
                 if !update.is_null() {
                     // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
                     // as it, itself is protected by other atomics, so we can use `Relaxed`
@@ -533,8 +531,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 Ok(_) => {
                     // clear out old updates to make sure our update won't be overwritten by them in the future
                     let old = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
-                    // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                    // as it, itself is protected by other atomics, so we can use `Relaxed`
+                                                                               // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
+                                                                               // as it, itself is protected by other atomics, so we can use `Relaxed`
                     let metadata =
                         Self::get_metadata(self.intermediate_ptr.load(Ordering::Relaxed));
                     let new = Self::merge_ptr_and_metadata(new, metadata).cast_mut();
@@ -610,7 +608,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     fence(Ordering::Acquire);
                     // push our update up, so it will be applied in the future
                     let old = self.updated.swap(new, Ordering::AcqRel); // FIXME: should we add some sort of update counter
-                                                                                         // FIXME: to determine which update is the most recent?
+                                                                        // FIXME: to determine which update is the most recent?
                     if !old.is_null() {
                         // drop the `virtual reference` we hold to the `D`
 
@@ -667,7 +665,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         }
         // clear out old updates to make sure our update won't be overwritten by them in the future
         let old_update = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
-        // increase the ref count
+                                                                          // increase the ref count
 
         // FIXME: add safety comment!
         let tmp = ManuallyDrop::new(D::from(Self::strip_metadata(new)));
@@ -742,14 +740,11 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         loop {
             let prefix = metadata & Self::META_MASK;
 
-            // TODO: use this once strict provenance got stabilized
-            // match self.intermediate_ptr.compare_exchange_weak(curr, curr.map_addr(|x| (x & !Self::META_MASK) | prefix), Ordering::Relaxed, Ordering::Relaxed) {
-
             // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
             // as it, itself is protected by other atomics, so we can use `Relaxed`
             match self.intermediate_ptr.compare_exchange_weak(
                 curr,
-                ((curr as usize & !Self::META_MASK) | prefix) as *mut T,
+                ptr::map_addr(curr, |x| (x & !Self::META_MASK) | prefix).cast_mut(),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -773,15 +768,13 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     #[cfg(feature = "ptr-ops")]
     pub fn try_update_meta(&self, old: *const T, metadata: usize) -> bool {
         let prefix = metadata & Self::META_MASK;
-        // TODO: use this once strict provenance got stabilized
-        // self.intermediate_ptr.compare_exchange(old.cast_mut(), old.map_addr(|x| (x & !Self::META_MASK) | prefix).cast_mut(), Ordering::Relaxed, Ordering::Relaxed).is_ok()
 
         // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
         // as it, itself is protected by other atomics, so we can use `Relaxed`
         self.intermediate_ptr
             .compare_exchange(
                 old.cast_mut(),
-                ((old as usize & !Self::META_MASK) | prefix) as *mut T,
+                ptr::map_addr(old, |x| (x & !Self::META_MASK) | prefix).cast_mut(),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             )
@@ -796,14 +789,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         let mut curr = self.intermediate_ptr.load(Ordering::Relaxed);
         loop {
             let prefix = active_bits & Self::META_MASK;
-            // TODO: use this once strict provenance got stabilized
-            // match self.intermediate_ptr.compare_exchange_weak(curr, curr.map_addr(|x| x | prefix), Ordering::Relaxed, Ordering::Relaxed) {
 
             // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
             // as it, itself is protected by other atomics, so we can use `Relaxed`
             match self.intermediate_ptr.compare_exchange_weak(
                 curr,
-                (curr as usize | prefix) as *mut T,
+                ptr::map_addr_mut(curr, |x| x | prefix),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -828,14 +819,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         let mut curr = self.intermediate_ptr.load(Ordering::Relaxed);
         loop {
             let prefix = inactive_bits & Self::META_MASK;
-            // TODO: use this once strict provenance got stabilized!
-            // match self.intermediate_ptr.compare_exchange_weak(curr, curr.map_addr(|x| x & !prefix), Ordering::Relaxed, Ordering::Relaxed) {
 
             // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
             // as it, itself is protected by other atomics, so we can use `Relaxed`
             match self.intermediate_ptr.compare_exchange_weak(
                 curr,
-                (curr as usize & !prefix) as *mut T,
+                ptr::map_addr_mut(curr, |x| x & !prefix),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -856,26 +845,22 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     pub fn load_metadata(&self) -> usize {
         // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
         // as it, itself is protected by other atomics, so we can use `Relaxed`
-        self.intermediate_ptr.load(Ordering::Relaxed) as usize & Self::META_MASK
+        ptr::expose_addr(self.intermediate_ptr.load(Ordering::Relaxed)) & Self::META_MASK
     }
 
     #[inline(always)]
     fn get_metadata(ptr: *const T) -> usize {
-        ptr as usize & Self::META_MASK
+        ptr::expose_addr(ptr) & Self::META_MASK
     }
 
     #[inline(always)]
     fn strip_metadata(ptr: *const T) -> *const T {
-        // TODO: use this once strict_provenance has been stabilized
-        // ptr.map_addr(|x| x & !Self::META_MASK)
-        (ptr as usize & !Self::META_MASK) as *const T
+        ptr::map_addr(ptr, |x| x & !Self::META_MASK)
     }
 
     #[inline(always)]
     fn merge_ptr_and_metadata(ptr: *const T, metadata: usize) -> *const T {
-        // TODO: use this once strict_provenance has been stabilized
-        // ptr.map_addr(|x| x | metadata)
-        (ptr as usize | metadata) as *const T
+        ptr::map_addr(ptr, |x| x | metadata)
     }
 
     const META_MASK: usize = {
@@ -1352,4 +1337,35 @@ const fn is_cmp_exchg_really_weak() -> bool {
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 const fn is_cmp_exchg_really_weak() -> bool {
     true
+}
+
+mod ptr {
+
+    // TODO: switch to strict_provenance once it has been stabilized
+
+    #[inline]
+    pub(crate) fn map_addr<T>(ptr: *const T, f: impl FnOnce(usize) -> usize) -> *const T {
+        f(expose_addr(ptr)) as *const T
+    }
+
+    #[inline]
+    pub(crate) fn map_addr_mut<T>(ptr: *mut T, f: impl FnOnce(usize) -> usize) -> *mut T {
+        f(expose_addr(ptr)) as *mut T
+    }
+
+    #[inline]
+    pub(crate) fn expose_addr<T>(ptr: *const T) -> usize {
+        ptr as usize
+    }
+
+    /*
+    #[inline]
+    pub(crate) const fn from_exposed_addr<T>(exposed_addr: usize) -> *const T {
+        exposed_addr as *const T
+    }
+
+    #[inline]
+    pub(crate) const fn from_exposed_addr_mut<T>(exposed_addr: usize) -> *mut T {
+        exposed_addr as *mut T
+    }*/
 }
