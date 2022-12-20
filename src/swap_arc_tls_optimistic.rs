@@ -39,14 +39,26 @@ use thread_local::ThreadLocal;
 /// to cache atomic accesses.
 
 /// This variant of `SwapArc` has wait-free reads.
-///
-pub struct SwapArcIntermediateTLS<T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
+pub struct SwapArcIntermediateTLS<
+    T: Send + Sync,
+    D: Send + Sync + DataPtrConvert<T> = Arc<T>,
+    const METADATA_BITS: u32 = 0,
+> {
     curr_ref_cnt: AtomicUsize, // the last bit is the `update` bit
     ptr: AtomicPtr<T>,
     intermediate_ref_cnt: AtomicUsize, // the last bit is the `update` bit
     intermediate_ptr: AtomicPtr<T>,
     updated: AtomicPtr<T>,
     thread_local: ThreadLocal<CachePadded<LocalData<T, D, METADATA_BITS>>>,
+}
+
+unsafe impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32> Send
+    for SwapArcIntermediateTLS<T, D, METADATA_BITS>
+{
+}
+unsafe impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32> Sync
+    for SwapArcIntermediateTLS<T, D, METADATA_BITS>
+{
 }
 
 #[inline]
@@ -62,7 +74,7 @@ const fn most_sig_set_bit(val: usize) -> Option<u32> {
     ret
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32>
     SwapArcIntermediateTLS<T, D, METADATA_BITS>
 {
     const UPDATE: usize = 1 << (usize::BITS - 1);
@@ -168,12 +180,22 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         }
 
         #[cold]
-        fn load_slow<'a, T, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(
+        fn load_slow<
+            'a,
+            T: Send + Sync,
+            D: Send + Sync + DataPtrConvert<T>,
+            const META_DATA_BITS: u32,
+        >(
             this: &'a SwapArcIntermediateTLS<T, D, { META_DATA_BITS }>,
             parent: &'a LocalData<T, D, META_DATA_BITS>,
             data: &mut LocalDataInner<T, D>,
         ) -> SwapArcIntermediateGuard<'a, T, D, META_DATA_BITS> {
-            fn load_new_slow<'a, T, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(
+            fn load_new_slow<
+                'a,
+                T: Send + Sync,
+                D: Send + Sync + DataPtrConvert<T>,
+                const META_DATA_BITS: u32,
+            >(
                 this: &'a SwapArcIntermediateTLS<T, D, { META_DATA_BITS }>,
                 data: &'a mut LocalDataInner<T, D>,
             ) -> (*const T, usize) {
@@ -877,7 +899,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     // to ensure that there's NO update pending
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32> Drop
     for SwapArcIntermediateTLS<T, D, METADATA_BITS>
 {
     fn drop(&mut self) {
@@ -912,13 +934,13 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
 
 cfg_if! {
     if #[cfg(feature = "ptr-ops")] {
-        pub struct SwapArcIntermediatePtrGuard<'a, T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
+        pub struct SwapArcIntermediatePtrGuard<'a, T: Send + Sync, D: Send + Sync + DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
             parent: &'a LocalData<T, D, METADATA_BITS>,
             ptr: *const T,
             gen_cnt: usize,
         }
 
-        impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
+        impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
 
             #[inline]
             pub fn as_raw(&self) -> *const T {
@@ -927,13 +949,13 @@ cfg_if! {
 
         }
 
-        impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Clone for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
+        impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32> Clone for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
             fn clone(&self) -> Self {
                 self.parent.parent().load_raw()
             }
         }
 
-        impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
+        impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
             fn drop(&mut self) {
                 // SAFETY: This is safe because we know that we are the only thread that
                 // is able to access the thread local data at this time and said data has to be initialized
@@ -946,7 +968,7 @@ cfg_if! {
                     slow_drop(self.parent, data, self.gen_cnt);
                 }
                 #[cold]
-                fn slow_drop<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>(parent: &LocalData<T, D, METADATA_BITS>, data: &mut LocalDataInner<T, D>, gen_cnt: usize) {
+                fn slow_drop<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32>(parent: &LocalData<T, D, METADATA_BITS>, data: &mut LocalDataInner<T, D>, gen_cnt: usize) {
                     if gen_cnt == data.new.gen_cnt {
                         data.new.ref_cnt -= 1;
                         if data.new.ref_cnt == 0 {
@@ -970,7 +992,7 @@ cfg_if! {
             }
         }
 
-        impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Debug for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
+        impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32> Debug for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
             fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                 let tmp = format!("{:?}", self.ptr);
                 f.write_str(tmp.as_str())
@@ -981,8 +1003,8 @@ cfg_if! {
 
 pub struct SwapArcIntermediateGuard<
     'a,
-    T,
-    D: DataPtrConvert<T> = Arc<T>,
+    T: Send + Sync,
+    D: Send + Sync + DataPtrConvert<T> = Arc<T>,
     const METADATA_BITS: u32 = 0,
 > {
     parent: &'a LocalData<T, D, METADATA_BITS>,
@@ -990,7 +1012,7 @@ pub struct SwapArcIntermediateGuard<
     gen_cnt: usize,
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32> Drop
     for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
 {
     #[inline]
@@ -1006,7 +1028,11 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
             slow_drop(self.parent, data, self.gen_cnt);
         }
         #[cold]
-        fn slow_drop<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>(
+        fn slow_drop<
+            T: Send + Sync,
+            D: Send + Sync + DataPtrConvert<T>,
+            const METADATA_BITS: u32,
+        >(
             parent: &LocalData<T, D, METADATA_BITS>,
             data: &mut LocalDataInner<T, D>,
             gen_cnt: usize,
@@ -1040,7 +1066,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
     }
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Deref
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32> Deref
     for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
 {
     type Target = D;
@@ -1051,7 +1077,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Deref
     }
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Borrow<D>
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32> Borrow<D>
     for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
 {
     #[inline]
@@ -1060,7 +1086,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Borrow<D>
     }
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> AsRef<D>
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32> AsRef<D>
     for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
 {
     #[inline]
@@ -1069,7 +1095,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> AsRef<D>
     }
 }
 
-impl<T, D: DataPtrConvert<T> + Display, const METADATA_BITS: u32> Display
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T> + Display, const METADATA_BITS: u32> Display
     for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
 {
     #[inline]
@@ -1078,7 +1104,7 @@ impl<T, D: DataPtrConvert<T> + Display, const METADATA_BITS: u32> Display
     }
 }
 
-impl<T, D: DataPtrConvert<T> + Debug, const METADATA_BITS: u32> Debug
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T> + Debug, const METADATA_BITS: u32> Debug
     for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
 {
     #[inline]
@@ -1089,8 +1115,8 @@ impl<T, D: DataPtrConvert<T> + Debug, const METADATA_BITS: u32> Debug
 
 struct SwapArcIntermediateInternalGuard<
     'a,
-    T,
-    D: DataPtrConvert<T> = Arc<T>,
+    T: Send + Sync,
+    D: Send + Sync + DataPtrConvert<T> = Arc<T>,
     const METADATA_BITS: u32 = 0,
 > {
     parent: &'a SwapArcIntermediateTLS<T, D, METADATA_BITS>,
@@ -1099,7 +1125,7 @@ struct SwapArcIntermediateInternalGuard<
     _no_send_guard: PhantomData<RefCell<()>>, // this ensures that this struct is not sent over to other threads
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32> Drop
     for SwapArcIntermediateInternalGuard<'_, T, D, METADATA_BITS>
 {
     fn drop(&mut self) {
@@ -1133,14 +1159,20 @@ enum RefSource {
     Intermediate,
 }
 
-struct LocalData<T, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
+struct LocalData<
+    T: Send + Sync,
+    D: Send + Sync + DataPtrConvert<T> = Arc<T>,
+    const METADATA_BITS: u32 = 0,
+> {
     parent: *const SwapArcIntermediateTLS<T, D, METADATA_BITS>, // this acts as a reference with hidden lifetime that only we know is safe because
     // `parent` won't be used in the drop impl and `LocalData` can only be accessed
     // through `parent`
     inner: UnsafeCell<LocalDataInner<T, D>>,
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> LocalData<T, D, METADATA_BITS> {
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32>
+    LocalData<T, D, METADATA_BITS>
+{
     #[inline]
     fn parent(&self) -> &SwapArcIntermediateTLS<T, D, METADATA_BITS> {
         // SAFETY: we know that `parent` has to be alive at this point
@@ -1151,26 +1183,32 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> LocalData<T, D, METADATA
 
 // SAFETY: this is safe because `parent` has to be alive when `LocalData` gets used
 // as it is only reachable through a valid reference to `SwapArc`
-unsafe impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Send
+unsafe impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const METADATA_BITS: u32> Send
     for LocalData<T, D, METADATA_BITS>
 {
 }
 
-struct LocalDataInner<T, D: DataPtrConvert<T> = Arc<T>> {
+struct LocalDataInner<T: Send + Sync, D: Send + Sync + DataPtrConvert<T> = Arc<T>> {
     next_gen_cnt: usize,
     intermediate: LocalCounted<T, D>,
     new: LocalCounted<T, D, true>,
     curr: LocalCounted<T, D, true>,
 }
 
-struct LocalCounted<T, D: DataPtrConvert<T> = Arc<T>, const DROP: bool = false> {
+struct LocalCounted<
+    T: Send + Sync,
+    D: Send + Sync + DataPtrConvert<T> = Arc<T>,
+    const DROP: bool = false,
+> {
     gen_cnt: usize, // TODO: would it help somehow (the performance) if we were to make `gen_cnt` an `u8`?
     ptr: *const T,
     ref_cnt: usize,
     _phantom_data: PhantomData<D>,
 }
 
-impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const DROP: bool>
+    LocalCounted<T, D, DROP>
+{
     /// SAFETY: The caller has to ensure that the safety invariants relied upon
     /// in the `val`, `refill_unchecked` and `drop` methods are valid.
     unsafe fn new(parent: &mut LocalDataInner<T, D>, ptr: *const T) -> Self {
@@ -1209,7 +1247,7 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
     }
 }
 
-impl<T, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>> LocalCounted<T, D, false> {
     /// SAFETY: callers have to make sure that the value behind the `ptr`
     /// contained inside this struct may be dropped as soon as this struct
     /// gets dropped.
@@ -1224,7 +1262,9 @@ impl<T, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
     }
 }
 
-impl<T, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCounted<T, D, DROP> {
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const DROP: bool> Default
+    for LocalCounted<T, D, DROP>
+{
     #[inline]
     fn default() -> Self {
         Self {
@@ -1236,11 +1276,15 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCounted<T, D, D
     }
 }
 
-// FIXME: is `Send` safe to implement even for `DROP = true`? - it probably is!
 // FIXME: add safety comment (the gist is that this will only ever be used when `parent` is dropped)
-unsafe impl<T, D: DataPtrConvert<T>, const DROP: bool> Send for LocalCounted<T, D, DROP> {}
+unsafe impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const DROP: bool> Send
+    for LocalCounted<T, D, DROP>
+{
+}
 
-impl<T, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCounted<T, D, DROP> {
+impl<T: Send + Sync, D: Send + Sync + DataPtrConvert<T>, const DROP: bool> Drop
+    for LocalCounted<T, D, DROP>
+{
     #[inline]
     fn drop(&mut self) {
         if DROP {
@@ -1262,12 +1306,12 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCounted<T, D, DROP
 /// it on `drop`.
 pub unsafe trait RefCnt: /*Send + Sync + */Clone {} // FIXME: is not having a Send + Sync bound correct here?
 
-pub trait DataPtrConvert<T>: RefCnt + Sized {
-    /// This function may not alter the reference count of the
+pub trait DataPtrConvert<T: Send + Sync>: RefCnt + Sized {
+    /// This method may not alter the reference count of the
     /// reference counted "object".
     unsafe fn from(ptr: *const T) -> Self;
 
-    /// This function should decrement the reference count of the
+    /// This method decrements the reference count of the
     /// reference counted "object" indirectly, by automatically
     /// decrementing it on drop inside the "object"'s drop
     /// implementation.
@@ -1276,11 +1320,11 @@ pub trait DataPtrConvert<T>: RefCnt + Sized {
         self.as_ptr()
     }
 
-    /// This function should NOT decrement the reference count of the
+    /// This method may not alter the reference count of the
     /// reference counted "object" in any way, shape or form.
     fn as_ptr(&self) -> *const T;
 
-    /// This function should increment the reference count of the
+    /// This method increments the reference count of the
     /// reference counted "object" directly.
     #[inline]
     fn increase_ref_cnt(&self) {
@@ -1288,9 +1332,9 @@ pub trait DataPtrConvert<T>: RefCnt + Sized {
     }
 }
 
-unsafe impl<T> RefCnt for Arc<T> {}
+unsafe impl<T: Send + Sync> RefCnt for Arc<T> {}
 
-impl<T> DataPtrConvert<T> for Arc<T> {
+impl<T: Send + Sync> DataPtrConvert<T> for Arc<T> {
     #[inline]
     unsafe fn from(ptr: *const T) -> Self {
         Arc::from_raw(ptr)
@@ -1302,9 +1346,9 @@ impl<T> DataPtrConvert<T> for Arc<T> {
     }
 }
 
-unsafe impl<T> RefCnt for Option<Arc<T>> {}
+unsafe impl<T: Send + Sync> RefCnt for Option<Arc<T>> {}
 
-impl<T> DataPtrConvert<T> for Option<Arc<T>> {
+impl<T: Send + Sync> DataPtrConvert<T> for Option<Arc<T>> {
     unsafe fn from(ptr: *const T) -> Self {
         if !ptr.is_null() {
             Some(Arc::from_raw(ptr))
