@@ -614,8 +614,10 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // other than spinning
                     fence(Ordering::Acquire);
                     // push our update up, so it will be applied in the future
-                    let old = self.updated.swap(new, Ordering::AcqRel); // FIXME: should we add some sort of update counter
-                                                                                         // FIXME: to determine which update is the most recent?
+                    // note: we don't need to add a counter to determine which update is the most recent as that would be
+                    // impossible anyways as there is no concept of time among two threads as long as they aren't synchronized
+                    // which means there's no way for us to know which update is the most recent in the first place
+                    let old = self.updated.swap(new, Ordering::AcqRel);
                     if !old.is_null() {
                         // drop the `virtual reference` we hold to the `D`
 
@@ -1265,6 +1267,80 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCount
             }
         }
     }
+}
+
+struct Ticket(usize);
+
+impl Ticket {
+
+    #[inline]
+    fn id(&self) -> usize {
+        self.0 << 1
+    }
+
+    #[inline]
+    fn overflow_guard(&self) -> bool {
+        self.0 & UpdateCache::OVERFLOW_GUARD != 0
+    }
+
+}
+
+struct UpdateCache<T> {
+    update: AtomicPtr<T>,
+    update_meta: AtomicUsize,
+    new_update: AtomicUsize,
+    new_id: AtomicUsize,
+}
+
+impl<T> UpdateCache<T> {
+
+    const UPDATE_MARKER: usize = 1 << 0;
+    const OVERFLOW_GUARD: usize = 1 << (usize::BITS - 1);
+    const TICKET_GUARD: usize = usize::MAX / 2 / 2 / 2;
+
+    const fn new() -> Self {
+        Self {
+            update: AtomicPtr::new(null_mut()),
+            update_meta: AtomicUsize::new(0),
+            new_update: AtomicUsize::new(0),
+            new_id: AtomicUsize::new(0),
+        }
+    }
+
+    fn draw_ticket(&self) -> Ticket {
+        // self.new_id.fetch_add(1, Ordering::Relaxed) // FIXME: handle overflow properly!
+        let ticket = self.new_id.fetch_add(1, Ordering::Relaxed);
+        if ticket >= Self::TICKET_GUARD {
+            self.new_id.store(Self::OVERFLOW_GUARD, Ordering::Relaxed);
+        }
+        Ticket(ticket)
+    }
+
+    fn try_update(&self, update: *mut T, ticket: Ticket) -> bool {
+        /*let ticket = ticket.id() | Self::UPDATE_MARKER;
+        while self.update_meta.load(Ordering::Relaxed) & Self::UPDATE_MARKER != 0 {}
+        if self.update_meta.fetch_max(ticket, Ordering::AcqRel) > ticket {
+            return false;
+        }
+        self.update.swap(update, Ordering::Relaxed);
+        self.update_meta.fetch_and(!Self::UPDATE_MARKER, Ordering::AcqRel);
+        true*/
+        let mut curr = self.new_update.load(Ordering::Relaxed);
+        loop {
+            if curr < ticket.id()
+            match self.new_update.compare_exchange_weak(0, ticket.id()) {}
+        }
+    }
+
+    fn try_take_update(&self) -> *mut T {
+        self.update.swap(null_mut(), Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn has_update_hint(&self) -> bool {
+        !self.update.load(Ordering::Relaxed).is_null()
+    }
+
 }
 
 /// SAFETY: Types implementing this trait are expected to perform
