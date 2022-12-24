@@ -395,7 +395,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     }
 
     fn try_update_curr(&self) -> bool {
-        let ret = match self.curr_ref_cnt.compare_exchange(
+        match self.curr_ref_cnt.compare_exchange(
             Self::OTHER_UPDATE,
             Self::UPDATE,
             Ordering::AcqRel,
@@ -435,8 +435,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 true
             }
             _ => false,
-        };
-        ret
+        }
     }
 
     fn try_update_intermediate(&self) {
@@ -557,7 +556,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         // while it is in there.
                         D::from(old);
                     }
-                    // try finishing the update up!
+                    // try finishing the update up
                     let mut curr = 0;
                     loop {
                         match self.curr_ref_cnt.compare_exchange(
@@ -1273,6 +1272,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCount
 /// To be precise, the `RefCnt` is expected to increment
 /// the reference count on `clone` calls, and decrement
 /// it on `drop`.
+/// NOTE: `Drop` is not required here as types such as
+/// `Option<Arc<T>>` fulfill all the requirements without
+/// needing special drop glue.
 pub unsafe trait RefCnt: Send + Sync + Clone {}
 
 pub trait DataPtrConvert<T: Send + Sync>: RefCnt + Sized {
@@ -1307,11 +1309,15 @@ pub trait DataPtrConvert<T: Send + Sync>: RefCnt + Sized {
     }
 }
 
+// SAFETY: This is safe because `Arc<T>` will increment an
+// internal reference count on `clone` calls and decrement
+// it on drop.
 unsafe impl<T: Send + Sync> RefCnt for Arc<T> {}
 
 impl<T: Send + Sync> DataPtrConvert<T> for Arc<T> {
     #[inline]
     unsafe fn from(ptr: *const T) -> Self {
+        // FIXME: add safety comment!
         Arc::from_raw(ptr)
     }
 
@@ -1321,11 +1327,17 @@ impl<T: Send + Sync> DataPtrConvert<T> for Arc<T> {
     }
 }
 
+// SAFETY: This is safe because on `drop` and `clone`, `Option<Arc<T>>`
+// will either: in case of `None`, "do nothing"
+// or in case of `Some` do the same as `Arc<T>`
+// which as explained above is also allowed to implement
+// `RefCnt`.
 unsafe impl<T: Send + Sync> RefCnt for Option<Arc<T>> {}
 
 impl<T: Send + Sync> DataPtrConvert<T> for Option<Arc<T>> {
     unsafe fn from(ptr: *const T) -> Self {
         if !ptr.is_null() {
+            // FIXME: add safety comment!
             Some(Arc::from_raw(ptr))
         } else {
             None
