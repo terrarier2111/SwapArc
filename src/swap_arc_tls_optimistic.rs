@@ -84,8 +84,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 expected, found
             );
         }
-        let val = ManuallyDrop::new(val);
-        let virtual_ref = val.as_ptr();
+        let virtual_ref = val.into_ptr();
         Self {
             curr_ref_cnt: Default::default(),
             ptr: AtomicPtr::new(virtual_ref.cast_mut()),
@@ -125,9 +124,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     pub fn load<'a>(&'a self) -> SwapArcIntermediateGuard<'a, T, D, METADATA_BITS> {
         let parent = self.thread_local.get_or(|| {
             let curr = self.load_internal();
-            let curr_ptr = curr.fake_ref.as_ptr();
             // increase the reference count
-            mem::forget(curr.fake_ref.clone());
+            let curr_ptr = ManuallyDrop::into_inner(curr.fake_ref.clone()).into_ptr();
             CachePadded::new(LocalData {
                 // SAFETY: this is safe because we know that this will only ever be accessed
                 // if there is a life reference to `self` present.
@@ -187,8 +185,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             ) -> (*const T, usize) {
                 let curr = this.load_internal();
                 // increase the strong reference count
-                mem::forget(curr.fake_ref.clone());
-                let new_ptr = curr.fake_ref.as_ptr();
+                let new_ptr = ManuallyDrop::into_inner(curr.fake_ref.clone()).into_ptr();
 
                 let gen_cnt = if data.curr.ref_cnt == 0 {
                     // don't modify the gen_cnt because we know that there are no references
@@ -448,7 +445,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             Ok(_) => {
                 // take the update
                 let update = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
-                // check if we even have an update
+                                                                              // check if we even have an update
                 if !update.is_null() {
                     // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
                     // as it, itself is protected by other atomics, so we can use `Relaxed`
@@ -507,7 +504,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     pub fn store(&self, updated: D) {
         // SAFETY: we know that `updated` is an instance of `D`, so we can generate a valid ptr to its content.
         unsafe {
-            self._store_raw(updated.as_ptr());
+            self._store_raw(updated.into_ptr());
         }
     }
 
@@ -515,18 +512,18 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// of `T` and has to be acquired by calling `D::as_ptr` or via similar means.
     #[cfg(feature = "ptr-ops")]
     pub unsafe fn store_raw(&self, updated: *const T) {
+        let updated = Self::strip_metadata(updated);
+        // SAFETY: this is safe because the caller promises that `updated` is valid.
+        let tmp = ManuallyDrop::new(D::from(updated.cast_mut()));
+        // increase the ref count
+        mem::forget(tmp.clone());
         self._store_raw(updated);
     }
 
     /// SAFETY: `updated` has to be a pointer that points to a valid instance
     /// of `T` and has to be acquired by calling `D::as_ptr` or via similar means.
     unsafe fn _store_raw(&self, updated: *const T) {
-        let updated = Self::strip_metadata(updated);
         let new = updated.cast_mut();
-        // SAFETY: this is safe because the caller promises that `updated` is valid.
-        let tmp = ManuallyDrop::new(D::from(new));
-        // increase the ref count
-        mem::forget(tmp.clone());
         let backoff = Backoff::new();
         loop {
             match self.intermediate_ref_cnt.compare_exchange(
@@ -538,8 +535,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 Ok(_) => {
                     // clear out old updates to make sure our update won't be overwritten by them in the future
                     let old = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
-                    // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                    // as it, itself is protected by other atomics, so we can use `Relaxed`
+                                                                               // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
+                                                                               // as it, itself is protected by other atomics, so we can use `Relaxed`
                     let metadata =
                         Self::get_metadata(self.intermediate_ptr.load(Ordering::Relaxed));
                     let new = Self::merge_ptr_and_metadata(new, metadata).cast_mut();
@@ -1285,23 +1282,13 @@ pub trait DataPtrConvert<T: Send + Sync>: RefCnt + Sized {
     ///
     /// SAFETY: `ptr` has to point to a valid instance of `T`
     /// and has to have been acquired by calling `DataPtrConvert::into`
-    /// or `DataPtrConvert::as_ptr`, furthermore the `DataPtrConvert`
-    /// which this was called on may never have reached a reference
-    /// count of `0`.
+    /// furthermore the `DataPtrConvert` which this was called on
+    /// may never have reached a reference count of `0`.
     unsafe fn from(ptr: *const T) -> Self;
 
-    /// This method decrements the reference count of the
-    /// reference counted "object" indirectly, by automatically
-    /// decrementing it on drop inside the "object"'s drop
-    /// implementation.
-    #[inline]
-    fn into(self) -> *const T {
-        self.as_ptr()
-    }
-
     /// This method may not alter the reference count of the
-    /// reference counted "object" in any way, shape or form.
-    fn as_ptr(&self) -> *const T;
+    /// reference counted "object".
+    fn into_ptr(self) -> *const T;
 
     /// This method increments the reference count of the
     /// reference counted "object" directly.
@@ -1319,13 +1306,16 @@ unsafe impl<T: Send + Sync> RefCnt for Arc<T> {}
 impl<T: Send + Sync> DataPtrConvert<T> for Arc<T> {
     #[inline]
     unsafe fn from(ptr: *const T) -> Self {
-        // FIXME: add safety comment!
+        // SAFETY: this is safe as the safety contract dictates
+        // `ptr` to not have been freed and to be a valid pointer
+        // that was acquired through `Self::into_ptr` which in this
+        // case means `Arc::into_raw`
         Arc::from_raw(ptr)
     }
 
     #[inline]
-    fn as_ptr(&self) -> *const T {
-        Arc::as_ptr(self)
+    fn into_ptr(self) -> *const T {
+        Arc::into_raw(self)
     }
 }
 
@@ -1339,17 +1329,19 @@ unsafe impl<T: Send + Sync> RefCnt for Option<Arc<T>> {}
 impl<T: Send + Sync> DataPtrConvert<T> for Option<Arc<T>> {
     unsafe fn from(ptr: *const T) -> Self {
         if !ptr.is_null() {
-            // FIXME: add safety comment!
+            // SAFETY: this is safe because this is doing the exact same as
+            // the `from` method in the `DataPtrConvert<T>` implementation of
+            // `Arc<T>`.
             Some(Arc::from_raw(ptr))
         } else {
             None
         }
     }
 
-    fn as_ptr(&self) -> *const T {
+    fn into_ptr(self) -> *const T {
         match self {
             None => null(),
-            Some(val) => Arc::as_ptr(val),
+            Some(val) => Arc::into_raw(val),
         }
     }
 }

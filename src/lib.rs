@@ -41,6 +41,66 @@ fn test_load_multi() {
         .for_each(|thread| thread.join().unwrap());
 }
 
+#[cfg(all(test, miri))]
+#[test]
+fn test_load_multi_miri() {
+    use std::hint::black_box;
+    use std::thread;
+    let tmp: Arc<SwapArcIntermediateTLS<i32, Arc<i32>, 0>> =
+        Arc::new(SwapArcIntermediateTLS::new(Arc::new(3)));
+    let mut threads = vec![];
+    for _ in 0..4 {
+        let tmp = tmp.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..200 {
+                let l1 = tmp.load();
+                black_box(l1);
+            }
+        }));
+    }
+    for _ in 0..4 {
+        let tmp = tmp.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..200 {
+                tmp.store(Arc::new(rand::random()));
+            }
+        }));
+    }
+    threads
+        .into_iter()
+        .for_each(|thread| thread.join().unwrap());
+}
+
+#[cfg(all(test, miri))]
+#[test]
+fn test_other_load_multi_miri() {
+    use std::hint::black_box;
+    use std::thread;
+    let tmp: Arc<SwapArcIntermediateTLS<i32, Arc<i32>, 0>> =
+        Arc::new(SwapArcIntermediateTLS::new(Arc::new(3)));
+    let mut threads = vec![];
+    for _ in 0..4 {
+        let tmp = tmp.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..200 {
+                let l1 = tmp.load();
+                black_box(l1);
+            }
+        }));
+    }
+    for _ in 0..1 {
+        let tmp = tmp.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..20 {
+                tmp.store(Arc::new(rand::random()));
+            }
+        }));
+    }
+    threads
+        .into_iter()
+        .for_each(|thread| thread.join().unwrap());
+}
+
 #[test]
 fn test_load() {
     let tmp = SwapArc::new(Arc::new(3));
