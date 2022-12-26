@@ -391,6 +391,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         }
     }
 
+    #[cold]
     fn try_update_curr(&self) -> bool {
         match self.curr_ref_cnt.compare_exchange(
             Self::OTHER_UPDATE,
@@ -434,6 +435,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         }
     }
 
+    #[cold]
     fn try_update_intermediate(&self) {
         match self.intermediate_ref_cnt.compare_exchange(
             0,
@@ -461,9 +463,10 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     self.intermediate_ref_cnt
                         .fetch_and(!Self::UPDATE, Ordering::AcqRel);
                     // try finishing the update up
+                    let mut curr = 0;
                     loop {
                         match self.curr_ref_cnt.compare_exchange(
-                            0,
+                            curr,
                             Self::UPDATE,
                             Ordering::AcqRel,
                             Ordering::Relaxed,
@@ -487,6 +490,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                                 unsafe {
                                     D::from(Self::strip_metadata(prev));
                                 }
+                                break;
                             }
                             Err(_) => {
                                 // set the `OTHER_UPDATE` flag to indicate that there is an update pending
