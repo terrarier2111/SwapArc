@@ -187,6 +187,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // increase the strong reference count
                 let new_ptr = ManuallyDrop::into_inner(curr.fake_ref.clone()).into_ptr();
 
+                // check if we can immediately update our `curr` value or if we have to
+                // put the update into `new` until `curr` can be updated.
                 let gen_cnt = if data.curr.ref_cnt == 0 {
                     // don't modify the gen_cnt because we know that there are no references
                     // left to this (thread-)local instance
@@ -194,6 +196,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     data.curr.gen_cnt
                 } else {
                     if data.new.gen_cnt != 0 {
+                        // don't modify the gen_cnt because we know that there are no references
+                        // left to this (thread-)local instance
                         data.new.refill_unchecked(new_ptr);
                     } else {
                         let new = unsafe { LocalCounted::new(data, new_ptr) };
@@ -216,7 +220,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     fake_ref,
                     gen_cnt,
                 };
-            } else if unlikely(data.new.ref_cnt == usize::MAX) {
+            }
+
+            if unlikely(data.new.ref_cnt == usize::MAX) {
                 // we now know that we are the first load to occur on the current thread
                 data.new.ref_cnt = 0;
                 // SAFETY: this is safe because we know that the pointer inside `data.curr.ptr`
@@ -238,6 +244,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // to the value stored inside `ptr` anyways, so it doesn't really matter when exactly we update `curr`
                 // and this allows us to save many branches on drop
                 data.curr = mem::take(&mut data.new);
+                // if the `ref_cnt` of `intermediate` is not `0`, we know that its `ptr` is valid
                 if data.intermediate.ref_cnt != 0 {
                     // increase the ref count of the new value
                     data.intermediate.val().increase_ref_cnt();
@@ -255,70 +262,50 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     return SwapArcIntermediateGuard {
                         parent,
                         fake_ref,
-                        gen_cnt: data.new.gen_cnt,
+                        gen_cnt: data.curr.gen_cnt,
                     };
                 }
-                // FIXME: what do we do here? `curr` was replaced by `new` and `new` is empty now, do we return now, or do we allow a potential update of `intermediate`?
-            }
-            if data.intermediate.ref_cnt == 0 {
-                // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                // as it, itself is protected by other atomics, so we can use `Relaxed`
-                let intermediate =
-                    SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(
-                        parent.parent().intermediate_ptr.load(Ordering::Relaxed),
-                    );
-                // check if there is a new intermediate value and that the intermediate value has been verified to be usable
-                let (ptr, gen_cnt) = if intermediate != data.new.ptr() {
-                    // there's a new value so we have to update our (thread-)local representation
 
-                    // we have to make sure we observe the update of `intermediate_ref_cnt` correctly
-                    fence(Ordering::Acquire);
-                    // increment the reference count in order to avoid race conditions and act as a guard for our load
-                    let loaded = parent
-                        .parent()
-                        .intermediate_ref_cnt
-                        .fetch_add(1, Ordering::AcqRel);
-                    // check if the update is still on-going or if the update is complete and we can thus use the
-                    // new value
-                    if loaded & SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::UPDATE == 0 {
-                        // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                        // as it, itself is protected by other atomics, but  we need to make sure we never
-                        // observe its guards' updates after its update, so we have to use `Acquire`
-                        let loaded =
-                            SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(
-                                parent.parent().intermediate_ptr.load(Ordering::Relaxed),
-                            );
-                        if data.intermediate.gen_cnt != 0 {
-                            data.intermediate.refill_unchecked(loaded);
-                        } else {
-                            let new = unsafe { LocalCounted::new(data, loaded) };
-                            data.intermediate = new;
-                        }
-                        (loaded, data.intermediate.gen_cnt)
-                    } else {
-                        // the update is on-going, so we have to fallback to our locally most recent value
-                        // and signal that the update finished.
-                        parent
-                            .parent()
-                            .intermediate_ref_cnt
-                            .fetch_sub(1, Ordering::Relaxed);
-                        data.new.ref_cnt += 1;
-                        (data.new.ptr(), data.new.gen_cnt)
-                    }
-                } else {
-                    // there's no new value so we can just return the newest one we have
-                    data.new.ref_cnt += 1;
-                    (data.new.ptr(), data.new.gen_cnt)
-                };
-                // SAFETY: we loaded the `ptr` right before this and used local and global guards in order
-                // to ensure that it's safe to dereference
-                let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
+                // curr was replace by `new` and `new` is empty now, so we return to not allow
+                // for `intermediate` to be updated because that would mean that we have an
+                // unexpected state in which we have:
+                // `curr`: value
+                // `new` : empty
+                // `intermediate`: value
+                // to avoid this we try to update `new` or just return `curr` if we fail to do so
+
+
+                // TODO: do we always have to assume that there is an update pending or can we check if there actually is?
+                let curr = this.load_internal();
+
+                if curr.fake_ref.ptr_eq(data.curr.ptr()) {
+                    // there is no new update, just stick with the version we have
+
+                    data.curr.ref_cnt += 1;
+                    // SAFETY: this is safe because the pointer contained inside `curr.ptr` is guaranteed to always be valid
+                    let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr()) });
+                    return SwapArcIntermediateGuard {
+                        parent,
+                        fake_ref,
+                        gen_cnt: data.curr.gen_cnt,
+                    };
+                }
+                // increase the strong reference count
+                let new_ptr = ManuallyDrop::into_inner(curr.fake_ref.clone()).into_ptr();
+
+                // don't modify the gen_cnt because we know that there are no references
+                // left to this (thread-)local instance
+                data.new.refill_unchecked(new_ptr);
+
                 return SwapArcIntermediateGuard {
                     parent,
-                    fake_ref,
-                    gen_cnt,
+                    // FIXME: add safety comment!
+                    fake_ref: ManuallyDrop::new(unsafe { D::from(new_ptr) }),
+                    gen_cnt: data.new.gen_cnt,
                 };
-            } else {
+            }
+
+            if data.intermediate.ref_cnt != 0 {
                 data.intermediate.ref_cnt += 1;
                 // SAFETY: we just checked that the ref count of `intermediate` is greater than 0
                 // and thus we know that `intermediate.ptr` has to be a valid value.
@@ -329,6 +316,62 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     gen_cnt: data.intermediate.gen_cnt,
                 };
             }
+
+            // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
+            // as it, itself is protected by other atomics, so we can use `Relaxed`
+            let intermediate = SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(
+                parent.parent().intermediate_ptr.load(Ordering::Relaxed),
+            );
+            // check if there is a new intermediate value and that the intermediate value has been verified to be usable
+            let (ptr, gen_cnt) = if intermediate != data.new.ptr() {
+                // there's a new value so we have to update our (thread-)local representation
+
+                // we have to make sure we observe the update of `intermediate_ref_cnt` correctly
+                fence(Ordering::Acquire);
+                // increment the reference count in order to avoid race conditions and act as a guard for our load
+                let loaded = parent
+                    .parent()
+                    .intermediate_ref_cnt
+                    .fetch_add(1, Ordering::AcqRel);
+                // check if the update is still on-going or if the update is complete and we can thus use the
+                // new value
+                if loaded & SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::UPDATE == 0 {
+                    // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
+                    // as it, itself is protected by other atomics, but  we need to make sure we never
+                    // observe its guards' updates after its update, so we have to use `Acquire`
+                    let loaded = SwapArcIntermediateTLS::<T, D, { META_DATA_BITS }>::strip_metadata(
+                        parent.parent().intermediate_ptr.load(Ordering::Relaxed),
+                    );
+                    if data.intermediate.gen_cnt != 0 {
+                        data.intermediate.refill_unchecked(loaded);
+                    } else {
+                        let new = unsafe { LocalCounted::new(data, loaded) };
+                        data.intermediate = new;
+                    }
+                    (loaded, data.intermediate.gen_cnt)
+                } else {
+                    // the update is on-going, so we have to fallback to our locally most recent value
+                    // and signal that the update finished.
+                    parent
+                        .parent()
+                        .intermediate_ref_cnt
+                        .fetch_sub(1, Ordering::Relaxed);
+                    data.new.ref_cnt += 1;
+                    (data.new.ptr(), data.new.gen_cnt)
+                }
+            } else {
+                // there's no new value so we can just return the newest one we have
+                data.new.ref_cnt += 1;
+                (data.new.ptr(), data.new.gen_cnt)
+            };
+            // SAFETY: we loaded the `ptr` right before this and used local and global guards in order
+            // to ensure that it's safe to dereference
+            let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
+            return SwapArcIntermediateGuard {
+                parent,
+                fake_ref,
+                gen_cnt,
+            };
         }
 
         load_slow(self, parent, data)
@@ -916,7 +959,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
     for SwapArcIntermediateTLS<T, D, METADATA_BITS>
 {
     fn drop(&mut self) {
-        // FIXME: how should we handle intermediate inside drop?
         let updated = *self.updated.get_mut();
         if !updated.is_null() {
             // SAFETY: we know that we hold a `virtual reference` to the `D`
@@ -929,7 +971,10 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
         let curr = Self::strip_metadata(*self.ptr.get_mut());
         let intermediate = Self::strip_metadata(*self.intermediate_ptr.get_mut());
         if intermediate != curr {
-            // FIXME: the reason why we have to do this currently is because the update function doesn't work properly, fix the root cause!
+            // we have to handle intermediate here too as it is possible for it to be non-null
+            // on drop of `SwapArc` if there's an update to `curr` pending and there are no instances of
+            // an value loaded through `intermediate` and a `store` happens meaning that once all `curr`
+            // instances get dropped, `intermediate` will be non-null.
             unsafe {
                 D::from(intermediate);
             }
@@ -1336,6 +1381,8 @@ pub trait DataPtrConvert<T: Send + Sync>: RefCnt + Sized {
     fn increase_ref_cnt(&self) {
         mem::forget(self.clone());
     }
+
+    fn ptr_eq(&self, other: *const Self) -> bool;
 }
 
 // SAFETY: This is safe because `Arc<T>` will increment an
@@ -1356,6 +1403,12 @@ impl<T: Send + Sync> DataPtrConvert<T> for Arc<T> {
     #[inline]
     fn into_ptr(self) -> *const T {
         Arc::into_raw(self)
+    }
+
+    #[inline]
+    fn ptr_eq(&self, other: *const Self) -> bool {
+        // FIXME: add safety comment!
+        Arc::ptr_eq(self, unsafe { &*other })
     }
 }
 
@@ -1384,6 +1437,20 @@ impl<T: Send + Sync> DataPtrConvert<T> for Option<Arc<T>> {
         match self {
             None => null(),
             Some(val) => Arc::into_raw(val),
+        }
+    }
+
+    #[inline]
+    fn ptr_eq(&self, other: *const Self) -> bool {
+        match self {
+            None => other.is_null(),
+            Some(slf) => {
+                if other.is_null() {
+                    return false;
+                }
+                // FIXME: add safety comment!
+                Arc::ptr_eq(slf, unsafe { &*other })
+            },
         }
     }
 }
