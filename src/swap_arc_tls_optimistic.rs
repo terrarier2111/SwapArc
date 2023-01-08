@@ -282,10 +282,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // `new` to `curr` with `new`'s `ref_cnt` being non-zero (which means that
                 // `new.ptr` had to have been valid)
                 let other = ManuallyDrop::new(unsafe { D::from(data.curr.ptr()) });
-                // SAFETY: we know that `curr.ptr` has to be valid because we just moved
-                // `new` to `curr` with `new`'s `ref_cnt` being non-zero (which means that
-                // `new.ptr` had to have been valid)
-                if unsafe { curr.fake_ref.ptr_eq(other.deref() as *const D) } {
+                if core::ptr::eq(curr.fake_ref.deref() as *const D, other.deref() as *const D) {
                     // there is no new update, just stick with the version we have
 
                     data.curr.ref_cnt += 1;
@@ -1389,11 +1386,6 @@ pub trait DataPtrConvert<T: Send + Sync>: RefCnt + Sized {
     fn increase_ref_cnt(&self) {
         mem::forget(self.clone());
     }
-
-    /// This method compares `other` with `self`.
-    /// SAFETY: `other` has to point to a valid instance of
-    /// `D`.
-    unsafe fn ptr_eq(&self, other: *const Self) -> bool;
 }
 
 // SAFETY: This is safe because `Arc<T>` will increment an
@@ -1414,13 +1406,6 @@ impl<T: Send + Sync> DataPtrConvert<T> for Arc<T> {
     #[inline]
     fn into_ptr(self) -> *const T {
         Arc::into_raw(self)
-    }
-
-    #[inline]
-    unsafe fn ptr_eq(&self, other: *const Self) -> bool {
-        // SAFETY: This is safe because as per this function's preconditions,
-        // `other` has to point to a valid instance of `D`.
-        Arc::ptr_eq(self, unsafe { &*other })
     }
 }
 
@@ -1449,21 +1434,6 @@ impl<T: Send + Sync> DataPtrConvert<T> for Option<Arc<T>> {
         match self {
             None => null(),
             Some(val) => Arc::into_raw(val),
-        }
-    }
-
-    #[inline]
-    unsafe fn ptr_eq(&self, other: *const Self) -> bool {
-        match self {
-            None => other.is_null(),
-            Some(slf) => {
-                if other.is_null() {
-                    return false;
-                }
-                // SAFETY: This is safe because as per this function's preconditions,
-                // `other` has to point to a valid instance of `D`.
-                Arc::ptr_eq(slf, unsafe { &*other.cast() })
-            },
         }
     }
 }

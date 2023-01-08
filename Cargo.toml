@@ -21,8 +21,7 @@ crossbeam-utils = "0.8.14"
 likely_stable = "0.1.2"
 cfg-if = "1.0.0"
 arc-swap = { version = "1.5.1", optional = true }
-# rand = { version = "0.8.5", optional = true }
-rand = "0.8.5"
+rand = { version = "0.8.5", optional = true }
 
 [dev-dependencies]
 rand = "0.8.5"
