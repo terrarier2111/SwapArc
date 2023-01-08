@@ -262,7 +262,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     return SwapArcIntermediateGuard {
                         parent,
                         fake_ref,
-                        gen_cnt: data.curr.gen_cnt,
+                        gen_cnt: data.new.gen_cnt,
                     };
                 }
 
@@ -278,7 +278,14 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // TODO: do we always have to assume that there is an update pending or can we check if there actually is?
                 let curr = this.load_internal();
 
-                if curr.fake_ref.ptr_eq(data.curr.ptr()) {
+                // SAFETY: we know that `curr.ptr` has to be valid because we just moved
+                // `new` to `curr` with `new`'s `ref_cnt` being non-zero (which means that
+                // `new.ptr` had to have been valid)
+                let other = ManuallyDrop::new(unsafe { D::from(data.curr.ptr()) });
+                // SAFETY: we know that `curr.ptr` has to be valid because we just moved
+                // `new` to `curr` with `new`'s `ref_cnt` being non-zero (which means that
+                // `new.ptr` had to have been valid)
+                if unsafe { curr.fake_ref.ptr_eq(other.deref() as *const D) } {
                     // there is no new update, just stick with the version we have
 
                     data.curr.ref_cnt += 1;
@@ -299,7 +306,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
                 return SwapArcIntermediateGuard {
                     parent,
-                    // FIXME: add safety comment!
+                    // SAFETY: This is safe because we just created the instance `new_ptr` is pointing to
+                    // and we didn't delete it. Thus `new_ptr` is a ptr to a valid instance of `D`.
                     fake_ref: ManuallyDrop::new(unsafe { D::from(new_ptr) }),
                     gen_cnt: data.new.gen_cnt,
                 };
@@ -1382,7 +1390,10 @@ pub trait DataPtrConvert<T: Send + Sync>: RefCnt + Sized {
         mem::forget(self.clone());
     }
 
-    fn ptr_eq(&self, other: *const Self) -> bool;
+    /// This method compares `other` with `self`.
+    /// SAFETY: `other` has to point to a valid instance of
+    /// `D`.
+    unsafe fn ptr_eq(&self, other: *const Self) -> bool;
 }
 
 // SAFETY: This is safe because `Arc<T>` will increment an
@@ -1406,8 +1417,9 @@ impl<T: Send + Sync> DataPtrConvert<T> for Arc<T> {
     }
 
     #[inline]
-    fn ptr_eq(&self, other: *const Self) -> bool {
-        // FIXME: add safety comment!
+    unsafe fn ptr_eq(&self, other: *const Self) -> bool {
+        // SAFETY: This is safe because as per this function's preconditions,
+        // `other` has to point to a valid instance of `D`.
         Arc::ptr_eq(self, unsafe { &*other })
     }
 }
@@ -1441,15 +1453,16 @@ impl<T: Send + Sync> DataPtrConvert<T> for Option<Arc<T>> {
     }
 
     #[inline]
-    fn ptr_eq(&self, other: *const Self) -> bool {
+    unsafe fn ptr_eq(&self, other: *const Self) -> bool {
         match self {
             None => other.is_null(),
             Some(slf) => {
                 if other.is_null() {
                     return false;
                 }
-                // FIXME: add safety comment!
-                Arc::ptr_eq(slf, unsafe { &*other })
+                // SAFETY: This is safe because as per this function's preconditions,
+                // `other` has to point to a valid instance of `D`.
+                Arc::ptr_eq(slf, unsafe { &*other.cast() })
             },
         }
     }
