@@ -2,6 +2,12 @@
 name = "swap-arc"
 version = "0.1.0"
 edition = "2021"
+description = "A swappable Arc"
+readme = "README.md"
+repository = "https://github.com/terrarier2111/SwapArc"
+license = "MIT OR Apache-2.0"
+keywords = ["utility", "concurrency", "data-structure", "performance", "atomic"]
+categories = ["Concurrency", "Data structures", "Memory management"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -11,17 +17,11 @@ ptr-ops = []
 [profile.release]
 debug = true
 
-#[target.x86_64-unknown-linux-gnu]
-#linker = "/usr/bin/clang"
-#rustflags = ["-Clink-arg=-fuse-ld=lld", "-Clink-arg=-Wl,--no-rosegment"]
-
 [dependencies]
 thread_local = { git = "https://github.com/terrarier2111/thread_local-rs", branch = "stable", features = ["nightly"] }
 crossbeam-utils = "0.8.14"
 likely_stable = "0.1.2"
 cfg-if = "1.0.0"
-arc-swap = { version = "1.5.1", optional = true }
-rand = { version = "0.8.5", optional = true }
 
 [dev-dependencies]
 rand = "0.8.5"
