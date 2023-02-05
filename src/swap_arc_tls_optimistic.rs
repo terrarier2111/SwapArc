@@ -4,6 +4,7 @@ use likely_stable::{likely, unlikely};
 use std::borrow::Borrow;
 use std::cell::{RefCell, UnsafeCell};
 use std::fmt::{Debug, Display, Formatter};
+use std::io::Write;
 use std::marker::PhantomData;
 use std::mem;
 use std::mem::{align_of, ManuallyDrop};
@@ -12,6 +13,9 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thread_local::ThreadLocal;
+
+// FIXME: we can probably combine the counters and ptrs in the main struct into an [(AtomicUsize, AtomicPtr); 2] and have
+// FIXME: a third number that is either 0 or 1 and represents an index into the array, this could improve performance!
 
 /// A `SwapArc` is a data structure that allows for an `Arc`
 /// to be passed around and swapped out with other `Arc`s.
@@ -68,8 +72,10 @@ const fn most_sig_set_bit(val: usize) -> Option<u32> {
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     SwapArcIntermediateTLS<T, D, METADATA_BITS>
 {
-    const UPDATE: usize = 1 << (usize::BITS - 1);
-    const OTHER_UPDATE: usize = 1 << (usize::BITS - 2);
+    const UPDATE: usize = 1 << (usize::BITS - 1); // when this bit is set on a cnt, it means that it is currently being
+                                                  // updated and its ptr may not be used while this bit is set.
+    const OTHER_UPDATE: usize = 1 << (usize::BITS - 2); // when this bit is set on `intermediate` we know that its value hasn't propagated to `ptr` yet.
+                                                        // and when it's set on `curr` we know that curr still has to be updated
 
     /// Creates a new `SwapArc` instance with `val` as the initial value.
     pub fn new(val: D) -> Self {
@@ -174,7 +180,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             parent: &'a LocalData<T, D, META_DATA_BITS>,
             data: &mut LocalDataInner<T, D>,
         ) -> SwapArcIntermediateGuard<'a, T, D, META_DATA_BITS> {
-            fn load_new_slow<
+            fn load_updated_slow<
                 'a,
                 T: Send + Sync,
                 D: DataPtrConvert<T>,
@@ -209,9 +215,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             }
 
             // the following conditional relies on preconditions provided by the caller (`load`)
-            // to be precise we rely on `parent.ptr` to be different from `curr.ptr`
+            // to be precise we rely on `parent.ptr` to be different from `data.curr.ptr`
             if data.new.ref_cnt == 0 {
-                let (ptr, gen_cnt) = load_new_slow(this, data);
+                let (ptr, gen_cnt) = load_updated_slow(this, data);
                 // SAFETY: this is safe because we know that `load_new_slow` returns a pointer that
                 // was acquired through `D::as_ptr` and points to a valid instance of `D`.
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
@@ -441,6 +447,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
     #[cold]
     fn try_update_curr(&self) -> bool {
+        // println!("try updating curr!");
         match self.curr_ref_cnt.compare_exchange(
             Self::OTHER_UPDATE,
             Self::UPDATE,
@@ -448,6 +455,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             Ordering::Relaxed,
         ) {
             Ok(_) => {
+                // FIXME: the abort only happens when this branch is taken!
+
                 // TODO: can we somehow bypass intermediate if we have a new update upcoming - we probably can't because this would probably cause memory leaks and other funny things that we don't like
                 // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
                 // as it, itself is protected by other atomics, so we can use `Relaxed`
@@ -477,14 +486,19 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // unset the `weak` update flag from the intermediate ref cnt
                 self.intermediate_ref_cnt
                     .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
+                println!("success updating curr!");
                 true
             }
-            _ => false,
+            _ => {
+                println!("failed updating curr!");
+                false
+            },
         }
     }
 
     #[cold]
     fn try_update_intermediate(&self) {
+        println!("try updating intermediate!");
         match self.intermediate_ref_cnt.compare_exchange(
             0,
             Self::UPDATE | Self::OTHER_UPDATE,
@@ -528,7 +542,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                                 self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                                 // unset the `weak` update flag from the intermediate ref cnt
                                 self.intermediate_ref_cnt
-                                    .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
+                                    .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel); // TODO: acquire should suffice here!
                                 // drop the `virtual reference` we hold to the `D`
 
                                 // SAFETY: we know that we hold a `virtual reference` to the `D`
@@ -659,7 +673,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                             }
                             Err(_) => {
                                 // set the `OTHER_UPDATE` flag to indicate that there is an update pending
-                                // and no other explicit update to `ptr` may occur until this updates has been
+                                // and no other explicit update to `ptr` may occur until this update has been
                                 // implicitly updated (but only if such a flag isn't present yet)
 
                                 // ORDERING: the failure ordering of `Relaxed` can't race because we are performing an `Acquire`
@@ -680,6 +694,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     break;
                 }
                 Err(old) => {
+                    // println!("store failed!");
                     if old & Self::UPDATE != 0 {
                         backoff.snooze();
                         // somebody else already updates the current ptr, so we wait until they finish their update
