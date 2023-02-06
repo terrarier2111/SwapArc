@@ -10,7 +10,7 @@ use std::mem;
 use std::mem::{align_of, ManuallyDrop};
 use std::ops::Deref;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
+use loom::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thread_local::ThreadLocal;
 
@@ -979,7 +979,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
     for SwapArcIntermediateTLS<T, D, METADATA_BITS>
 {
     fn drop(&mut self) {
-        let updated = *self.updated.get_mut();
+        let updated = unsafe { self.updated.unsync_load() };
         if !updated.is_null() {
             // SAFETY: we know that we hold a `virtual reference` to the `D`
             // which `updated` points to and thus we are allowed to drop
@@ -988,8 +988,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
                 D::from(updated);
             }
         }
-        let curr = Self::strip_metadata(*self.ptr.get_mut());
-        let intermediate = Self::strip_metadata(*self.intermediate_ptr.get_mut());
+        let curr = Self::strip_metadata(unsafe { self.ptr.unsync_load() });
+        let intermediate = Self::strip_metadata(unsafe { self.intermediate_ptr.unsync_load() });
         if intermediate != curr {
             // we have to handle intermediate here too as it is possible for it to be non-null
             // on drop of `SwapArc` if there's an update to `curr` pending and there are no instances of
