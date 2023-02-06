@@ -14,13 +14,8 @@ categories = ["Concurrency", "Data structures", "Memory management"]
 [features]
 ptr-ops = []
 
-[profile.release]
-# debug = true
-overflow-checks = true
-
 [dependencies]
 thread_local = { git = "https://github.com/terrarier2111/thread_local-rs", branch = "stable", features = ["nightly"] }
-# thread_local = { git = "https://github.com/terrarier2111/thread_local-rs", branch = "loom" }
 crossbeam-utils = "0.8.14"
 likely_stable = "0.1.2"
 cfg-if = "1.0.0"

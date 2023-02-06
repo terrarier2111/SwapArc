@@ -14,8 +14,8 @@ use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thread_local::ThreadLocal;
 
-// FIXME: we can probably combine the counters and ptrs in the main struct into an [(AtomicUsize, AtomicPtr); 2] and have
-// FIXME: a third number that is either 0 or 1 and represents an index into the array, this could improve performance!
+// TODO: we can probably combine the counters and ptrs in the main struct into an [(AtomicUsize, AtomicPtr); 2] and have
+// TODO: a third number that is either 0 or 1 and represents an index into the array, this could improve performance!
 
 /// A `SwapArc` is a data structure that allows for an `Arc`
 /// to be passed around and swapped out with other `Arc`s.
@@ -411,7 +411,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
     fn load_internal(&self) -> SwapArcIntermediateInternalGuard<T, D, METADATA_BITS> {
         let ref_cnt = self.curr_ref_cnt.fetch_add(1, Ordering::AcqRel);
-        let (ptr, src) = if ref_cnt & Self::UPDATE != 0 {
+        // Check if there is currently an update of `curr` on-going because if there is,
+        // the ptr can be invalidated at any point in time. Additionally we have to check
+        // if there is an implicit update allowed which also means that the ptr
+        // can be invalidated at any point in time.
+        let (ptr, src) = if ref_cnt & (Self::UPDATE | Self::OTHER_UPDATE) != 0 {
             let intermediate_ref_cnt = self.intermediate_ref_cnt.fetch_add(1, Ordering::AcqRel);
             if intermediate_ref_cnt & Self::UPDATE != 0 {
                 // ORDERING: `ptr` doesn't have to care about anything other than itself
@@ -447,7 +451,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
     #[cold]
     fn try_update_curr(&self) -> bool {
-        // println!("try updating curr!");
         match self.curr_ref_cnt.compare_exchange(
             Self::OTHER_UPDATE,
             Self::UPDATE,
@@ -455,8 +458,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             Ordering::Relaxed,
         ) {
             Ok(_) => {
-                // FIXME: the abort only happens when this branch is taken!
-
                 // TODO: can we somehow bypass intermediate if we have a new update upcoming - we probably can't because this would probably cause memory leaks and other funny things that we don't like
                 // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
                 // as it, itself is protected by other atomics, so we can use `Relaxed`
@@ -486,19 +487,14 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // unset the `weak` update flag from the intermediate ref cnt
                 self.intermediate_ref_cnt
                     .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
-                println!("success updating curr!");
                 true
             }
-            _ => {
-                println!("failed updating curr!");
-                false
-            },
+            _ => false,
         }
     }
 
     #[cold]
     fn try_update_intermediate(&self) {
-        println!("try updating intermediate!");
         match self.intermediate_ref_cnt.compare_exchange(
             0,
             Self::UPDATE | Self::OTHER_UPDATE,
@@ -694,7 +690,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     break;
                 }
                 Err(old) => {
-                    // println!("store failed!");
                     if old & Self::UPDATE != 0 {
                         backoff.snooze();
                         // somebody else already updates the current ptr, so we wait until they finish their update
