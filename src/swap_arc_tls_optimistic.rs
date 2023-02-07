@@ -141,13 +141,13 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     intermediate: LocalCounted::default(),
                     new: LocalCounted {
                         gen_cnt: 0,
-                        ptr: AtomicPtr::new(null_mut()),
+                        ptr: null_mut(),
                         ref_cnt: usize::MAX,
                         _phantom_data: Default::default(),
                     },
                     curr: LocalCounted {
                         gen_cnt: 1,
-                        ptr: AtomicPtr::new(curr_ptr.cast_mut()),
+                        ptr: curr_ptr.cast_mut(),
                         ref_cnt: 1,
                         _phantom_data: Default::default(),
                     },
@@ -162,11 +162,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         // ORDERING: `ptr` doesn't have to care about anything other than itself
         // as it, itself is protected by other atomics, so we can use `Relaxed`
         let no_update =
-            Self::strip_metadata(parent.parent().ptr.load(Ordering::Relaxed)) == data.curr.ptr();
+            Self::strip_metadata(parent.parent().ptr.load(Ordering::Relaxed)) == data.curr.ptr;
         if likely(no_update && data.new.ref_cnt == 0) {
             data.curr.ref_cnt += 1;
             // SAFETY: this is safe because the pointer contained inside `curr.ptr` is guaranteed to always be valid
-            let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr()) });
+            let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
             return SwapArcIntermediateGuard {
                 parent,
                 fake_ref,
@@ -237,7 +237,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // have a `virtual reference` that points to it "stored" inside
                 // `data.curr` i.e it has a reference to it leaked on `data.curr`'s
                 // creation.
-                let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr()) });
+                let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
                 return SwapArcIntermediateGuard {
                     parent,
                     fake_ref,
@@ -264,7 +264,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         .fetch_sub(1, Ordering::AcqRel);
                     // SAFETY: this is safe because `data.new` was just updated by us and thus we know that it
                     // contains a valid ptr inside its `ptr` field.
-                    let fake_ref = ManuallyDrop::new(unsafe { D::from(data.new.ptr()) });
+                    let fake_ref = ManuallyDrop::new(unsafe { D::from(data.new.ptr) });
                     return SwapArcIntermediateGuard {
                         parent,
                         fake_ref,
@@ -287,13 +287,13 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // SAFETY: we know that `curr.ptr` has to be valid because we just moved
                 // `new` to `curr` with `new`'s `ref_cnt` being non-zero (which means that
                 // `new.ptr` had to have been valid)
-                let other = ManuallyDrop::new(unsafe { D::from(data.curr.ptr()) });
+                let other = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
                 if core::ptr::eq(curr.fake_ref.deref() as *const D, other.deref() as *const D) {
                     // there is no new update, just stick with the version we have
 
                     data.curr.ref_cnt += 1;
                     // SAFETY: this is safe because the pointer contained inside `curr.ptr` is guaranteed to always be valid
-                    let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr()) });
+                    let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
                     return SwapArcIntermediateGuard {
                         parent,
                         fake_ref,
@@ -320,7 +320,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 data.intermediate.ref_cnt += 1;
                 // SAFETY: we just checked that the ref count of `intermediate` is greater than 0
                 // and thus we know that `intermediate.ptr` has to be a valid value.
-                let fake_ref = ManuallyDrop::new(unsafe { D::from(data.intermediate.ptr()) });
+                let fake_ref = ManuallyDrop::new(unsafe { D::from(data.intermediate.ptr) });
                 return SwapArcIntermediateGuard {
                     parent: &parent,
                     fake_ref,
@@ -334,7 +334,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 parent.parent().intermediate_ptr.load(Ordering::Relaxed),
             );
             // check if there is a new intermediate value and that the intermediate value has been verified to be usable
-            let (ptr, gen_cnt) = if intermediate != data.new.ptr() {
+            let (ptr, gen_cnt) = if intermediate != data.new.ptr {
                 // there's a new value so we have to update our (thread-)local representation
 
                 // we have to make sure we observe the update of `intermediate_ref_cnt` correctly
@@ -368,12 +368,12 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         .intermediate_ref_cnt
                         .fetch_sub(1, Ordering::Relaxed);
                     data.new.ref_cnt += 1;
-                    (data.new.ptr(), data.new.gen_cnt)
+                    (data.new.ptr.cast_const(), data.new.gen_cnt)
                 }
             } else {
                 // there's no new value so we can just return the newest one we have
                 data.new.ref_cnt += 1;
-                (data.new.ptr(), data.new.gen_cnt)
+                (data.new.ptr.cast_const(), data.new.gen_cnt)
             };
             // SAFETY: we loaded the `ptr` right before this and used local and global guards in order
             // to ensure that it's safe to dereference
@@ -581,6 +581,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     }
 
     /// Update the value inside the SwapArc to value passed in `updated`.
+    #[inline]
     pub fn store(&self, updated: D) {
         // SAFETY: we know that `updated` is an instance of `D`, so we can generate a valid ptr to its content.
         unsafe {
@@ -591,6 +592,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// SAFETY: `updated` has to be a pointer that points to a valid instance
     /// of `T` and has to be acquired by calling `D::as_ptr` or via similar means.
     #[cfg(feature = "ptr-ops")]
+    #[inline]
     pub unsafe fn store_raw(&self, updated: *const T) {
         let updated = Self::strip_metadata(updated);
         // SAFETY: this is safe because the caller promises that `updated` is valid.
@@ -1273,10 +1275,15 @@ struct LocalDataInner<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>> {
 
 struct LocalCounted<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const DROP: bool = false> {
     gen_cnt: usize, // TODO: would it help somehow (the performance) if we were to make `gen_cnt` an `u8`? - it probably wouldn't!
-    ptr: AtomicPtr<T>, // TODO: make this non-atomic (this requires some explanation why it is safe and manual Send + Sync impls)
+    ptr: *mut T,
     ref_cnt: usize,
     _phantom_data: PhantomData<D>,
 }
+
+// SAFETY: These impls are safe as the lack of Send and Sync impls on ptrs is just due to
+// historic reasons and doesn't have a logical foundation.
+unsafe impl<T: Send + Sync, D: DataPtrConvert<T>> Send for LocalCounted<T, D> {}
+unsafe impl<T: Send + Sync, D: DataPtrConvert<T>> Sync for LocalCounted<T, D> {}
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
     /// SAFETY: The caller has to ensure that the safety invariants relied upon
@@ -1289,7 +1296,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, 
         parent.next_gen_cnt = res.0 + res.1 as usize;
         Self {
             gen_cnt,
-            ptr: AtomicPtr::new(ptr.cast_mut()),
+            ptr: ptr.cast_mut(),
             ref_cnt: 1,
             _phantom_data: Default::default(),
         }
@@ -1299,27 +1306,21 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, 
     fn val(&self) -> ManuallyDrop<D> {
         // SAFETY: this is safe because we know that the pointer
         // we hold has to be valid as long as our `gen_cnt` isn't `0`.
-        ManuallyDrop::new(unsafe { D::from(self.ptr()) })
+        ManuallyDrop::new(unsafe { D::from(self.ptr) })
     }
 
     fn refill_unchecked(&mut self, ptr: *const T) {
         if DROP {
-            let ptr = self.ptr();
-            if !ptr.is_null() {
+            if !self.ptr.is_null() {
                 // SAFETY: the person defining this struct has to make sure that
                 // choosing `DROP` is correct.
                 unsafe {
-                    D::from(ptr);
+                    D::from(self.ptr);
                 }
             }
         }
-        self.ptr.store(ptr.cast_mut(), Ordering::Relaxed);
+        self.ptr = ptr.cast_mut();
         self.ref_cnt = 1;
-    }
-
-    #[inline]
-    fn ptr(&self) -> *const T {
-        self.ptr.load(Ordering::Relaxed)
     }
 }
 
@@ -1331,7 +1332,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
     unsafe fn make_drop(self) -> LocalCounted<T, D, true> {
         LocalCounted {
             gen_cnt: self.gen_cnt,
-            ptr: AtomicPtr::new(self.ptr().cast_mut()),
+            ptr: self.ptr,
             ref_cnt: self.ref_cnt,
             _phantom_data: Default::default(),
         }
@@ -1343,7 +1344,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCo
     fn default() -> Self {
         Self {
             gen_cnt: 0,
-            ptr: AtomicPtr::new(null_mut()),
+            ptr: null_mut(),
             ref_cnt: 0,
             _phantom_data: Default::default(),
         }
@@ -1354,12 +1355,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCount
     #[inline]
     fn drop(&mut self) {
         if DROP {
-            let ptr = self.ptr();
-            if !ptr.is_null() {
+            if !self.ptr.is_null() {
                 // SAFETY: the person defining this struct has to make sure that
                 // choosing `DROP` is correct.
                 unsafe {
-                    D::from(ptr);
+                    D::from(self.ptr);
                 }
             }
         }
