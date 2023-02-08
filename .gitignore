@@ -1,0 +1,5 @@
+/target
+.idea/
+*.iml
+flamegraph.svg
+main.rs
