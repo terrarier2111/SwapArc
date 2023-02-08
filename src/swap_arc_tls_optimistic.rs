@@ -261,7 +261,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     parent
                         .parent()
                         .intermediate_ref_cnt
-                        .fetch_sub(1, Ordering::AcqRel);
+                        .fetch_sub(1, Ordering::Release);
                     // SAFETY: this is safe because `data.new` was just updated by us and thus we know that it
                     // contains a valid ptr inside its `ptr` field.
                     let fake_ref = ManuallyDrop::new(unsafe { D::from(data.new.ptr) });
@@ -422,14 +422,14 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // as it, itself is protected by other atomics, so we can use `Relaxed`
                 let ret = self.ptr.load(Ordering::Relaxed);
                 // release the redundant reference
-                self.intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
+                self.intermediate_ref_cnt.fetch_sub(1, Ordering::Release);
                 (ret, RefSource::Curr)
             } else {
                 // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
                 // as it, itself is protected by other atomics, so we can use `Relaxed`
                 let ret = self.intermediate_ptr.load(Ordering::Relaxed);
                 // release the redundant reference
-                self.curr_ref_cnt.fetch_sub(1, Ordering::AcqRel);
+                self.curr_ref_cnt.fetch_sub(1, Ordering::Release);
                 (ret, RefSource::Intermediate)
             }
         } else {
@@ -486,7 +486,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 }
                 // unset the `weak` update flag from the intermediate ref cnt
                 self.intermediate_ref_cnt
-                    .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
+                    .fetch_and(!Self::OTHER_UPDATE, Ordering::Release);
                 true
             }
             _ => false,
@@ -503,8 +503,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         ) {
             Ok(_) => {
                 // take the update
-                let update = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
-                                                                              // check if we even have an update
+                let update = self.updated.swap(null_mut(), Ordering::Relaxed);
+                // check if we even have an update
                 if !update.is_null() {
                     // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
                     // as it, itself is protected by other atomics, so we can use `Relaxed`
@@ -538,7 +538,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                                 self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                                 // unset the `weak` update flag from the intermediate ref cnt
                                 self.intermediate_ref_cnt
-                                    .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel); // TODO: acquire should suffice here!
+                                    .fetch_and(!Self::OTHER_UPDATE, Ordering::Release);
                                 // drop the `virtual reference` we hold to the `D`
 
                                 // SAFETY: we know that we hold a `virtual reference` to the `D`
@@ -573,7 +573,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 } else {
                     // unset the update flags as there's no update to be applied here
                     self.intermediate_ref_cnt
-                        .fetch_and(!(Self::UPDATE | Self::OTHER_UPDATE), Ordering::AcqRel);
+                        .fetch_and(!(Self::UPDATE | Self::OTHER_UPDATE), Ordering::Release);
                 }
             }
             Err(_) => {}
@@ -581,7 +581,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     }
 
     /// Update the value inside the SwapArc to value passed in `updated`.
-    #[inline]
     pub fn store(&self, updated: D) {
         // SAFETY: we know that `updated` is an instance of `D`, so we can generate a valid ptr to its content.
         unsafe {
@@ -592,7 +591,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// SAFETY: `updated` has to be a pointer that points to a valid instance
     /// of `T` and has to be acquired by calling `D::as_ptr` or via similar means.
     #[cfg(feature = "ptr-ops")]
-    #[inline]
     pub unsafe fn store_raw(&self, updated: *const T) {
         let updated = Self::strip_metadata(updated);
         // SAFETY: this is safe because the caller promises that `updated` is valid.
@@ -619,9 +617,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             ) {
                 Ok(_) => {
                     // clear out old updates to make sure our update won't be overwritten by them in the future
-                    let old = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
-                                                                               // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                                                                               // as it, itself is protected by other atomics, so we can use `Relaxed`
+                    let old = self.updated.swap(null_mut(), Ordering::Relaxed);
+                    // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
+                    // as it, itself is protected by other atomics, so we can use `Relaxed`
                     let metadata =
                         Self::get_metadata(self.intermediate_ptr.load(Ordering::Relaxed));
                     let new = Self::merge_ptr_and_metadata(new, metadata).cast_mut();
@@ -659,7 +657,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                                 // unset the `weak` update flag to signal that new updates to
                                 // `intermediate_ptr` are now permitted again
                                 self.intermediate_ref_cnt
-                                    .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
+                                    .fetch_and(!Self::OTHER_UPDATE, Ordering::Release);
                                 // drop the `virtual reference` we hold to the `D`
 
                                 // SAFETY: we know that we hold a `virtual reference` to the `D`
@@ -704,7 +702,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // note: we don't need to add a counter to determine which update is the most recent as that would be
                     // impossible anyways as there is no concept of time among two threads as long as they aren't synchronized
                     // which means there's no way for us to know which update is the most recent in the first place
-                    let old = self.updated.swap(new, Ordering::AcqRel);
+                    let old = self.updated.swap(new, Ordering::Relaxed);
                     if !old.is_null() {
                         // drop the `virtual reference` we hold to the `D`
 
@@ -760,7 +758,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             return false;
         }
         // clear out old updates to make sure our update won't be overwritten by them in the future
-        let old_update = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
+        let old_update = self.updated.swap(null_mut(), Ordering::Relaxed);
 
         // SAFETY: This is safe because we know that `new` points to a valid instance of `D`.
         let tmp = ManuallyDrop::new(D::from(Self::strip_metadata(new)));
@@ -1054,13 +1052,13 @@ cfg_if! {
                                 // increased by us and thus we can decrease it again when
                                 // it isn't needed anymore.
                                 data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
-                                parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
+                                parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::Release);
                             }
                         }
                     } else {
                         data.intermediate.ref_cnt -= 1;
                         if data.intermediate.ref_cnt == 0 {
-                            parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::AcqRel);
+                            parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::Release);
                         }
                     }
                 }
@@ -1127,7 +1125,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
                         parent
                             .parent()
                             .intermediate_ref_cnt
-                            .fetch_sub(1, Ordering::AcqRel);
+                            .fetch_sub(1, Ordering::Release);
                     }
                 }
             } else {
@@ -1138,7 +1136,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
                     parent
                         .parent()
                         .intermediate_ref_cnt
-                        .fetch_sub(1, Ordering::AcqRel);
+                        .fetch_sub(1, Ordering::Release);
                 }
             }
         }
@@ -1211,7 +1209,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
         // release the reference we hold
         match self.ref_src {
             RefSource::Curr => {
-                let ref_cnt = self.parent.curr_ref_cnt.fetch_sub(1, Ordering::AcqRel);
+                let ref_cnt = self.parent.curr_ref_cnt.fetch_sub(1, Ordering::Release);
                 // Note: we only perform implicit updates when `OTHER_UPDATE` is set and there
                 // are no other references alive as `OTHER_UPDATE` signals that there is still
                 // an update pending and it would be useless to try to perform an implicit
@@ -1224,7 +1222,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
                 let ref_cnt = self
                     .parent
                     .intermediate_ref_cnt
-                    .fetch_sub(1, Ordering::AcqRel);
+                    .fetch_sub(1, Ordering::Release);
                 // fast-rejection path to ensure we are only trying to update if it's worth it:
                 // first check if there are no other references alive, then check if there are
                 // still updates pending.
