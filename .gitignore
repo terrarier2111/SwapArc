@@ -1,5 +1,7 @@
 /target
 .idea/
 *.iml
-flamegraph.svg
+*.svg
 main.rs
+perf.data
+perf.data.old
