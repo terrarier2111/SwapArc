@@ -15,6 +15,8 @@ use thread_local::ThreadLocal;
 
 pub type SwapArc<T> = SwapArcAnyMeta<T, Arc<T>, 0>;
 pub type SwapArcOption<T> = SwapArcAnyMeta<T, Option<Arc<T>>, 0>;
+pub type SwapArcOptionMeta<T, const METADATA_BITS: u32> =
+    SwapArcAnyMeta<T, Option<Arc<T>>, METADATA_BITS>;
 pub type SwapArcAny<T, D> = SwapArcAnyMeta<T, D, 0>;
 
 // TODO: we can probably combine the counters and ptrs in the main struct into an [(AtomicUsize, AtomicPtr); 2] and have
@@ -74,7 +76,7 @@ const fn most_sig_set_bit(val: usize) -> Option<u32> {
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
-SwapArcAnyMeta<T, D, METADATA_BITS>
+    SwapArcAnyMeta<T, D, METADATA_BITS>
 {
     const UPDATE: usize = 1 << (usize::BITS - 1); // when this bit is set on a cnt, it means that it is currently being
                                                   // updated and its ptr may not be used while this bit is set.
@@ -131,7 +133,7 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
     }
 
     /// Loads the reference counted stored value partially.
-    pub fn load(&self) -> SwapArcIntermediateGuard<T, D, METADATA_BITS> {
+    pub fn load(&self) -> SwapArcGuard<T, D, METADATA_BITS> {
         let parent = self.thread_local.get_or(|| {
             let curr = self.load_internal();
             // increase the reference count
@@ -171,7 +173,7 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
             data.curr.ref_cnt += 1;
             // SAFETY: this is safe because the pointer contained inside `curr.ptr` is guaranteed to always be valid
             let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
-            return SwapArcIntermediateGuard {
+            return SwapArcGuard {
                 parent,
                 fake_ref,
                 gen_cnt: data.curr.gen_cnt,
@@ -183,7 +185,7 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
             this: &'a SwapArcAnyMeta<T, D, { META_DATA_BITS }>,
             parent: &'a LocalData<T, D, META_DATA_BITS>,
             data: &mut LocalDataInner<T, D>,
-        ) -> SwapArcIntermediateGuard<'a, T, D, META_DATA_BITS> {
+        ) -> SwapArcGuard<'a, T, D, META_DATA_BITS> {
             fn load_updated_slow<
                 'a,
                 T: Send + Sync,
@@ -225,7 +227,7 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
                 // SAFETY: this is safe because we know that `load_new_slow` returns a pointer that
                 // was acquired through `D::as_ptr` and points to a valid instance of `D`.
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
-                return SwapArcIntermediateGuard {
+                return SwapArcGuard {
                     parent,
                     fake_ref,
                     gen_cnt,
@@ -242,7 +244,7 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
                 // `data.curr` i.e it has a reference to it leaked on `data.curr`'s
                 // creation.
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
-                return SwapArcIntermediateGuard {
+                return SwapArcGuard {
                     parent,
                     fake_ref,
                     gen_cnt: data.curr.gen_cnt,
@@ -269,7 +271,7 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
                     // SAFETY: this is safe because `data.new` was just updated by us and thus we know that it
                     // contains a valid ptr inside its `ptr` field.
                     let fake_ref = ManuallyDrop::new(unsafe { D::from(data.new.ptr) });
-                    return SwapArcIntermediateGuard {
+                    return SwapArcGuard {
                         parent,
                         fake_ref,
                         gen_cnt: data.new.gen_cnt,
@@ -284,7 +286,6 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
                 // `intermediate`: value
                 // to avoid this we try to update `new` or just return `curr` if we fail to do so
 
-
                 // TODO: do we always have to assume that there is an update pending or can we check if there actually is?
                 let curr = this.load_internal();
 
@@ -298,7 +299,7 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
                     data.curr.ref_cnt += 1;
                     // SAFETY: this is safe because the pointer contained inside `curr.ptr` is guaranteed to always be valid
                     let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
-                    return SwapArcIntermediateGuard {
+                    return SwapArcGuard {
                         parent,
                         fake_ref,
                         gen_cnt: data.curr.gen_cnt,
@@ -311,7 +312,7 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
                 // left to this (thread-)local instance
                 data.new.refill_unchecked(new_ptr);
 
-                return SwapArcIntermediateGuard {
+                return SwapArcGuard {
                     parent,
                     // SAFETY: This is safe because we just created the instance `new_ptr` is pointing to
                     // and we didn't delete it. Thus `new_ptr` is a ptr to a valid instance of `D`.
@@ -325,7 +326,7 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
                 // SAFETY: we just checked that the ref count of `intermediate` is greater than 0
                 // and thus we know that `intermediate.ptr` has to be a valid value.
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(data.intermediate.ptr) });
-                return SwapArcIntermediateGuard {
+                return SwapArcGuard {
                     parent: &parent,
                     fake_ref,
                     gen_cnt: data.intermediate.gen_cnt,
@@ -382,7 +383,7 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
             // SAFETY: we loaded the `ptr` right before this and used local and global guards in order
             // to ensure that it's safe to dereference
             let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
-            return SwapArcIntermediateGuard {
+            return SwapArcGuard {
                 parent,
                 fake_ref,
                 gen_cnt,
@@ -401,19 +402,19 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
 
     /// Loads the pointer with metadata into a guard which protects it partially.
     #[cfg(feature = "ptr-ops")]
-    pub fn load_raw(&self) -> SwapArcIntermediatePtrGuard<T, D, METADATA_BITS> {
+    pub fn load_raw(&self) -> SwapArcPtrGuard<T, D, METADATA_BITS> {
         let guard = ManuallyDrop::new(self.load());
         // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
         // as it, itself is protected by other atomics, so we can use `Relaxed`
         let curr_meta = Self::get_metadata(self.intermediate_ptr.load(Ordering::Relaxed));
-        SwapArcIntermediatePtrGuard {
+        SwapArcPtrGuard {
             parent: guard.parent,
-            ptr: ptr::map_addr(guard.fake_ref.as_ptr(), |x| x | curr_meta),
+            ptr: ptr::map_addr(guard.fake_ref.deref() as *const _, |x| x | curr_meta),
             gen_cnt: guard.gen_cnt,
         }
     }
 
-    fn load_internal(&self) -> SwapArcIntermediateInternalGuard<T, D, METADATA_BITS> {
+    fn load_internal(&self) -> SwapArcFullGuard<T, D, METADATA_BITS> {
         let ref_cnt = self.curr_ref_cnt.fetch_add(1, Ordering::AcqRel);
         // Check if there is currently an update of `curr` on-going because if there is,
         // the ptr can be invalidated at any point in time. Additionally we have to check
@@ -445,7 +446,7 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
         // SAFETY: this is safe because the pointers are protected by their reference counts
         // and the flags contained inside them.
         let fake_ref = ManuallyDrop::new(unsafe { D::from(Self::strip_metadata(ptr)) });
-        SwapArcIntermediateInternalGuard {
+        SwapArcFullGuard {
             parent: self,
             fake_ref,
             ref_src: src,
@@ -977,7 +978,7 @@ SwapArcAnyMeta<T, D, METADATA_BITS>
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
-for SwapArcAnyMeta<T, D, METADATA_BITS>
+    for SwapArcAnyMeta<T, D, METADATA_BITS>
 {
     fn drop(&mut self) {
         let updated = *self.updated.get_mut();
@@ -1013,13 +1014,13 @@ for SwapArcAnyMeta<T, D, METADATA_BITS>
 
 cfg_if! {
     if #[cfg(feature = "ptr-ops")] {
-        pub struct SwapArcIntermediatePtrGuard<'a, T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
+        pub struct SwapArcPtrGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32 = 0> {
             parent: &'a LocalData<T, D, METADATA_BITS>,
             ptr: *const T,
             gen_cnt: usize,
         }
 
-        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
+        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcPtrGuard<'_, T, D, METADATA_BITS> {
 
             #[inline]
             pub fn as_raw(&self) -> *const T {
@@ -1028,13 +1029,13 @@ cfg_if! {
 
         }
 
-        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Clone for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
+        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Clone for SwapArcPtrGuard<'_, T, D, METADATA_BITS> {
             fn clone(&self) -> Self {
                 self.parent.parent().load_raw()
             }
         }
 
-        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
+        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcPtrGuard<'_, T, D, METADATA_BITS> {
             fn drop(&mut self) {
                 // SAFETY: This is safe because we know that we are the only thread that
                 // is able to access the thread local data at this time and said data has to be initialized
@@ -1071,7 +1072,7 @@ cfg_if! {
             }
         }
 
-        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Debug for SwapArcIntermediatePtrGuard<'_, T, D, METADATA_BITS> {
+        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Debug for SwapArcPtrGuard<'_, T, D, METADATA_BITS> {
             fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                 let tmp = format!("{:?}", self.ptr);
                 f.write_str(tmp.as_str())
@@ -1080,10 +1081,10 @@ cfg_if! {
     }
 }
 
-pub struct SwapArcIntermediateGuard<
+pub struct SwapArcGuard<
     'a,
     T: Send + Sync,
-    D: DataPtrConvert<T> = Arc<T>,
+    D: DataPtrConvert<T>,
     const METADATA_BITS: u32 = 0,
 > {
     parent: &'a LocalData<T, D, METADATA_BITS>,
@@ -1092,7 +1093,7 @@ pub struct SwapArcIntermediateGuard<
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
-for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
+    for SwapArcGuard<'_, T, D, METADATA_BITS>
 {
     #[inline]
     fn drop(&mut self) {
@@ -1150,7 +1151,7 @@ for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Deref
-for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
+    for SwapArcGuard<'_, T, D, METADATA_BITS>
 {
     type Target = D;
 
@@ -1161,7 +1162,7 @@ for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Borrow<D>
-for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
+    for SwapArcGuard<'_, T, D, METADATA_BITS>
 {
     #[inline]
     fn borrow(&self) -> &D {
@@ -1170,7 +1171,7 @@ for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> AsRef<D>
-for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
+    for SwapArcGuard<'_, T, D, METADATA_BITS>
 {
     #[inline]
     fn as_ref(&self) -> &D {
@@ -1179,7 +1180,7 @@ for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T> + Display, const METADATA_BITS: u32> Display
-for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
+    for SwapArcGuard<'_, T, D, METADATA_BITS>
 {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -1188,7 +1189,7 @@ for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T> + Debug, const METADATA_BITS: u32> Debug
-for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
+    for SwapArcGuard<'_, T, D, METADATA_BITS>
 {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -1196,10 +1197,10 @@ for SwapArcIntermediateGuard<'_, T, D, METADATA_BITS>
     }
 }
 
-struct SwapArcIntermediateInternalGuard<
+struct SwapArcFullGuard<
     'a,
     T: Send + Sync,
-    D: DataPtrConvert<T> = Arc<T>,
+    D: DataPtrConvert<T>,
     const METADATA_BITS: u32 = 0,
 > {
     parent: &'a SwapArcAnyMeta<T, D, METADATA_BITS>,
@@ -1209,7 +1210,7 @@ struct SwapArcIntermediateInternalGuard<
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
-for SwapArcIntermediateInternalGuard<'_, T, D, METADATA_BITS>
+    for SwapArcFullGuard<'_, T, D, METADATA_BITS>
 {
     fn drop(&mut self) {
         // release the reference we hold
@@ -1245,7 +1246,7 @@ enum RefSource {
     Intermediate,
 }
 
-struct LocalData<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
+struct LocalData<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32 = 0> {
     parent: *const SwapArcAnyMeta<T, D, METADATA_BITS>, // this acts as a reference with hidden lifetime that only we know is safe because
     // `parent` won't be used in the drop impl and `LocalData` can only be accessed
     // through `parent`
@@ -1253,7 +1254,7 @@ struct LocalData<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const METADATA_B
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
-LocalData<T, D, METADATA_BITS>
+    LocalData<T, D, METADATA_BITS>
 {
     #[inline]
     fn parent(&self) -> &SwapArcAnyMeta<T, D, METADATA_BITS> {
@@ -1266,18 +1267,18 @@ LocalData<T, D, METADATA_BITS>
 // SAFETY: this is safe because `parent` has to be alive when `LocalData` gets used
 // as it is only reachable through a valid reference to `SwapArc`
 unsafe impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Send
-for LocalData<T, D, METADATA_BITS>
+    for LocalData<T, D, METADATA_BITS>
 {
 }
 
-struct LocalDataInner<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>> {
+struct LocalDataInner<T: Send + Sync, D: DataPtrConvert<T>> {
     next_gen_cnt: usize,
     intermediate: LocalCounted<T, D>,
     new: LocalCounted<T, D, true>,
     curr: LocalCounted<T, D, true>,
 }
 
-struct LocalCounted<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const DROP: bool = false> {
+struct LocalCounted<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool = false> {
     gen_cnt: usize, // TODO: would it help somehow (the performance) if we were to make `gen_cnt` an `u8`? - it probably wouldn't!
     ptr: *mut T,
     ref_cnt: usize,
@@ -1493,14 +1494,12 @@ mod ptr {
     }
 }
 
-
 #[cfg(all(test, not(miri)))]
 #[test]
 fn test_load_multi() {
     use std::hint::black_box;
     use std::thread;
-    let tmp: Arc<SwapArcAnyMeta<i32, Arc<i32>, 0>> =
-        Arc::new(SwapArcAnyMeta::new(Arc::new(3)));
+    let tmp: Arc<SwapArcAnyMeta<i32, Arc<i32>, 0>> = Arc::new(SwapArcAnyMeta::new(Arc::new(3)));
     let mut threads = vec![];
     for _ in 0..20 {
         let tmp = tmp.clone();
@@ -1529,8 +1528,7 @@ fn test_load_multi() {
 fn test_load_multi_miri() {
     use std::hint::black_box;
     use std::thread;
-    let tmp: Arc<SwapArcAnyMeta<i32, Arc<i32>, 0>> =
-        Arc::new(SwapArcAnyMeta::new(Arc::new(3)));
+    let tmp: Arc<SwapArcAnyMeta<i32, Arc<i32>, 0>> = Arc::new(SwapArcAnyMeta::new(Arc::new(3)));
     let mut threads = vec![];
     for _ in 0..4 {
         let tmp = tmp.clone();
@@ -1559,8 +1557,7 @@ fn test_load_multi_miri() {
 fn test_other_load_multi_miri() {
     use std::hint::black_box;
     use std::thread;
-    let tmp: Arc<SwapArcAnyMeta<i32, Arc<i32>, 0>> =
-        Arc::new(SwapArcAnyMeta::new(Arc::new(3)));
+    let tmp: Arc<SwapArcAnyMeta<i32, Arc<i32>, 0>> = Arc::new(SwapArcAnyMeta::new(Arc::new(3)));
     let mut threads = vec![];
     for _ in 0..4 {
         let tmp = tmp.clone();
