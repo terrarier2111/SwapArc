@@ -29,21 +29,21 @@ pub type SwapArcAny<T, D> = SwapArcAnyMeta<T, D, 0>;
 /// reads in the common case (no update) and will still be
 /// decently fast when an update is performed. When a new
 /// `Arc` is to be stored in the `SwapArc`, it first tries to
-/// immediately update the current pointer (the one all `full readers` will see in the uncontended case)
-/// (this is possible, if no other update is being performed and if there are no `full readers` left)
+/// immediately update the current pointer (the one all `strong readers` will see in the uncontended case)
+/// (this is possible, if no other update is being performed and if there are no `strong readers` left)
 /// if this fails, it will try to do the same thing with the `intermediate` pointer
 /// and if even that fails, it will `push` the update so that it will
 /// be performed by the last `intermediate` reader to finish reading.
-/// A `full read` consists of loading the current pointer and
+/// A `strong read` consists of loading the current pointer and
 /// performing a clone operation on the `Arc`, thus
-/// `full readers` are very short-lived and can't block
+/// `strong readers` are very short-lived and can't block
 /// updates for very long.
-/// A `full read` in this case refers to the process of acquiring
+/// A `strong read` in this case refers to the process of acquiring
 /// the shared pointer which gets handled by the `SwapArc`
-/// itself internally. Note that such a `full read` isn't what would
+/// itself internally. Note that such a `strong read` isn't what would
 /// typically happen when `load` gets called as such a call
 /// usually (in the case of no update) will only result
-/// in a `local read` and thus only
+/// in a `weak read` and thus only
 /// in a single `Relaxed` atomic load and a couple of
 /// non-atomic bookkeeping operations utilizing TLS
 /// to cache previous reads.
@@ -135,7 +135,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// Loads the reference counted stored value partially.
     pub fn load(&self) -> SwapArcGuard<T, D, METADATA_BITS> {
         let parent = self.thread_local.get_or(|| {
-            let curr = self.load_internal();
+            let curr = self.load_strongly();
             // increase the reference count
             let curr_ptr = ManuallyDrop::into_inner(curr.fake_ref.clone()).into_ptr();
             CachePadded::new(LocalData {
@@ -195,7 +195,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 this: &'a SwapArcAnyMeta<T, D, { META_DATA_BITS }>,
                 data: &'a mut LocalDataInner<T, D>,
             ) -> (*const T, usize) {
-                let curr = this.load_internal();
+                let curr = this.load_strongly();
                 // increase the strong reference count
                 let new_ptr = ManuallyDrop::into_inner(curr.fake_ref.clone()).into_ptr();
 
@@ -287,7 +287,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // to avoid this we try to update `new` or just return `curr` if we fail to do so
 
                 // TODO: do we always have to assume that there is an update pending or can we check if there actually is?
-                let curr = this.load_internal();
+                let curr = this.load_strongly();
 
                 // SAFETY: we know that `curr.ptr` has to be valid because we just moved
                 // `new` to `curr` with `new`'s `ref_cnt` being non-zero (which means that
@@ -394,13 +394,21 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     }
 
     /// Loads the reference counted value that's currently stored
-    /// inside the SwapArc fully i.e it increases the reference
+    /// inside the SwapArc strongly i.e it increases the reference
     /// count directly.
+    /// This is slower than `load` but will allow for the result
+    /// to be used even after the `SwapArc` was dropped.
     pub fn load_full(&self) -> D {
         self.load().as_ref().clone()
     }
 
-    /// Loads the pointer with metadata into a guard which protects it partially.
+    /// Loads the pointer with metadata into a guard which protects it weakly.
+    /// The protection offered by this method is the same as the protection
+    /// offered by `load`.
+    /// Note: `weak` in this context doesn't mean that it's less safe to use
+    /// this method compared to `load_full`, rather it means that it **should**
+    /// be used only for short-lived usages - long-lived usages won't introduce
+    /// **any** unsafety tho.
     #[cfg(feature = "ptr-ops")]
     pub fn load_raw(&self) -> SwapArcPtrGuard<T, D, METADATA_BITS> {
         let guard = ManuallyDrop::new(self.load());
@@ -419,13 +427,57 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         }
     }
 
-    fn load_internal(&self) -> SwapArcFullGuard<T, D, METADATA_BITS> {
+    /// Loads the reference counted value that's currently stored
+    /// inside the SwapArc strongly i.e it increases the reference
+    /// count directly.
+    /// This is slower than `load` but will allow for the result
+    /// to be used even after the `SwapArc` was dropped.
+    #[cfg(feature = "ptr-ops")]
+    pub fn load_raw_full(&self) -> SwapArcFullPtrGuard<T, D, METADATA_BITS> {
+        let (ptr, src) = self.load_internal();
+
+        let val = ManuallyDrop::new(unsafe { D::from(ptr) });
+
+        match src {
+            RefSource::Curr => {
+                self.curr_ref_cnt.fetch_sub(1, Ordering::Release);
+            }
+            RefSource::Intermediate => {
+                self.intermediate_ref_cnt.fetch_sub(1, Ordering::Release);
+            }
+        }
+
+        SwapArcFullPtrGuard {
+            inner: ManuallyDrop::into_inner(val.clone()),
+            ptr,
+        }
+    }
+
+    /// This is what the docs are referring to as a `strong read` or
+    /// `strong load`.
+    fn load_strongly(&self) -> SwapArcStrongGuard<T, D, METADATA_BITS> {
+        let (ptr, src) = self.load_internal();
+        // create a fake reference to the `D` to ensure so that the borrow checker understands
+        // that the reference returned from the guard will point to valid memory
+
+        // SAFETY: this is safe because the pointers are protected by their reference counts
+        // and the flags contained inside them.
+        let fake_ref = ManuallyDrop::new(unsafe { D::from(Self::strip_metadata(ptr)) });
+        SwapArcStrongGuard {
+            parent: self,
+            fake_ref,
+            ref_src: src,
+            _no_send_guard: Default::default(),
+        }
+    }
+
+    fn load_internal(&self) -> (*mut T, RefSource) {
         let ref_cnt = self.curr_ref_cnt.fetch_add(1, Ordering::AcqRel);
         // Check if there is currently an update of `curr` on-going because if there is,
         // the ptr can be invalidated at any point in time. Additionally we have to check
         // if there is an implicit update allowed which also means that the ptr
         // can be invalidated at any point in time.
-        let (ptr, src) = if ref_cnt & (Self::UPDATE | Self::OTHER_UPDATE) != 0 {
+        if ref_cnt & (Self::UPDATE | Self::OTHER_UPDATE) != 0 {
             let intermediate_ref_cnt = self.intermediate_ref_cnt.fetch_add(1, Ordering::AcqRel);
             if intermediate_ref_cnt & Self::UPDATE != 0 {
                 // ORDERING: `ptr` doesn't have to care about anything other than itself
@@ -444,18 +496,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             }
         } else {
             (self.ptr.load(Ordering::Relaxed), RefSource::Curr)
-        };
-        // create a fake reference to the `D` to ensure so that the borrow checker understands
-        // that the reference returned from the guard will point to valid memory
-
-        // SAFETY: this is safe because the pointers are protected by their reference counts
-        // and the flags contained inside them.
-        let fake_ref = ManuallyDrop::new(unsafe { D::from(Self::strip_metadata(ptr)) });
-        SwapArcFullGuard {
-            parent: self,
-            fake_ref,
-            ref_src: src,
-            _no_send_guard: Default::default(),
         }
     }
 
@@ -1019,7 +1059,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
 
 cfg_if! {
     if #[cfg(feature = "ptr-ops")] {
-        pub struct SwapArcPtrGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32 = 0> {
+        pub struct SwapArcPtrGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
             parent: &'a LocalData<T, D, METADATA_BITS>,
             ptr: *const T,
             gen_cnt: usize,
@@ -1083,10 +1123,40 @@ cfg_if! {
                 f.write_str(tmp.as_str())
             }
         }
+
+        pub struct SwapArcFullPtrGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
+            inner: D,
+            ptr: *const T,
+        }
+
+        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcFullPtrGuard<'_, T, D, METADATA_BITS> {
+
+            #[inline]
+            pub fn as_raw(&self) -> *const T {
+                self.ptr
+            }
+
+        }
+
+        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Clone for SwapArcFullPtrGuard<'_, T, D, METADATA_BITS> {
+            fn clone(&self) -> Self {
+                Self {
+                    inner: self.inner.clone(),
+                    ptr: self.ptr,
+                }
+            }
+        }
+
+        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Debug for SwapArcFullPtrGuard<'_, T, D, METADATA_BITS> {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                let tmp = format!("{:?}", self.ptr);
+                f.write_str(tmp.as_str())
+            }
+        }
     }
 }
 
-pub struct SwapArcGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32 = 0> {
+pub struct SwapArcGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
     parent: &'a LocalData<T, D, METADATA_BITS>,
     fake_ref: ManuallyDrop<D>,
     gen_cnt: usize,
@@ -1197,7 +1267,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T> + Debug, const METADATA_BITS: u32> Deb
     }
 }
 
-struct SwapArcFullGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32 = 0> {
+struct SwapArcStrongGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
     parent: &'a SwapArcAnyMeta<T, D, METADATA_BITS>,
     fake_ref: ManuallyDrop<D>,
     ref_src: RefSource,
@@ -1205,7 +1275,7 @@ struct SwapArcFullGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
-    for SwapArcFullGuard<'_, T, D, METADATA_BITS>
+    for SwapArcStrongGuard<'_, T, D, METADATA_BITS>
 {
     fn drop(&mut self) {
         // release the reference we hold
@@ -1241,7 +1311,7 @@ enum RefSource {
     Intermediate,
 }
 
-struct LocalData<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32 = 0> {
+struct LocalData<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
     parent: *const SwapArcAnyMeta<T, D, METADATA_BITS>, // this acts as a reference with hidden lifetime that only we know is safe because
     // `parent` won't be used in the drop impl and `LocalData` can only be accessed
     // through `parent`
