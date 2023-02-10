@@ -407,9 +407,12 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
         // as it, itself is protected by other atomics, so we can use `Relaxed`
         let curr_meta = Self::get_metadata(self.intermediate_ptr.load(Ordering::Relaxed));
+        // SAFETY: This is safe as we know that the ptr is valid and we are *not* dropping the
+        // inner value we read from it.
+        let ptr = unsafe { (&guard.fake_ref as *const ManuallyDrop<D>).read().into_ptr() };
         SwapArcPtrGuard {
             parent: guard.parent,
-            ptr: ptr::map_addr(guard.fake_ref.deref() as *const _, |x| x | curr_meta),
+            ptr: ptr::map_addr(ptr, |x| x | curr_meta),
             gen_cnt: guard.gen_cnt,
         }
     }
