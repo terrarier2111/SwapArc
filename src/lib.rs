@@ -409,7 +409,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         let curr_meta = Self::get_metadata(self.intermediate_ptr.load(Ordering::Relaxed));
         // SAFETY: This is safe as we know that the ptr is valid and we are *not* dropping the
         // inner value we read from it.
-        let ptr = unsafe { (&guard.fake_ref as *const ManuallyDrop<D>).read().into_ptr() };
+        let ptr =
+            ManuallyDrop::into_inner(unsafe { (&guard.fake_ref as *const ManuallyDrop<D>).read() })
+                .into_ptr();
         SwapArcPtrGuard {
             parent: guard.parent,
             ptr: ptr::map_addr(ptr, |x| x | curr_meta),
@@ -1084,12 +1086,7 @@ cfg_if! {
     }
 }
 
-pub struct SwapArcGuard<
-    'a,
-    T: Send + Sync,
-    D: DataPtrConvert<T>,
-    const METADATA_BITS: u32 = 0,
-> {
+pub struct SwapArcGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32 = 0> {
     parent: &'a LocalData<T, D, METADATA_BITS>,
     fake_ref: ManuallyDrop<D>,
     gen_cnt: usize,
@@ -1200,12 +1197,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T> + Debug, const METADATA_BITS: u32> Deb
     }
 }
 
-struct SwapArcFullGuard<
-    'a,
-    T: Send + Sync,
-    D: DataPtrConvert<T>,
-    const METADATA_BITS: u32 = 0,
-> {
+struct SwapArcFullGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32 = 0> {
     parent: &'a SwapArcAnyMeta<T, D, METADATA_BITS>,
     fake_ref: ManuallyDrop<D>,
     ref_src: RefSource,
