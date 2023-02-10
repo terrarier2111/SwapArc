@@ -1124,12 +1124,12 @@ cfg_if! {
             }
         }
 
-        pub struct SwapArcFullPtrGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
+        pub struct SwapArcFullPtrGuard<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
             inner: D,
             ptr: *const T,
         }
 
-        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcFullPtrGuard<'_, T, D, METADATA_BITS> {
+        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcFullPtrGuard<T, D, METADATA_BITS> {
 
             #[inline]
             pub fn as_raw(&self) -> *const T {
@@ -1138,7 +1138,7 @@ cfg_if! {
 
         }
 
-        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Clone for SwapArcFullPtrGuard<'_, T, D, METADATA_BITS> {
+        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Clone for SwapArcFullPtrGuard<T, D, METADATA_BITS> {
             fn clone(&self) -> Self {
                 Self {
                     inner: self.inner.clone(),
@@ -1147,7 +1147,7 @@ cfg_if! {
             }
         }
 
-        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Debug for SwapArcFullPtrGuard<'_, T, D, METADATA_BITS> {
+        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Debug for SwapArcFullPtrGuard<T, D, METADATA_BITS> {
             fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                 let tmp = format!("{:?}", self.ptr);
                 f.write_str(tmp.as_str())
