@@ -1398,7 +1398,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, 
     }
 }
 
-impl<T: Send + Sync, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
+impl<T, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
     /// SAFETY: callers have to make sure that the value behind the `ptr`
     /// contained inside this struct may be dropped as soon as this struct
     /// gets dropped.
