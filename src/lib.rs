@@ -50,7 +50,7 @@ pub type SwapArcAny<T, D> = SwapArcAnyMeta<T, D, 0>;
 
 /// Note: `SwapArc` has wait-free reads.
 pub struct SwapArcAnyMeta<
-    T: Send + Sync,
+    T,
     D: DataPtrConvert<T> = Arc<T>,
     const METADATA_BITS: u32 = 0,
 > {
@@ -993,6 +993,12 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         ptr::expose_addr(self.intermediate_ptr.load(Ordering::Relaxed)) & Self::META_MASK
     }
 
+    // TODO: MAYBE: introduce FORCE_UPDATing into the data structure in order for the user to be able
+    // TODO: to ensure that there's NO update pending
+}
+
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcAnyMeta<T, D, METADATA_BITS> {
+
     #[inline(always)]
     fn get_metadata(ptr: *const T) -> usize {
         ptr::expose_addr(ptr) & Self::META_MASK
@@ -1018,11 +1024,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         result
     };
 
-    // TODO: MAYBE: introduce FORCE_UPDATing into the data structure in order for the user to be able
-    // TODO: to ensure that there's NO update pending
 }
 
-impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
     for SwapArcAnyMeta<T, D, METADATA_BITS>
 {
     fn drop(&mut self) {
@@ -1311,7 +1315,7 @@ enum RefSource {
     Intermediate,
 }
 
-struct LocalData<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
+struct LocalData<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
     parent: *const SwapArcAnyMeta<T, D, METADATA_BITS>, // this acts as a reference with hidden lifetime that only we know is safe because
     // `parent` won't be used in the drop impl and `LocalData` can only be accessed
     // through `parent`
@@ -1336,14 +1340,14 @@ unsafe impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Send
 {
 }
 
-struct LocalDataInner<T: Send + Sync, D: DataPtrConvert<T>> {
+struct LocalDataInner<T, D: DataPtrConvert<T>> {
     next_gen_cnt: usize,
     intermediate: LocalCounted<T, D>,
     new: LocalCounted<T, D, true>,
     curr: LocalCounted<T, D, true>,
 }
 
-struct LocalCounted<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool = false> {
+struct LocalCounted<T, D: DataPtrConvert<T>, const DROP: bool = false> {
     gen_cnt: usize, // TODO: would it help somehow (the performance) if we were to make `gen_cnt` an `u8`? - it probably wouldn't!
     ptr: *mut T,
     ref_cnt: usize,
@@ -1421,7 +1425,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCo
     }
 }
 
-impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCounted<T, D, DROP> {
+impl<T, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCounted<T, D, DROP> {
     #[inline]
     fn drop(&mut self) {
         if DROP {
@@ -1446,7 +1450,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCount
 /// needing special drop glue.
 pub unsafe trait RefCnt: Send + Sync + Clone {}
 
-pub trait DataPtrConvert<T: Send + Sync>: RefCnt + Sized {
+pub trait DataPtrConvert<T>: RefCnt + Sized {
     /// This method may not alter the reference count of the
     /// reference counted "object".
     ///
