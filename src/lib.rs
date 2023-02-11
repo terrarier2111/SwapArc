@@ -1063,7 +1063,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
 
 cfg_if! {
     if #[cfg(feature = "ptr-ops")] {
-        pub struct SwapArcPtrGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
+        pub struct SwapArcPtrGuard<'a, T, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
             parent: &'a LocalData<T, D, METADATA_BITS>,
             ptr: *const T,
             gen_cnt: usize,
@@ -1084,7 +1084,7 @@ cfg_if! {
             }
         }
 
-        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcPtrGuard<'_, T, D, METADATA_BITS> {
+        impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcPtrGuard<'_, T, D, METADATA_BITS> {
             fn drop(&mut self) {
                 // SAFETY: This is safe because we know that we are the only thread that
                 // is able to access the thread local data at this time and said data has to be initialized
@@ -1128,7 +1128,7 @@ cfg_if! {
             }
         }
 
-        pub struct SwapArcFullPtrGuard<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
+        pub struct SwapArcFullPtrGuard<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
             inner: D,
             ptr: *const T,
         }
