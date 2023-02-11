@@ -1475,9 +1475,9 @@ pub trait DataPtrConvert<T>: RefCnt + Sized {
 // SAFETY: This is safe because `Arc<T>` will increment an
 // internal reference count on `clone` calls and decrement
 // it on drop.
-unsafe impl<T: Send + Sync> RefCnt for Arc<T> {}
+unsafe impl<T> RefCnt for Arc<T> {}
 
-impl<T: Send + Sync> DataPtrConvert<T> for Arc<T> {
+impl<T> DataPtrConvert<T> for Arc<T> {
     #[inline]
     unsafe fn from(ptr: *const T) -> Self {
         // SAFETY: this is safe as the safety contract dictates
