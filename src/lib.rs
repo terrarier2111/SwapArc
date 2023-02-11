@@ -1448,7 +1448,7 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCounted<T, D, DROP
 /// NOTE: `Drop` is not required here as types such as
 /// `Option<Arc<T>>` fulfill all the requirements without
 /// needing special drop glue.
-pub unsafe trait RefCnt: Send + Sync + Clone {}
+pub unsafe trait RefCnt: Clone {}
 
 pub trait DataPtrConvert<T>: RefCnt + Sized {
     /// This method may not alter the reference count of the
