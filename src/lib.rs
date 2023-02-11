@@ -1097,7 +1097,7 @@ cfg_if! {
                     slow_drop(self.parent, data, self.gen_cnt);
                 }
                 #[cold]
-                fn slow_drop<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>(parent: &LocalData<T, D, METADATA_BITS>, data: &mut LocalDataInner<T, D>, gen_cnt: usize) {
+                fn slow_drop<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>(parent: &LocalData<T, D, METADATA_BITS>, data: &mut LocalDataInner<T, D>, gen_cnt: usize) {
                     if gen_cnt == data.new.gen_cnt {
                         data.new.ref_cnt -= 1;
                         if data.new.ref_cnt == 0 {
