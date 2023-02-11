@@ -1413,7 +1413,7 @@ impl<T, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
     }
 }
 
-impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCounted<T, D, DROP> {
+impl<T, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCounted<T, D, DROP> {
     #[inline]
     fn default() -> Self {
         Self {
