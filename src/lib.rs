@@ -1322,7 +1322,7 @@ struct LocalData<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
     inner: UnsafeCell<LocalDataInner<T, D>>,
 }
 
-impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
+impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     LocalData<T, D, METADATA_BITS>
 {
     #[inline]
