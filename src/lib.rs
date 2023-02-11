@@ -1359,7 +1359,7 @@ struct LocalCounted<T, D: DataPtrConvert<T>, const DROP: bool = false> {
 unsafe impl<T: Send + Sync, D: DataPtrConvert<T>> Send for LocalCounted<T, D> {}
 unsafe impl<T: Send + Sync, D: DataPtrConvert<T>> Sync for LocalCounted<T, D> {}
 
-impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
+impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
     /// SAFETY: The caller has to ensure that the safety invariants relied upon
     /// in the `val`, `refill_unchecked` and `drop` methods are valid.
     unsafe fn new(parent: &mut LocalDataInner<T, D>, ptr: *const T) -> Self {
