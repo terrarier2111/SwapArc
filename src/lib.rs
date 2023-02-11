@@ -1498,9 +1498,9 @@ impl<T> DataPtrConvert<T> for Arc<T> {
 // or in case of `Some` do the same as `Arc<T>`
 // which as explained above is also allowed to implement
 // `RefCnt`.
-unsafe impl<T: Send + Sync> RefCnt for Option<Arc<T>> {}
+unsafe impl<T> RefCnt for Option<Arc<T>> {}
 
-impl<T: Send + Sync> DataPtrConvert<T> for Option<Arc<T>> {
+impl<T> DataPtrConvert<T> for Option<Arc<T>> {
     #[inline]
     unsafe fn from(ptr: *const T) -> Self {
         if !ptr.is_null() {
