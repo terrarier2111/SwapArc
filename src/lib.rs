@@ -12,6 +12,7 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thread_local::ThreadLocal;
+use crate::ptr::map_addr;
 
 pub type SwapArc<T> = SwapArcAnyMeta<T, Arc<T>, 0>;
 pub type SwapArcOption<T> = SwapArcAnyMeta<T, Option<Arc<T>>, 0>;
@@ -797,6 +798,109 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         // This load may be `Relaxed` because it is guarded by the `intermediate_ref_cnt`.
         let intermediate = self.intermediate_ptr.load(Ordering::Relaxed);
         if intermediate.cast_const() != old {
+            // ORDERING: We use Acquire here because we have a Release above with which we can establish
+            // a happens-before relationship with the RMW (compare_exchange) above
+            self.intermediate_ref_cnt.fetch_and(
+                !(Self::UPDATE | Self::OTHER_UPDATE),
+                // ORDERING: This is `Acquire` because we only need to mak sure future writes happen
+                // after this and we don't have to care about anything that happened before this
+                // (as the only important thing happening in between these two modifications of
+                // `intermediate_ref_cnt` is the load of `intermediate_ptr` which is sequenced-before this)
+                Ordering::Acquire,
+            );
+            return false;
+        }
+        // clear out old updates to make sure our update won't be overwritten by them in the future
+        let old_update = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
+
+        // SAFETY: This is safe because we know that `new` points to a valid instance of `D`.
+        let tmp = ManuallyDrop::new(D::from(Self::strip_metadata(new)));
+        tmp.increase_ref_cnt();
+        self.intermediate_ptr
+            .store(new.cast_mut(), Ordering::Relaxed);
+        // unset the update flag
+        self.intermediate_ref_cnt
+            .fetch_and(!Self::UPDATE, Ordering::AcqRel);
+        if !old_update.is_null() {
+            // drop the `virtual reference` we hold to the `D`
+
+            // SAFETY: we know that we hold a `virtual reference` to the `D`
+            // which `updated` pointed to before but we took it out of
+            // `updated` and we know that the value in `updated` has to be valid
+            // while it is in there.
+            D::from(old_update);
+        }
+        let mut curr = 0;
+        loop {
+            match self.curr_ref_cnt.compare_exchange(
+                curr,
+                Self::UPDATE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    // ORDERING: Relaxed should be okay because curr_ref_cnt guards `ptr`
+                    // and ensures that other threads see the update because
+                    // of the happens-before-relationship between
+                    let prev = self.ptr.load(Ordering::Relaxed);
+                    self.ptr.store(new.cast_mut(), Ordering::Relaxed);
+                    // unset the update flag
+                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
+                    // unset the `weak` update flag from the intermediate ref cnt
+                    self.intermediate_ref_cnt
+                        .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
+                    // drop the `virtual reference` we hold to the `D`
+
+                    // SAFETY: we know that we hold a `virtual reference` to the `D`
+                    // which `prev` points to and thus we are allowed to drop
+                    // this `virtual reference`, once we replace `self.ptr` (or in other
+                    // word `prev`)
+                    D::from(Self::strip_metadata(prev));
+                    break;
+                }
+                Err(_) => {
+                    // signal that it's allowed to implicitly update this now
+                    if self
+                        .curr_ref_cnt
+                        .fetch_or(Self::OTHER_UPDATE, Ordering::AcqRel)
+                        == 0
+                    {
+                        curr = Self::OTHER_UPDATE;
+                        // retry update, as no implicit update can occur anymore
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        true
+    }
+
+    /// Note: this can cause "deadlocks" if there are any other (loaded) references alive.
+    /// SAFETY: `old` has to be a pointer that was acquired through
+    /// methods of this `SwapArc` instance. `old` may contain
+    /// metadata. The metadata of `old` and the current pointer
+    /// is ignored, i.e it doesn't have to match.
+    /// `new` has to be a pointer to a valid instance of `D`.
+    #[cfg(feature = "ptr-ops")]
+    pub unsafe fn try_compare_exchange_ignore_meta(&self, old: *const T, new: *const T) -> bool {
+        let backoff = Backoff::new();
+        while !self
+            .intermediate_ref_cnt
+            .compare_exchange_weak(
+                0,
+                Self::UPDATE | Self::OTHER_UPDATE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            // back-off
+            backoff.snooze();
+        }
+        // This load may be `Relaxed` because it is guarded by the `intermediate_ref_cnt`.
+        let intermediate = self.intermediate_ptr.load(Ordering::Relaxed);
+        if map_addr(intermediate.cast_const(), |x| x & !Self::META_MASK) != map_addr(old, |x| x & !Self::META_MASK) {
             // ORDERING: We use Acquire here because we have a Release above with which we can establish
             // a happens-before relationship with the RMW (compare_exchange) above
             self.intermediate_ref_cnt.fetch_and(
