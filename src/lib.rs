@@ -12,7 +12,6 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thread_local::ThreadLocal;
-use crate::ptr::map_addr;
 
 pub type SwapArc<T> = SwapArcAnyMeta<T, Arc<T>, 0>;
 pub type SwapArcOption<T> = SwapArcAnyMeta<T, Option<Arc<T>>, 0>;
