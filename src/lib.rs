@@ -50,7 +50,7 @@ pub type SwapArcAny<T, D> = SwapArcAnyMeta<T, D, 0>;
 
 /// Note: `SwapArc` has wait-free reads.
 pub struct SwapArcAnyMeta<
-    T,
+    T: Send + Sync,
     D: DataPtrConvert<T> = Arc<T>,
     const METADATA_BITS: u32 = 0,
 > {
@@ -993,12 +993,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         ptr::expose_addr(self.intermediate_ptr.load(Ordering::Relaxed)) & Self::META_MASK
     }
 
-    // TODO: MAYBE: introduce FORCE_UPDATing into the data structure in order for the user to be able
-    // TODO: to ensure that there's NO update pending
-}
-
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcAnyMeta<T, D, METADATA_BITS> {
-
     #[inline(always)]
     fn get_metadata(ptr: *const T) -> usize {
         ptr::expose_addr(ptr) & Self::META_MASK
@@ -1024,9 +1018,11 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcAnyMeta<T, D, MET
         result
     };
 
+    // TODO: MAYBE: introduce FORCE_UPDATing into the data structure in order for the user to be able
+    // TODO: to ensure that there's NO update pending
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
+impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
     for SwapArcAnyMeta<T, D, METADATA_BITS>
 {
     fn drop(&mut self) {
@@ -1063,7 +1059,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
 
 cfg_if! {
     if #[cfg(feature = "ptr-ops")] {
-        pub struct SwapArcPtrGuard<'a, T, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
+        pub struct SwapArcPtrGuard<'a, T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
             parent: &'a LocalData<T, D, METADATA_BITS>,
             ptr: *const T,
             gen_cnt: usize,
@@ -1071,7 +1067,7 @@ cfg_if! {
 
         impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcPtrGuard<'_, T, D, METADATA_BITS> {
 
-            #[inline]
+            #[inline(always)]
             pub fn as_raw(&self) -> *const T {
                 self.ptr
             }
@@ -1084,7 +1080,7 @@ cfg_if! {
             }
         }
 
-        impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcPtrGuard<'_, T, D, METADATA_BITS> {
+        impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop for SwapArcPtrGuard<'_, T, D, METADATA_BITS> {
             fn drop(&mut self) {
                 // SAFETY: This is safe because we know that we are the only thread that
                 // is able to access the thread local data at this time and said data has to be initialized
@@ -1097,7 +1093,7 @@ cfg_if! {
                     slow_drop(self.parent, data, self.gen_cnt);
                 }
                 #[cold]
-                fn slow_drop<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>(parent: &LocalData<T, D, METADATA_BITS>, data: &mut LocalDataInner<T, D>, gen_cnt: usize) {
+                fn slow_drop<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>(parent: &LocalData<T, D, METADATA_BITS>, data: &mut LocalDataInner<T, D>, gen_cnt: usize) {
                     if gen_cnt == data.new.gen_cnt {
                         data.new.ref_cnt -= 1;
                         if data.new.ref_cnt == 0 {
@@ -1128,14 +1124,14 @@ cfg_if! {
             }
         }
 
-        pub struct SwapArcFullPtrGuard<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
+        pub struct SwapArcFullPtrGuard<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
             inner: D,
             ptr: *const T,
         }
 
         impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcFullPtrGuard<T, D, METADATA_BITS> {
 
-            #[inline]
+            #[inline(always)]
             pub fn as_raw(&self) -> *const T {
                 self.ptr
             }
@@ -1160,7 +1156,7 @@ cfg_if! {
     }
 }
 
-pub struct SwapArcGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
+pub struct SwapArcGuard<'a, T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
     parent: &'a LocalData<T, D, METADATA_BITS>,
     fake_ref: ManuallyDrop<D>,
     gen_cnt: usize,
@@ -1315,14 +1311,14 @@ enum RefSource {
     Intermediate,
 }
 
-struct LocalData<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
+struct LocalData<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
     parent: *const SwapArcAnyMeta<T, D, METADATA_BITS>, // this acts as a reference with hidden lifetime that only we know is safe because
     // `parent` won't be used in the drop impl and `LocalData` can only be accessed
     // through `parent`
     inner: UnsafeCell<LocalDataInner<T, D>>,
 }
 
-impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
+impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     LocalData<T, D, METADATA_BITS>
 {
     #[inline]
@@ -1340,14 +1336,14 @@ unsafe impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Send
 {
 }
 
-struct LocalDataInner<T, D: DataPtrConvert<T>> {
+struct LocalDataInner<T: Send + Sync, D: DataPtrConvert<T>> {
     next_gen_cnt: usize,
     intermediate: LocalCounted<T, D>,
     new: LocalCounted<T, D, true>,
     curr: LocalCounted<T, D, true>,
 }
 
-struct LocalCounted<T, D: DataPtrConvert<T>, const DROP: bool = false> {
+struct LocalCounted<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool = false> {
     gen_cnt: usize, // TODO: would it help somehow (the performance) if we were to make `gen_cnt` an `u8`? - it probably wouldn't!
     ptr: *mut T,
     ref_cnt: usize,
@@ -1359,7 +1355,7 @@ struct LocalCounted<T, D: DataPtrConvert<T>, const DROP: bool = false> {
 unsafe impl<T: Send + Sync, D: DataPtrConvert<T>> Send for LocalCounted<T, D> {}
 unsafe impl<T: Send + Sync, D: DataPtrConvert<T>> Sync for LocalCounted<T, D> {}
 
-impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
+impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
     /// SAFETY: The caller has to ensure that the safety invariants relied upon
     /// in the `val`, `refill_unchecked` and `drop` methods are valid.
     unsafe fn new(parent: &mut LocalDataInner<T, D>, ptr: *const T) -> Self {
@@ -1398,7 +1394,7 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
     }
 }
 
-impl<T, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
+impl<T: Send + Sync, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
     /// SAFETY: callers have to make sure that the value behind the `ptr`
     /// contained inside this struct may be dropped as soon as this struct
     /// gets dropped.
@@ -1413,7 +1409,7 @@ impl<T, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
     }
 }
 
-impl<T, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCounted<T, D, DROP> {
+impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCounted<T, D, DROP> {
     #[inline]
     fn default() -> Self {
         Self {
@@ -1425,7 +1421,7 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCounted<T, D, D
     }
 }
 
-impl<T, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCounted<T, D, DROP> {
+impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCounted<T, D, DROP> {
     #[inline]
     fn drop(&mut self) {
         if DROP {
@@ -1448,9 +1444,9 @@ impl<T, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCounted<T, D, DROP
 /// NOTE: `Drop` is not required here as types such as
 /// `Option<Arc<T>>` fulfill all the requirements without
 /// needing special drop glue.
-pub unsafe trait RefCnt: Clone {}
+pub unsafe trait RefCnt: Send + Sync + Clone {}
 
-pub trait DataPtrConvert<T>: RefCnt + Sized {
+pub trait DataPtrConvert<T: Send + Sync>: RefCnt + Sized {
     /// This method may not alter the reference count of the
     /// reference counted "object".
     ///
@@ -1475,9 +1471,9 @@ pub trait DataPtrConvert<T>: RefCnt + Sized {
 // SAFETY: This is safe because `Arc<T>` will increment an
 // internal reference count on `clone` calls and decrement
 // it on drop.
-unsafe impl<T> RefCnt for Arc<T> {}
+unsafe impl<T: Send + Sync> RefCnt for Arc<T> {}
 
-impl<T> DataPtrConvert<T> for Arc<T> {
+impl<T: Send + Sync> DataPtrConvert<T> for Arc<T> {
     #[inline]
     unsafe fn from(ptr: *const T) -> Self {
         // SAFETY: this is safe as the safety contract dictates
@@ -1498,9 +1494,9 @@ impl<T> DataPtrConvert<T> for Arc<T> {
 // or in case of `Some` do the same as `Arc<T>`
 // which as explained above is also allowed to implement
 // `RefCnt`.
-unsafe impl<T> RefCnt for Option<Arc<T>> {}
+unsafe impl<T: Send + Sync> RefCnt for Option<Arc<T>> {}
 
-impl<T> DataPtrConvert<T> for Option<Arc<T>> {
+impl<T: Send + Sync> DataPtrConvert<T> for Option<Arc<T>> {
     #[inline]
     unsafe fn from(ptr: *const T) -> Self {
         if !ptr.is_null() {
