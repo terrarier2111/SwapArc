@@ -437,6 +437,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         let (ptr, src) = self.load_internal();
 
         let val = ManuallyDrop::new(unsafe { D::from(ptr) });
+        let val = ManuallyDrop::into_inner(val.clone());
 
         match src {
             RefSource::Curr => {
@@ -448,7 +449,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         }
 
         SwapArcFullPtrGuard {
-            inner: ManuallyDrop::into_inner(val.clone()),
+            inner: val,
             ptr,
         }
     }
