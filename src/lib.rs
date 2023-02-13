@@ -883,6 +883,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// `new` has to be a pointer to a valid instance of `D`.
     #[cfg(feature = "ptr-ops")]
     pub unsafe fn try_compare_exchange_ignore_meta(&self, old: *const T, new: *const T) -> bool {
+        use crate::ptr::map_addr;
         let backoff = Backoff::new();
         while !self
             .intermediate_ref_cnt
