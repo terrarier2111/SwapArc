@@ -520,6 +520,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
                     // as it, itself is protected by other atomics, so we can use `Relaxed`
                     self.ptr.store(intermediate, Ordering::Relaxed);
+                    // ORDERING: we need a release here as it allows the following
+                    // RMW on `curr_ref_cnt` to establish a happens-before relationship
+                    // with this fence and ensure that the store to `ptr` is visible to
+                    // anybody observing the update to `curr_ref_cnt`.
+                    fence(Ordering::Release);
                     // unset the update flag
                     self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                     // drop the `virtual reference` we hold to the `D`
@@ -570,6 +575,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // before the update of `intermediate_ref_cnt` in order to make the protection
                     // of it by the other atomics effective, so we have to use `Release`
                     self.intermediate_ptr.store(update, Ordering::Release);
+                    // FIXME: do we need a release fence here?
                     // unset the update flag
                     self.intermediate_ref_cnt
                         .fetch_and(!Self::UPDATE, Ordering::AcqRel);
@@ -587,6 +593,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                                 // as it, itself is protected by other atomics, so we can use `Relaxed`
                                 let prev = self.ptr.load(Ordering::Relaxed);
                                 self.ptr.store(update, Ordering::Relaxed);
+                                // ORDERING: we need a release here as it allows the following
+                                // RMW on `curr_ref_cnt` to establish a happens-before relationship
+                                // with this fence and ensure that the store to `ptr` is visible to
+                                // anybody observing the update to `curr_ref_cnt`.
+                                fence(Ordering::Release);
                                 // unset the update flag
                                 self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                                 // unset the `weak` update flag from the intermediate ref cnt
@@ -684,6 +695,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         Self::get_metadata(self.intermediate_ptr.load(Ordering::Relaxed));
                     let new = Self::merge_ptr_and_metadata(new, metadata).cast_mut();
                     self.intermediate_ptr.store(new, Ordering::Relaxed);
+                    // ORDERING: we need a release here as it allows the following
+                    // RMW on `intermediate_ref_cnt` to establish a happens-before relationship
+                    // with this fence and ensure that the store to `ptr` is visible to
+                    // anybody observing the update to `intermediate_ref_cnt`.
+                    fence(Ordering::Release);
                     // unset the update flag to signal that `intermediate_ptr` may now be relied upon
                     self.intermediate_ref_cnt
                         .fetch_and(!Self::UPDATE, Ordering::AcqRel);
@@ -712,9 +728,13 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                                 // as it, itself is protected by other atomics, so we can use `Relaxed`
                                 let prev = self.ptr.load(Ordering::Relaxed);
                                 self.ptr.store(new, Ordering::Relaxed);
+                                // ORDERING: we need a release here as it allows the following
+                                // RMW on `curr_ref_cnt` to establish a happens-before relationship
+                                // with this fence and ensure that the store to `ptr` is visible to
+                                // anybody observing the update to `curr_ref_cnt`.
+                                fence(Ordering::Release);
                                 // unset the update flag to signal that `ptr` may now be used again
                                 self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
-                                fence(Ordering::Acquire);
                                 // unset the `weak` update flag to signal that new updates to
                                 // `intermediate_ptr` are now permitted again
                                 // we do this after updating the `curr_ref_cnt` as the `curr_ref_cnt`
@@ -874,6 +894,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
         self.intermediate_ptr
             .store(new.cast_mut(), Ordering::Relaxed);
+        // ORDERING: we need a release here as it allows the following
+        // RMW on `intermediate_ref_cnt` to establish a happens-before relationship
+        // with this fence and ensure that the store to `ptr` is visible to
+        // anybody observing the update to `intermediate_ref_cnt`.
+        fence(Ordering::Release);
         // unset the update flag
         self.intermediate_ref_cnt
             .fetch_and(!Self::UPDATE, Ordering::AcqRel);
@@ -900,9 +925,13 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // of the happens-before-relationship between
                     let prev = self.ptr.load(Ordering::Relaxed);
                     self.ptr.store(new.cast_mut(), Ordering::Relaxed);
+                    // ORDERING: we need a release here as it allows the following
+                    // RMW on `curr_ref_cnt` to establish a happens-before relationship
+                    // with this fence and ensure that the store to `ptr` is visible to
+                    // anybody observing the update to `curr_ref_cnt`.
+                    fence(Ordering::Release);
                     // unset the update flag
                     self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
-                    fence(Ordering::Acquire);
                     // unset the `weak` update flag from the intermediate ref cnt
                     // we do this after updating the `curr_ref_cnt` as the `curr_ref_cnt`
                     // may not have any flags set when `intermediate` is allowed to be
