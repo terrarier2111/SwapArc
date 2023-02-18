@@ -554,7 +554,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         ) {
             Ok(_) => {
                 // take the update
-                let update = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
+
+                // ORDERING: this is `Relaxed` as it doesn't have to synchronize-with anything else.
+                let update = self.updated.swap(null_mut(), Ordering::Relaxed);
                 // check if we even have an update
                 if !update.is_null() {
                     // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
@@ -588,6 +590,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                                 // unset the update flag
                                 self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                                 // unset the `weak` update flag from the intermediate ref cnt
+                                // we do this after updating the `curr_ref_cnt` as the `curr_ref_cnt`
+                                // may not have any flags set when `intermediate` is allowed to be
+                                // updated again.
                                 self.intermediate_ref_cnt
                                     .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel); // TODO: acquire should suffice here!
                                 // drop the `virtual reference` we hold to the `D`
@@ -670,7 +675,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             ) {
                 Ok(_) => {
                     // clear out old updates to make sure our update won't be overwritten by them in the future
-                    let old = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
+
+                    // ORDERING: this is `Relaxed` as it doesn't have to synchronize-with anything else.
+                    let old = self.updated.swap(null_mut(), Ordering::Relaxed);
                     // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
                     // as it, itself is protected by other atomics, so we can use `Relaxed`
                     let metadata =
@@ -709,6 +716,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                                 self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                                 // unset the `weak` update flag to signal that new updates to
                                 // `intermediate_ptr` are now permitted again
+                                // we do this after updating the `curr_ref_cnt` as the `curr_ref_cnt`
+                                // may not have any flags set when `intermediate` is allowed to be
+                                // updated again.
                                 self.intermediate_ref_cnt
                                     .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
                                 // drop the `virtual reference` we hold to the `D`
@@ -755,7 +765,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // note: we don't need to add a counter to determine which update is the most recent as that would be
                     // impossible anyways as there is no concept of time among two threads as long as they aren't synchronized
                     // which means there's no way for us to know which update is the most recent in the first place
-                    let old = self.updated.swap(new, Ordering::AcqRel);
+
+                    // ORDERING: this is `Relaxed` as it doesn't have to synchronize-with anything else,
+                    // the `Acquire` fence above doesn't have to interact with this, as it only ensures that the
+                    // change to `intermediate_ref_cnt` is visible at this point.
+                    let old = self.updated.swap(new, Ordering::Relaxed);
                     if !old.is_null() {
                         // drop the `virtual reference` we hold to the `D`
 
@@ -804,19 +818,26 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             old
         };
         let backoff = Backoff::new();
-        while !self
+        let mut cmp = self
             .intermediate_ref_cnt
             .compare_exchange_weak(
                 0,
                 Self::UPDATE | Self::OTHER_UPDATE,
                 Ordering::AcqRel,
                 Ordering::Relaxed,
-            )
-            .is_ok()
-        {
-            println!("waiting...");
+            );
+        while !cmp.is_ok() {
+            println!("waiting: {:?}", cmp);
             // back-off
             backoff.snooze();
+            cmp = self
+                .intermediate_ref_cnt
+                .compare_exchange_weak(
+                    0,
+                    Self::UPDATE | Self::OTHER_UPDATE,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
         }
         // This load may be `Relaxed` because it is guarded by the `intermediate_ref_cnt`.
         let intermediate = self.intermediate_ptr.load(Ordering::Relaxed).cast_const();
@@ -843,7 +864,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         tmp.increase_ref_cnt();
 
         // clear out old updates to make sure our update won't be overwritten by them in the future
-        let old_update = self.updated.swap(null_mut(), Ordering::AcqRel); // TODO: can this be weaker?
+
+        // ORDERING: this is `Relaxed` as it doesn't have to synchronize-with anything else.
+        let old_update = self.updated.swap(null_mut(), Ordering::Relaxed);
 
         self.intermediate_ptr
             .store(new.cast_mut(), Ordering::Relaxed);
@@ -876,6 +899,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // unset the update flag
                     self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
                     // unset the `weak` update flag from the intermediate ref cnt
+                    // we do this after updating the `curr_ref_cnt` as the `curr_ref_cnt`
+                    // may not have any flags set when `intermediate` is allowed to be
+                    // updated again.
                     self.intermediate_ref_cnt
                         .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
                     // drop the `virtual reference` we hold to the `D`
