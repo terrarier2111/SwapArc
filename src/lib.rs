@@ -827,7 +827,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 Ordering::Relaxed,
             );
         while !cmp.is_ok() {
-            println!("waiting: {:?}", cmp);
+            println!("waiting: {:?} | {}", cmp, self.curr_ref_cnt.load(Ordering::Acquire));
             // back-off
             backoff.snooze();
             cmp = self
