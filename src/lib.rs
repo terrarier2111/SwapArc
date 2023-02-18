@@ -714,6 +714,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                                 self.ptr.store(new, Ordering::Relaxed);
                                 // unset the update flag to signal that `ptr` may now be used again
                                 self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
+                                fence(Ordering::Acquire);
                                 // unset the `weak` update flag to signal that new updates to
                                 // `intermediate_ptr` are now permitted again
                                 // we do this after updating the `curr_ref_cnt` as the `curr_ref_cnt`
@@ -812,6 +813,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     unsafe fn compare_exchange_inner<const IGNORE_META: bool>(&self, old: *const T, new: *const T) -> bool {
         use crate::ptr::map_addr;
 
+        // FIXME: when both `intermediate_ref_cnt` and `curr_ref_cnt` are equal to `OTHER_UPDATE`, then the `cmp_exchg_inner`
+        // FIXME: can get stuck in an infinite loop
+
         let old = if IGNORE_META {
             map_addr(old, |x| x & !Self::META_MASK)
         } else {
@@ -898,6 +902,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     self.ptr.store(new.cast_mut(), Ordering::Relaxed);
                     // unset the update flag
                     self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::AcqRel);
+                    fence(Ordering::Acquire);
                     // unset the `weak` update flag from the intermediate ref cnt
                     // we do this after updating the `curr_ref_cnt` as the `curr_ref_cnt`
                     // may not have any flags set when `intermediate` is allowed to be
