@@ -439,12 +439,29 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         let val = ManuallyDrop::new(unsafe { D::from(ptr) });
         let val = ManuallyDrop::into_inner(val.clone());
 
+        // release the reference we hold
         match src {
             RefSource::Curr => {
-                self.curr_ref_cnt.fetch_sub(1, Ordering::Release);
+                let ref_cnt = self.parent.curr_ref_cnt.fetch_sub(1, Ordering::AcqRel);
+                // Note: we only perform implicit updates when `OTHER_UPDATE` is set and there
+                // are no other references alive as `OTHER_UPDATE` signals that there is still
+                // an update pending and it would be useless to try to perform an implicit
+                // update if no update is pending.
+                if ref_cnt == SwapArcAnyMeta::<T, D, METADATA_BITS>::OTHER_UPDATE + 1 {
+                    self.parent.try_update_curr();
+                }
             }
             RefSource::Intermediate => {
-                self.intermediate_ref_cnt.fetch_sub(1, Ordering::Release);
+                let ref_cnt = self
+                    .parent
+                    .intermediate_ref_cnt
+                    .fetch_sub(1, Ordering::AcqRel);
+                // fast-rejection path to ensure we are only trying to update if it's worth it:
+                // first check if there are no other references alive, then check if there are
+                // still updates pending.
+                if ref_cnt == 1 && !self.parent.updated.load(Ordering::Relaxed).is_null() {
+                    self.parent.try_update_intermediate();
+                }
             }
         }
 
@@ -605,7 +622,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                                 // may not have any flags set when `intermediate` is allowed to be
                                 // updated again.
                                 self.intermediate_ref_cnt
-                                    .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel); // TODO: acquire should suffice here!
+                                    .fetch_and(!Self::OTHER_UPDATE, Ordering::AcqRel);
                                 // drop the `virtual reference` we hold to the `D`
 
                                 // SAFETY: we know that we hold a `virtual reference` to the `D`
