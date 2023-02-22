@@ -165,8 +165,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         // and we also know, that the pointer has to be non-null
         let data = unsafe { parent.inner.get().as_mut().unwrap_unchecked() };
 
-        // ORDERING: `ptr` doesn't have to care about anything other than itself
-        // as it, itself is protected by other atomics, so we can use `Relaxed`
+        // ORDERING: This is `Relaxed` because we are only speculatively loading `ptr` here,
+        // so we don't care about the consistency of state of the atomics around it.
         let no_update =
             Self::strip_metadata(parent.parent().ptr.load(Ordering::Relaxed)) == data.curr.ptr;
         if likely(no_update && data.new.ref_cnt == 0) {
@@ -264,10 +264,14 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // increased by us and thus we can decrease it again when
                     // it isn't needed anymore.
                     data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
+                    // ORDERING: This is `Release` as the counters act as guards for the critical
+                    // sections inside them and as a guard this counter has to make sure that every
+                    // load of it will automatically ensure that the critical section of its last
+                    // decrement has finished when the new critical section begins.
                     parent
                         .parent()
                         .intermediate_ref_cnt
-                        .fetch_sub(1, Ordering::AcqRel);
+                        .fetch_sub(1, Ordering::Release);
                     // SAFETY: this is safe because `data.new` was just updated by us and thus we know that it
                     // contains a valid ptr inside its `ptr` field.
                     let fake_ref = ManuallyDrop::new(unsafe { D::from(data.new.ptr) });
@@ -343,8 +347,12 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // there's a new value so we have to update our (thread-)local representation
 
                 // we have to make sure we observe the update of `intermediate_ref_cnt` correctly
-                fence(Ordering::Acquire);
+                fence(Ordering::Acquire); // FIXME: is this still required?
                 // increment the reference count in order to avoid race conditions and act as a guard for our load
+
+                // ORDERING: This is `Acquire` because we have to ensure that the previous critical sections have
+                // a happens-before relationship with this increment, i.e they are finished at the point this operation
+                // gets performed.
                 let loaded = parent
                     .parent()
                     .intermediate_ref_cnt
@@ -352,9 +360,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // check if the update is still on-going or if the update is complete and we can thus use the
                 // new value
                 if loaded & SwapArcAnyMeta::<T, D, { META_DATA_BITS }>::UPDATE == 0 {
-                    // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                    // as it, itself is protected by other atomics, but  we need to make sure we never
-                    // observe its guards' updates after its update, so we have to use `Acquire`
+                    // FIXME: add ordering comment.
                     let loaded = SwapArcAnyMeta::<T, D, { META_DATA_BITS }>::strip_metadata(
                         parent.parent().intermediate_ptr.load(Ordering::Acquire),
                     );
@@ -368,6 +374,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 } else {
                     // the update is on-going, so we have to fallback to our locally most recent value
                     // and signal that the update finished.
+
+                    // ORDERING: This is `Relaxed` because there's no critical section which
+                    // requires protection.
                     parent
                         .parent()
                         .intermediate_ref_cnt
@@ -441,6 +450,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         // release the reference we hold
         match src {
             RefSource::Curr => {
+                // ORDERING: This is `Release` in order to establish a happens-before relationship
+                // with loads of this counter and thus ensure that on the load of this counter
+                // the critical section has ended.
                 let ref_cnt = self.curr_ref_cnt.fetch_sub(1, Ordering::Release);
                 // Note: we only perform implicit updates when `OTHER_UPDATE` is set and there
                 // are no other references alive as `OTHER_UPDATE` signals that there is still
@@ -451,12 +463,19 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 }
             }
             RefSource::Intermediate => {
+                // ORDERING: This is `Release` in order to establish a happens-before relationship
+                // with loads of this counter and thus ensure that on the load of this counter
+                // the critical section has ended.
                 let ref_cnt = self
                     .intermediate_ref_cnt
                     .fetch_sub(1, Ordering::Release);
                 // fast-rejection path to ensure we are only trying to update if it's worth it:
                 // first check if there are no other references alive, then check if there are
                 // still updates pending.
+
+                // ORDERING: This is `Relaxed` as we are only speculatively loading
+                // `updated` here and thus don't need any relationships to other
+                // atomics here.
                 if ref_cnt == 1 && !self.updated.load(Ordering::Relaxed).is_null() {
                     self.try_update_intermediate();
                 }
@@ -488,27 +507,36 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     }
 
     fn load_internal(&self) -> (*mut T, RefSource) {
+        // ORDERING: This is `Acquire` because we have to ensure that the previous critical sections have
+        // a happens-before relationship with this increment, i.e they are finished at the point this operation
+        // gets performed.
         let ref_cnt = self.curr_ref_cnt.fetch_add(1, Ordering::Acquire);
         // Check if there is currently an update of `curr` on-going because if there is,
         // the ptr can be invalidated at any point in time. Additionally we have to check
         // if there is an implicit update allowed which also means that the ptr
         // can be invalidated at any point in time.
         if ref_cnt & (Self::UPDATE | Self::OTHER_UPDATE) != 0 {
-            let intermediate_ref_cnt = self.intermediate_ref_cnt.fetch_add(1, Ordering::Relaxed); // FIXME: ordering comment
+            // ORDERING: This is `Acquire` as we have to ensure that critical sections
+            // that were marked as ended via a mutation of `intermediate_ref_cnt` have
+            // actually ended at the point of this increment.
+            let intermediate_ref_cnt = self.intermediate_ref_cnt.fetch_add(1, Ordering::Acquire);
             if intermediate_ref_cnt & Self::UPDATE != 0 {
-                // FIXME: ordering comment
                 // release the redundant reference
+
+                // ORDERING: This is `Relaxed` because there's no critical section which
+                // requires protection.
                 self.intermediate_ref_cnt.fetch_sub(1, Ordering::Relaxed);
-                // ORDERING: `ptr` doesn't have to care about anything other than itself
-                // as it, itself is protected by other atomics, so we can use `Relaxed` // FIXME: update this
+                // FIXME: ordering comment
                 let ret = self.ptr.load(Ordering::Acquire);
                 (ret, RefSource::Curr)
             } else {
-                fence(Ordering::Acquire);
                 // release the redundant reference
+
+                // ORDERING: This is `Release` in order to establish a happens-before relationship
+                // with loads of this counter and thus ensure that on the load of this counter
+                // the critical section (in this case the increment of `intermediate_ref_cnt`) has ended.
                 self.curr_ref_cnt.fetch_sub(1, Ordering::Release);
-                // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                // as it, itself is protected by other atomics, so we can use `Relaxed` // FIXME: update this
+                // FIXME: ordering comment
                 let ret = self.intermediate_ptr.load(Ordering::Acquire);
                 (ret, RefSource::Intermediate)
             }
@@ -527,18 +555,19 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         ) {
             Ok(_) => {
                 // TODO: can we somehow bypass intermediate if we have a new update upcoming - we probably can't because this would probably cause memory leaks and other funny things that we don't like
-                // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                // as it, itself is protected by other atomics, so we can use `Relaxed` // FIXME: update this
+
+                // FIXME: ordering comments
                 let intermediate = self.intermediate_ptr.load(Ordering::Acquire);
-                // ORDERING: `ptr` doesn't have to care about anything other than itself
-                // as it, itself is protected by other atomics, so we can use `Relaxed`
                 let prev = self.ptr.load(Ordering::Acquire);
                 if Self::strip_metadata(prev) != Self::strip_metadata(intermediate) {
-                    // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                    // as it, itself is protected by other atomics, so we can use `Relaxed` // FIXME: update this
+                    // FIXME: ordering comment
                     self.ptr.store(intermediate, Ordering::Release);
                     // unset the update flag
-                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::Release); // FIXME: ordering comment
+
+                    // ORDERING: This is `Release` in order to establish a happens-before relationship
+                    // with loads of this counter and thus ensure that on the load of this counter
+                    // the critical section (in this case the load of `intermediate_ref_cnt` and the load + store of `ptr`) has ended.
+                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::Release);
                     // drop the `virtual reference` we hold to the `D`
 
                     // SAFETY: we know that we hold a `virtual reference` to the `D`
@@ -550,11 +579,19 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     }
                 } else {
                     // unset the update flag
-                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::Release); // FIXME: ordering comment
+
+                    // ORDERING: This is `Release` in order to establish a happens-before relationship
+                    // with loads of this counter and thus ensure that on the load of this counter
+                    // the critical section (in this case the loads of `ptr` and `intermediate_ptr`) has ended.
+                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::Release);
                 }
                 // unset the `weak` update flag from the intermediate ref cnt
+
+                // ORDERING: This is `Release` in order to establish a happens-before relationship
+                // with loads of this counter and thus ensure that on the load of this counter
+                // the critical section (in this case the potential update of `ptr`) has ended.
                 self.intermediate_ref_cnt
-                    .fetch_and(!Self::OTHER_UPDATE, Ordering::Release); // FIXME: ordering comment
+                    .fetch_and(!Self::OTHER_UPDATE, Ordering::Release);
                 true
             }
             _ => false,
@@ -563,6 +600,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
     #[cold]
     fn try_update_intermediate(&self) {
+        // ORDERING: This is `Acquire` because we have to ensure that the previous critical sections have
+        // a happens-before relationship with this increment, i.e they are finished at the point this operation
+        // gets performed.
         match self.intermediate_ref_cnt.compare_exchange(
             0,
             Self::UPDATE | Self::OTHER_UPDATE,
@@ -572,82 +612,99 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             Ok(_) => {
                 // take the update
 
-                // ORDERING: this is `Relaxed` as it doesn't have to synchronize-with anything else.
+                // ORDERING: this is `Acquire` in order to establish a happens-before relationship with
+                // to previous updates and thus ensure that the initialization has already happened when
+                // we acquire the value of `updated`.
                 let update = self.updated.swap(null_mut(), Ordering::Acquire);
                 // check if we even have an update
-                if !update.is_null() {
-                    // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                    // as it, itself is protected by other atomics, so we can use `Relaxed`
-                    let metadata =
-                        Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire));
-                    let update = Self::merge_ptr_and_metadata(update, metadata).cast_mut();
-                    // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                    // as it, itself is protected by other atomics, but when performing a load we have be
-                    // able to ensure that we never observe the update of `intermediate_ptr`
-                    // before the update of `intermediate_ref_cnt` in order to make the protection
-                    // of it by the other atomics effective, so we have to use `Release`
-                    self.intermediate_ptr.store(update, Ordering::Release);
-                    // FIXME: do we need a release fence here?
-                    // unset the update flag
-                    self.intermediate_ref_cnt
-                        .fetch_and(!Self::UPDATE, Ordering::Release);
-                    // try finishing the update up
-                    let mut curr = 0;
-                    loop {
-                        match self.curr_ref_cnt.compare_exchange(
-                            curr,
-                            Self::UPDATE,
-                            Ordering::Acquire,
-                            Ordering::Relaxed,
-                        ) {
-                            Ok(_) => {
-                                // `ptr` doesn't have to care about anything other than itself
-                                // as it, itself is protected by other atomics, so we can use `Relaxed`
-                                let prev = self.ptr.load(Ordering::Acquire);
-                                self.ptr.store(update, Ordering::Release);
-                                // unset the update flag
-                                self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::Release);
-                                // unset the `weak` update flag from the intermediate ref cnt
-                                // we do this after updating the `curr_ref_cnt` as the `curr_ref_cnt`
-                                // may not have any flags set when `intermediate` is allowed to be
-                                // updated again.
-                                self.intermediate_ref_cnt
-                                    .fetch_and(!Self::OTHER_UPDATE, Ordering::Release);
-                                // drop the `virtual reference` we hold to the `D`
-
-                                // SAFETY: we know that we hold a `virtual reference` to the `D`
-                                // which `prev` points to and thus we are allowed to drop
-                                // this `virtual reference`, once we replace `self.ptr` (or in other
-                                // word `prev`)
-                                unsafe {
-                                    D::from(Self::strip_metadata(prev));
-                                }
-                                break;
-                            }
-                            Err(_) => {
-                                // set the `OTHER_UPDATE` flag to indicate that there is an update pending
-                                // and no other explicit update to `ptr` may occur until this updates has been
-                                // implicitly updated (but only if such a flag isn't present yet)
-
-                                // ORDERING: the failure ordering of `Relaxed` can't race because we are performing an `Acquire`
-                                // ordered atomic operation right here. // FIXME: update this
-                                if self
-                                    .curr_ref_cnt
-                                    .fetch_or(Self::OTHER_UPDATE, Ordering::Release)
-                                    == 0
-                                {
-                                    curr = Self::OTHER_UPDATE;
-                                    // retry update, as no implicit update can occur anymore
-                                    continue;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                } else {
+                if update.is_null() {
                     // unset the update flags as there's no update to be applied here
+
+                    // ORDERING: This is `Release` in order to establish a happens-before relationship
+                    // with loads of this counter and thus ensure that on the load of this counter
+                    // the critical section (in this case the swap of `updated`) has ended.
                     self.intermediate_ref_cnt
                         .fetch_and(!(Self::UPDATE | Self::OTHER_UPDATE), Ordering::Release);
+                    return;
+                }
+
+                // FIXME: ordering comment
+                let metadata =
+                    Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire));
+                let update = Self::merge_ptr_and_metadata(update, metadata).cast_mut();
+                // FIXME: ordering comment
+                self.intermediate_ptr.store(update, Ordering::Release);
+                // unset the update flag
+
+                // ORDERING: This is `Release` in order to establish a happens-before relationship
+                // with loads of this counter and thus ensure that on the load of this counter
+                // the critical section (in this case the swap of `updated` and the load + store
+                // of `intermediate_ptr`) has ended.
+                self.intermediate_ref_cnt
+                    .fetch_and(!Self::UPDATE, Ordering::Release);
+                // try finishing the update up
+                let mut curr = 0;
+                loop {
+                    // ORDERING: This is `Acquire` because we have to ensure that the previous critical sections have
+                    // a happens-before relationship with this increment, i.e they are finished at the point this operation
+                    // gets performed.
+                    match self.curr_ref_cnt.compare_exchange(
+                        curr,
+                        Self::UPDATE,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            // FIXME: ordering comment!
+                            let prev = self.ptr.load(Ordering::Acquire);
+                            self.ptr.store(update, Ordering::Release);
+                            // unset the update flag
+
+                            // ORDERING: This is `Release` in order to establish a happens-before relationship
+                            // with loads of this counter and thus ensure that on the load of this counter
+                            // the critical section (in this case the load + store of `ptr`) has ended.
+                            self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::Release);
+                            // unset the `weak` update flag from the intermediate ref cnt
+                            // we do this after updating the `curr_ref_cnt` as the `curr_ref_cnt`
+                            // may not have any flags set when `intermediate` is allowed to be
+                            // updated again.
+
+                            // ORDERING: This is `Release` in order to establish a happens-before relationship
+                            // with loads of this counter and thus ensure that on the load of this counter
+                            // the critical section (in this case the update of `curr_ref_cnt`) has ended.
+                            self.intermediate_ref_cnt
+                                .fetch_and(!Self::OTHER_UPDATE, Ordering::Release);
+                            // drop the `virtual reference` we hold to the `D`
+
+                            // SAFETY: we know that we hold a `virtual reference` to the `D`
+                            // which `prev` points to and thus we are allowed to drop
+                            // this `virtual reference`, once we replace `self.ptr` (or in other
+                            // word `prev`)
+                            unsafe {
+                                D::from(Self::strip_metadata(prev));
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            // set the `OTHER_UPDATE` flag to indicate that there is an update pending
+                            // and no other explicit update to `ptr` may occur until this updates has been
+                            // implicitly updated (but only if such a flag isn't present yet)
+
+                            // ORDERING: This is `Release` in order to establish a happens-before relationship
+                            // with loads of this counter and thus ensure that on the load of this counter
+                            // the critical section (in this case the update of `intermediate_ref_cnt`) has ended.
+                            if self
+                                .curr_ref_cnt
+                                .fetch_or(Self::OTHER_UPDATE, Ordering::Release)
+                                == 0
+                            {
+                                curr = Self::OTHER_UPDATE;
+                                // retry update, as no implicit update can occur anymore
+                                continue;
+                            }
+                            break;
+                        }
+                    }
                 }
             }
             Err(_) => {}
@@ -685,6 +742,10 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             // via the `UPDATE` flag.
             // additionally we set the `OTHER_UPDATE` flag in advance to signal that the
             // "new" value inside `intermediate_ptr` hasn't propagated to `ptr` yet.
+
+            // ORDERING: This is `Acquire` because we have to ensure that the previous critical sections have
+            // a happens-before relationship with this increment, i.e they are finished at the point this operation
+            // gets performed.
             match self.intermediate_ref_cnt.compare_exchange(
                 0,
                 Self::UPDATE | Self::OTHER_UPDATE,
@@ -694,15 +755,20 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 Ok(_) => {
                     // clear out old updates to make sure our update won't be overwritten by them in the future
 
-                    // ORDERING: this is `Relaxed` as it doesn't have to synchronize-with anything else.
+                    // ORDERING: this is `Acquire` in order to establish a happens-before relationship with
+                    // to previous updates and thus ensure that the initialization has already happened when
+                    // we acquire the value of `updated`.
                     let old = self.updated.swap(null_mut(), Ordering::Acquire);
-                    // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-                    // as it, itself is protected by other atomics, so we can use `Relaxed`
+                    // FIXME: ordering comments
                     let metadata =
                         Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire));
                     let new = Self::merge_ptr_and_metadata(new, metadata).cast_mut();
                     self.intermediate_ptr.store(new, Ordering::Release);
                     // unset the update flag to signal that `intermediate_ptr` may now be relied upon
+
+                    // ORDERING: This is `Release` in order to establish a happens-before relationship
+                    // with loads of this counter and thus ensure that on the load of this counter
+                    // the critical section (in this case the swap of `updated` and the load + store of `intermediate_ptr`) has ended.
                     self.intermediate_ref_cnt
                         .fetch_and(!Self::UPDATE, Ordering::Release);
                     if !old.is_null() {
@@ -719,6 +785,10 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     loop {
                         // try setting the `UPDATE` flag to signal that `ptr` is being updated
                         // and may not be relied upon.
+
+                        // ORDERING: This is `Acquire` because we have to ensure that the previous critical sections have
+                        // a happens-before relationship with this increment, i.e they are finished at the point this operation
+                        // gets performed.
                         match self.curr_ref_cnt.compare_exchange(
                             curr,
                             Self::UPDATE,
@@ -726,17 +796,24 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                             Ordering::Relaxed,
                         ) {
                             Ok(_) => {
-                                // `ptr` doesn't have to care about anything other than itself
-                                // as it, itself is protected by other atomics, so we can use `Relaxed`
+                                // FIXME: ordering comments
                                 let prev = self.ptr.load(Ordering::Acquire);
                                 self.ptr.store(new, Ordering::Release);
                                 // unset the update flag to signal that `ptr` may now be used again
+
+                                // ORDERING: This is `Release` in order to establish a happens-before relationship
+                                // with loads of this counter and thus ensure that on the load of this counter
+                                // the critical section (in this case the load + store of `ptr`) has ended.
                                 self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::Release);
                                 // unset the `weak` update flag to signal that new updates to
                                 // `intermediate_ptr` are now permitted again
                                 // we do this after updating the `curr_ref_cnt` as the `curr_ref_cnt`
                                 // may not have any flags set when `intermediate` is allowed to be
                                 // updated again.
+
+                                // ORDERING: This is `Release` in order to establish a happens-before relationship
+                                // with loads of this counter and thus ensure that on the load of this counter
+                                // the critical section (in this case the update of `curr_ref_cnt`) has ended.
                                 self.intermediate_ref_cnt
                                     .fetch_and(!Self::OTHER_UPDATE, Ordering::Release);
                                 // drop the `virtual reference` we hold to the `D`
@@ -753,8 +830,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                                 // and no other explicit update to `ptr` may occur until this update has been
                                 // implicitly updated (but only if such a flag isn't present yet)
 
-                                // ORDERING: the failure ordering of `Relaxed` can't race because we are performing an `Acquire`
-                                // ordered atomic operation right here. // FIXME: update this!
+                                // ORDERING: This is `Release` in order to establish a happens-before relationship
+                                // with loads of this counter and thus ensure that on the load of this counter
+                                // the critical section (in this case the update of `intermediate_ref_cnt`) has ended.
                                 if self
                                     .curr_ref_cnt
                                     .fetch_or(Self::OTHER_UPDATE, Ordering::Release)
@@ -813,7 +891,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// metadata.
     /// `new` has to be a pointer to a valid instance of `D`.
     #[cfg(feature = "ptr-ops")]
-    pub unsafe fn try_compare_exchange_with_meta(&self, old: *const T, new: *const T) -> bool {
+    pub unsafe fn compare_exchange_with_meta(&self, old: *const T, new: *const T) -> bool {
         self.compare_exchange_inner::<false>(old, new)
     }
 
@@ -824,15 +902,12 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// is ignored, i.e it doesn't have to match.
     /// `new` has to be a pointer to a valid instance of `D`.
     #[cfg(feature = "ptr-ops")]
-    pub unsafe fn try_compare_exchange_ignore_meta(&self, old: *const T, new: *const T) -> bool {
+    pub unsafe fn compare_exchange_ignore_meta(&self, old: *const T, new: *const T) -> bool {
         self.compare_exchange_inner::<true>(old, new)
     }
 
     unsafe fn compare_exchange_inner<const IGNORE_META: bool>(&self, old: *const T, new: *const T) -> bool {
         use crate::ptr::map_addr;
-
-        // FIXME: when both `intermediate_ref_cnt` and `curr_ref_cnt` are equal to `OTHER_UPDATE`, then the `cmp_exchg_inner`
-        // FIXME: can get stuck in an infinite loop
 
         let old = if IGNORE_META {
             map_addr(old, |x| x & !Self::META_MASK)
@@ -840,6 +915,10 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             old
         };
         let backoff = Backoff::new();
+
+        // ORDERING: This is `Acquire` because we have to ensure that the previous critical sections have
+        // a happens-before relationship with this increment, i.e they are finished at the point this operation
+        // gets performed.
         while !self
             .intermediate_ref_cnt
             .compare_exchange_weak(
@@ -851,7 +930,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             // back-off
             backoff.snooze();
         }
-        // This load may be `Relaxed` because it is guarded by the `intermediate_ref_cnt`.
+        // FIXME: ordering comment
         let intermediate = self.intermediate_ptr.load(Ordering::Acquire).cast_const();
         let intermediate = if IGNORE_META {
             map_addr(intermediate, |x| x & !Self::META_MASK)
@@ -859,12 +938,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             intermediate
         };
         if intermediate != old {
-            // ORDERING: We use Acquire here because we have a Release above with which we can establish
-            // a happens-before relationship with the RMW (compare_exchange) above
+            // ORDERING: This is `Release` in order to establish a happens-before relationship
+            // with loads of this counter and thus ensure that on the load of this counter
+            // the critical section (in this case the load of `intermediate_ptr`) has ended.
             self.intermediate_ref_cnt.fetch_and(
                 !(Self::UPDATE | Self::OTHER_UPDATE),
-                // ORDERING: This is `Release` because we only need to make sure everything before this
-                // happens-before future writes.
                 Ordering::Release,
             );
             return false;
@@ -875,9 +953,12 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
         // clear out old updates to make sure our update won't be overwritten by them in the future
 
-        // ORDERING: this is `Relaxed` as it doesn't have to synchronize-with anything else.
+        // ORDERING: this is `Acquire` in order to establish a happens-before relationship with
+        // to previous updates and thus ensure that the initialization has already happened when
+        // we acquire the value of `updated`.
         let old_update = self.updated.swap(null_mut(), Ordering::Acquire);
 
+        // FIXME: ordering comment
         self.intermediate_ptr
             .store(new.cast_mut(), Ordering::Release);
         // ORDERING: we need a release here as it allows the following
@@ -886,6 +967,10 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         // anybody observing the update to `intermediate_ref_cnt`.
         fence(Ordering::Release);
         // unset the update flag
+
+        // ORDERING: This is `Release` in order to establish a happens-before relationship
+        // with loads of this counter and thus ensure that on the load of this counter
+        // the critical section (in this case the swap of `updated` and the load + store of `intermediate_ptr`) has ended.
         self.intermediate_ref_cnt
             .fetch_and(!Self::UPDATE, Ordering::Release);
         if !old_update.is_null() {
@@ -899,6 +984,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         }
         let mut curr = 0;
         loop {
+            // ORDERING: This is `Acquire` because we have to ensure that the previous critical sections have
+            // a happens-before relationship with this increment, i.e they are finished at the point this operation
+            // gets performed.
             match self.curr_ref_cnt.compare_exchange(
                 curr,
                 Self::UPDATE,
@@ -906,9 +994,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    // ORDERING: Relaxed should be okay because curr_ref_cnt guards `ptr`
-                    // and ensures that other threads see the update because
-                    // of the happens-before-relationship between
+                    // FIXME: ordering comments
                     let prev = self.ptr.load(Ordering::Acquire);
                     self.ptr.store(new.cast_mut(), Ordering::Release);
                     // unset the update flag
@@ -930,6 +1016,10 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 }
                 Err(_) => {
                     // signal that it's allowed to implicitly update this now
+
+                    // ORDERING: This is `Release` in order to establish a happens-before relationship
+                    // with loads of this counter and thus ensure that on the load of this counter
+                    // the critical section (in this case the update of `intermediate_ref_cnt`) has ended.
                     if self
                         .curr_ref_cnt
                         .fetch_or(Self::OTHER_UPDATE, Ordering::Release)
@@ -1369,7 +1459,10 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
                 // fast-rejection path to ensure we are only trying to update if it's worth it:
                 // first check if there are no other references alive, then check if there are
                 // still updates pending.
-                if ref_cnt == 1 && !self.parent.updated.load(Ordering::Acquire).is_null() {
+
+                // ORDERING: This is `Relaxed` because we are only speculatively loading `updated` here,
+                // so we don't care about the consistency of state of the atomics around it.
+                if ref_cnt == 1 && !self.parent.updated.load(Ordering::Relaxed).is_null() {
                     self.parent.try_update_intermediate();
                 }
             }
