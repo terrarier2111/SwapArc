@@ -998,11 +998,19 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     let prev = self.ptr.load(Ordering::Acquire);
                     self.ptr.store(new.cast_mut(), Ordering::Release);
                     // unset the update flag
+
+                    // ORDERING: This is `Release` in order to establish a happens-before relationship
+                    // with loads of this counter and thus ensure that on the load of this counter
+                    // the critical section (in this case the load + store of `ptr`) has ended.
                     self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::Release);
                     // unset the `weak` update flag from the intermediate ref cnt
                     // we do this after updating the `curr_ref_cnt` as the `curr_ref_cnt`
                     // may not have any flags set when `intermediate` is allowed to be
                     // updated again.
+
+                    // ORDERING: This is `Release` in order to establish a happens-before relationship
+                    // with loads of this counter and thus ensure that on the load of this counter
+                    // the critical section (in this case the update of `curr_ref_cnt`) has ended.
                     self.intermediate_ref_cnt
                         .fetch_and(!Self::OTHER_UPDATE, Ordering::Release);
                     // drop the `virtual reference` we hold to the `D`
