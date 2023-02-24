@@ -413,7 +413,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// This is slower than `load` but will allow for the result
     /// to be used even after the `SwapArc` was dropped.
     pub fn load_full(&self) -> D {
-        self.load().as_ref().clone()
+        self.load().deref().clone()
     }
 
     /// Loads the pointer with metadata into a guard which protects it weakly.
@@ -1324,7 +1324,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T> + Display, const METADATA_BITS: u32> D
 {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        D::fmt(self.as_ref(), f)
+        D::fmt(self.deref(), f)
     }
 }
 
@@ -1333,7 +1333,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T> + Debug, const METADATA_BITS: u32> Deb
 {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        D::fmt(self.as_ref(), f)
+        D::fmt(self.deref(), f)
     }
 }
 
