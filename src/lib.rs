@@ -943,7 +943,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         let backoff = Backoff::new();
         // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
         // as it, itself is protected by other atomics, so we can use `Relaxed`
-        let mut curr = self.intermediate_ptr.load(Ordering::Relaxed);
+        // FIXME: is this ordering correct?
+        let mut curr = self.intermediate_ptr.load(Ordering::Acquire);
         loop {
             let prefix = metadata & Self::META_MASK;
 
@@ -952,7 +953,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             match self.intermediate_ptr.compare_exchange_weak(
                 curr,
                 ptr::map_addr(curr, |x| (x & !Self::META_MASK) | prefix).cast_mut(),
-                Ordering::Relaxed,
+                Ordering::Release,// FIXME: is this ordering correct?
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
@@ -982,7 +983,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             .compare_exchange(
                 old.cast_mut(),
                 ptr::map_addr(old, |x| (x & !Self::META_MASK) | prefix).cast_mut(),
-                Ordering::Relaxed,
+                Ordering::Acquire, // FIXME: is this ordering correct?
                 Ordering::Relaxed,
             )
             .is_ok()
@@ -993,7 +994,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         let backoff = Backoff::new();
         // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
         // as it, itself is protected by other atomics, so we can use `Relaxed`
-        let mut curr = self.intermediate_ptr.load(Ordering::Relaxed);
+        // FIXME: is this ordering correct?
+        let mut curr = self.intermediate_ptr.load(Ordering::Acquire);
         loop {
             let prefix = active_bits & Self::META_MASK;
 
@@ -1002,7 +1004,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             match self.intermediate_ptr.compare_exchange_weak(
                 curr,
                 ptr::map_addr_mut(curr, |x| x | prefix),
-                Ordering::Relaxed,
+                Ordering::Release, // FIXME: is this ordering correct?
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
@@ -1023,7 +1025,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         let backoff = Backoff::new();
         // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
         // as it, itself is protected by other atomics, so we can use `Relaxed`
-        let mut curr = self.intermediate_ptr.load(Ordering::Relaxed);
+        // FIXME: is this ordering correct?
+        let mut curr = self.intermediate_ptr.load(Ordering::Acquire);
         loop {
             let prefix = inactive_bits & Self::META_MASK;
 
@@ -1032,7 +1035,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             match self.intermediate_ptr.compare_exchange_weak(
                 curr,
                 ptr::map_addr_mut(curr, |x| x & !prefix),
-                Ordering::Relaxed,
+                Ordering::Release, // FIXME: is this ordering correct?
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
@@ -1052,7 +1055,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     pub fn load_metadata(&self) -> usize {
         // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
         // as it, itself is protected by other atomics, so we can use `Relaxed`
-        ptr::expose_addr(self.intermediate_ptr.load(Ordering::Relaxed)) & Self::META_MASK
+        // FIXME: is this ordering correct?
+        ptr::expose_addr(self.intermediate_ptr.load(Ordering::Acquire)) & Self::META_MASK
     }
 
     #[inline(always)]
@@ -1261,6 +1265,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
                         // increased by us and thus we can decrease it again when
                         // it isn't needed anymore.
                         data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
+                        // FIXME: ordering comment
                         parent
                             .parent()
                             .intermediate_ref_cnt
@@ -1272,6 +1277,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
                 if data.intermediate.ref_cnt == 0 {
                     // we have no local references to the `intermediate` value anymore
                     // so release the outside reference as well.
+                    // FIXME: ordering comment
                     parent
                         .parent()
                         .intermediate_ref_cnt
