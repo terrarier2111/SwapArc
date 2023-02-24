@@ -1,3 +1,5 @@
+#![cfg_attr(miri, feature(strict_provenance))]
+
 use cfg_if::cfg_if;
 use crossbeam_utils::{Backoff, CachePadded};
 use likely_stable::{likely, unlikely};
@@ -644,7 +646,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     .fetch_and(!Self::UPDATE, Ordering::Release);
                 // try finishing the update up
                 // FIXME: safety comment!
-                unsafe { self.update_curr(); }
+                unsafe { self.update_curr(update); }
             }
             Err(_) => {}
         }
@@ -721,7 +723,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     }
                     // try finishing the update up
                     // FIXME: safety comment!
-                    self.update_curr();
+                    self.update_curr(new);
                     break;
                 }
                 Err(old) => {
@@ -760,7 +762,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
     // FIXME: add safety comment
     #[inline]
-    unsafe fn update_curr(&self) {
+    unsafe fn update_curr(&self, update: *mut T) {
         let mut curr = 0;
         loop {
             // try setting the `UPDATE` flag to signal that `ptr` is being updated
@@ -931,7 +933,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             D::from(old_update);
         }
         // FIXME: safety comment
-        self.update_curr();
+        self.update_curr(new.cast_mut());
         true
     }
 
@@ -1592,6 +1594,7 @@ const fn is_cmp_exchg_really_weak() -> bool {
     return true;
 }
 
+#[cfg(not(miri))]
 mod ptr {
 
     // TODO: switch to strict_provenance once it has been stabilized
@@ -1606,19 +1609,48 @@ mod ptr {
         f(expose_addr(ptr)) as *mut T
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn expose_addr<T>(ptr: *const T) -> usize {
         ptr as usize
     }
 
-    #[inline]
-    pub(crate) const fn from_exposed_addr<T>(exposed_addr: usize) -> *const T {
+    #[inline(always)]
+    pub(crate) fn from_exposed_addr<T>(exposed_addr: usize) -> *const T {
         exposed_addr as *const T
     }
 
-    #[inline]
-    pub(crate) const fn from_exposed_addr_mut<T>(exposed_addr: usize) -> *mut T {
+    #[inline(always)]
+    pub(crate) fn from_exposed_addr_mut<T>(exposed_addr: usize) -> *mut T {
         exposed_addr as *mut T
+    }
+}
+
+#[cfg(miri)]
+mod ptr {
+
+    #[inline]
+    pub(crate) fn map_addr<T>(ptr: *const T, f: impl FnOnce(usize) -> usize) -> *const T {
+        ptr.map_addr(f)
+    }
+
+    #[inline]
+    pub(crate) fn map_addr_mut<T>(ptr: *mut T, f: impl FnOnce(usize) -> usize) -> *mut T {
+        ptr.map_addr(f)
+    }
+
+    #[inline(always)]
+    pub(crate) fn expose_addr<T>(ptr: *const T) -> usize {
+        ptr.expose_addr()
+    }
+
+    #[inline(always)]
+    pub(crate) fn from_exposed_addr<T>(exposed_addr: usize) -> *const T {
+        core::ptr::from_exposed_addr(exposed_addr)
+    }
+
+    #[inline(always)]
+    pub(crate) fn from_exposed_addr_mut<T>(exposed_addr: usize) -> *mut T {
+        core::ptr::from_exposed_addr_mut(exposed_addr)
     }
 }
 
