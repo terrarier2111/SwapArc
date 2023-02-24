@@ -1319,15 +1319,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Borrow<D>
     }
 }
 
-impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> AsRef<D>
-    for SwapArcGuard<'_, T, D, METADATA_BITS>
-{
-    #[inline]
-    fn as_ref(&self) -> &D {
-        self.fake_ref.deref()
-    }
-}
-
 impl<T: Send + Sync, D: DataPtrConvert<T> + Display, const METADATA_BITS: u32> Display
     for SwapArcGuard<'_, T, D, METADATA_BITS>
 {
