@@ -21,6 +21,13 @@ pub type SwapArcOptionMeta<T, const METADATA_BITS: u32> =
     SwapArcAnyMeta<T, Option<Arc<T>>, METADATA_BITS>;
 pub type SwapArcAny<T, D> = SwapArcAnyMeta<T, D, 0>;
 
+impl<T: Send + Sync, const METADATA_BITS: u32> SwapArcOptionMeta<T, METADATA_BITS> {
+    #[inline]
+    pub fn empty() -> Self {
+        Self::new(None)
+    }
+}
+
 // TODO: we can probably combine the counters and ptrs in the main struct into an [(AtomicUsize, AtomicPtr); 2] and have
 // TODO: a third number that is either 0 or 1 and represents an index into the array, this could improve performance!
 
@@ -464,9 +471,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // ORDERING: This is `Release` in order to establish a happens-before relationship
                 // with loads of this counter and thus ensure that on the load of this counter
                 // the critical section has ended.
-                let ref_cnt = self
-                    .intermediate_ref_cnt
-                    .fetch_sub(1, Ordering::Release);
+                let ref_cnt = self.intermediate_ref_cnt.fetch_sub(1, Ordering::Release);
                 // fast-rejection path to ensure we are only trying to update if it's worth it:
                 // first check if there are no other references alive, then check if there are
                 // still updates pending.
@@ -480,10 +485,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             }
         }
 
-        SwapArcFullPtrGuard {
-            inner: val,
-            ptr,
-        }
+        SwapArcFullPtrGuard { inner: val, ptr }
     }
 
     /// This is what the docs are referring to as a `strong read` or
@@ -565,7 +567,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // ORDERING: This is `Release` in order to establish a happens-before relationship
                     // with loads of this counter and thus ensure that on the load of this counter
                     // the critical section (in this case the load of `intermediate_ref_cnt` and the load + store of `ptr`) has ended.
-                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::Release);
+                    self.curr_ref_cnt
+                        .fetch_and(!Self::UPDATE, Ordering::Release);
                     // drop the `virtual reference` we hold to the `D`
 
                     // SAFETY: we know that we hold a `virtual reference` to the `D`
@@ -581,7 +584,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // ORDERING: This is `Release` in order to establish a happens-before relationship
                     // with loads of this counter and thus ensure that on the load of this counter
                     // the critical section (in this case the loads of `ptr` and `intermediate_ptr`) has ended.
-                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::Release);
+                    self.curr_ref_cnt
+                        .fetch_and(!Self::UPDATE, Ordering::Release);
                 }
                 // unset the `weak` update flag from the intermediate ref cnt
 
@@ -627,8 +631,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 }
 
                 // FIXME: ordering comment
-                let metadata =
-                    Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire));
+                let metadata = Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire));
                 let update = Self::merge_ptr_and_metadata(update, metadata).cast_mut();
                 // FIXME: ordering comment
                 self.intermediate_ptr.store(update, Ordering::Release);
@@ -642,7 +645,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     .fetch_and(!Self::UPDATE, Ordering::Release);
                 // try finishing the update up
                 // FIXME: safety comment!
-                unsafe { self.update_curr(update); }
+                unsafe {
+                    self.update_curr(update);
+                }
             }
             Err(_) => {}
         }
@@ -782,7 +787,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // ORDERING: This is `Release` in order to establish a happens-before relationship
                     // with loads of this counter and thus ensure that on the load of this counter
                     // the critical section (in this case the load + store of `ptr`) has ended.
-                    self.curr_ref_cnt.fetch_and(!Self::UPDATE, Ordering::Release);
+                    self.curr_ref_cnt
+                        .fetch_and(!Self::UPDATE, Ordering::Release);
                     // unset the `weak` update flag to signal that new updates to
                     // `intermediate_ptr` are now permitted again
                     // we do this after updating the `curr_ref_cnt` as the `curr_ref_cnt`
@@ -852,7 +858,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         self.compare_exchange_inner::<true>(old, new)
     }
 
-    unsafe fn compare_exchange_inner<const IGNORE_META: bool>(&self, old: *const T, new: *const T) -> bool {
+    unsafe fn compare_exchange_inner<const IGNORE_META: bool>(
+        &self,
+        old: *const T,
+        new: *const T,
+    ) -> bool {
         use crate::ptr::map_addr;
 
         let old = if IGNORE_META {
@@ -872,7 +882,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 Self::UPDATE | Self::OTHER_UPDATE,
                 Ordering::Acquire,
                 Ordering::Relaxed,
-            ).is_ok() {
+            )
+            .is_ok()
+        {
             // back-off
             backoff.snooze();
         }
@@ -887,10 +899,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             // ORDERING: This is `Release` in order to establish a happens-before relationship
             // with loads of this counter and thus ensure that on the load of this counter
             // the critical section (in this case the load of `intermediate_ptr`) has ended.
-            self.intermediate_ref_cnt.fetch_and(
-                !(Self::UPDATE | Self::OTHER_UPDATE),
-                Ordering::Release,
-            );
+            self.intermediate_ref_cnt
+                .fetch_and(!(Self::UPDATE | Self::OTHER_UPDATE), Ordering::Release);
             return false;
         }
         // SAFETY: This is safe because we know that `new` points to a valid instance of `D`.
@@ -949,7 +959,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             match self.intermediate_ptr.compare_exchange_weak(
                 curr,
                 ptr::map_addr(curr, |x| (x & !Self::META_MASK) | prefix).cast_mut(),
-                Ordering::Release,// FIXME: is this ordering correct?
+                Ordering::Release, // FIXME: is this ordering correct?
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
@@ -1218,7 +1228,12 @@ cfg_if! {
     }
 }
 
-pub struct SwapArcGuard<'a, T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
+pub struct SwapArcGuard<
+    'a,
+    T: Send + Sync,
+    D: DataPtrConvert<T> = Arc<T>,
+    const METADATA_BITS: u32 = 0,
+> {
     parent: &'a LocalData<T, D, METADATA_BITS>,
     fake_ref: ManuallyDrop<D>,
     gen_cnt: usize,
