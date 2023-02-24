@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "swap-arc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "cfg-if",

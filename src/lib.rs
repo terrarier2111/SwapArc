@@ -87,17 +87,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
     /// Creates a new `SwapArc` instance with `val` as the initial value.
     pub fn new(val: D) -> Self {
-        // TODO: use `inline_const` once it gets stabilized in order to
-        // TODO: make sure it gets optimized away.
-        let free_bits = most_sig_set_bit(align_of::<T>()).unwrap_or(0);
-        if free_bits < METADATA_BITS {
-            let expected = 1 << METADATA_BITS;
-            let found = 1 << free_bits;
-            panic!(
-                "The alignment of T is insufficient, expected `{}`, but found `{}`",
-                expected, found
-            );
-        }
+        Self::ensure_sufficient_alignment();
+
         let virtual_ref = val.into_ptr();
         Self {
             curr_ref_cnt: Default::default(),
@@ -113,6 +104,19 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// reference count of the "object" `val` points to.
     #[cfg(feature = "ptr-ops")]
     pub unsafe fn new_raw(val: *const T) -> Self {
+        Self::ensure_sufficient_alignment();
+
+        Self {
+            curr_ref_cnt: Default::default(),
+            ptr: AtomicPtr::new(val.cast_mut()),
+            intermediate_ref_cnt: Default::default(),
+            intermediate_ptr: AtomicPtr::new(val.cast_mut()),
+            updated: AtomicPtr::new(null_mut()),
+            thread_local: ThreadLocal::new(),
+        }
+    }
+
+    fn ensure_sufficient_alignment() {
         // TODO: use `inline_const` once it gets stabilized in order to
         // TODO: make sure it gets optimized away.
         let free_bits = most_sig_set_bit(align_of::<T>()).unwrap_or(0);
@@ -123,14 +127,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 "The alignment of T is insufficient, expected `{}`, but found `{}`",
                 expected, found
             );
-        }
-        Self {
-            curr_ref_cnt: Default::default(),
-            ptr: AtomicPtr::new(val.cast_mut()),
-            intermediate_ref_cnt: Default::default(),
-            intermediate_ptr: AtomicPtr::new(val.cast_mut()),
-            updated: AtomicPtr::new(null_mut()),
-            thread_local: ThreadLocal::new(),
         }
     }
 
