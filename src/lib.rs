@@ -416,18 +416,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         self.load().deref().clone()
     }
 
-    /// Returns a mutable reference to the most recent value.
-    /// This returns an Option in case there is no value present
-    /// for example because the `D` is an `Option<Arc<T>>` and the
-    /// currently stored value is `None`.
-    #[inline]
-    pub fn get_mut(&mut self) -> Option<&mut T> {
-        // SAFETY: This is safe because we know that the value currently stored
-        // inside `intermediate_ptr` has to either point to a valid instance
-        // of `T` or be `null` in which case we just return `None`.
-        unsafe { self.intermediate_ptr.load(Ordering::Acquire).as_mut() }
-    }
-
     /// Loads the pointer with metadata into a guard which protects it weakly.
     /// The protection offered by this method is the same as the protection
     /// offered by `load`.
