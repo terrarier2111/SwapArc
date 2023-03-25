@@ -217,6 +217,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         // left to this (thread-)local instance
                         data.new.refill_unchecked(new_ptr);
                     } else {
+                        // FIXME: add safety comment!
                         let new = unsafe { LocalCounted::new(data, new_ptr) };
                         data.new = new;
                     }
@@ -372,6 +373,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     if data.intermediate.gen_cnt != 0 {
                         data.intermediate.refill_unchecked(loaded);
                     } else {
+                        // FIXME: add safety comment!
                         let new = unsafe { LocalCounted::new(data, loaded) };
                         data.intermediate = new;
                     }
@@ -449,6 +451,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     pub fn load_raw_full(&self) -> SwapArcFullPtrGuard<T, D, METADATA_BITS> {
         let (ptr, src) = self.load_internal();
 
+        // FIXME: add safety comment!
         let val = ManuallyDrop::new(unsafe { D::from(ptr) });
         let val = ManuallyDrop::into_inner(val.clone());
 
@@ -1430,7 +1433,7 @@ unsafe impl<T: Send + Sync, D: DataPtrConvert<T>> Sync for LocalCounted<T, D> {}
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
     /// SAFETY: The caller has to ensure that the safety invariants relied upon
-    /// in the `val`, `refill_unchecked` and `drop` methods are valid.
+    /// in the `val`, `refill_unchecked` and `drop` methods are being upheld.
     unsafe fn new(parent: &mut LocalDataInner<T, D>, ptr: *const T) -> Self {
         let gen_cnt = parent.next_gen_cnt;
         let res = parent.next_gen_cnt.overflowing_add(1);
@@ -1455,8 +1458,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, 
     fn refill_unchecked(&mut self, ptr: *const T) {
         if DROP {
             if !self.ptr.is_null() {
-                // SAFETY: the person defining this struct has to make sure that
-                // choosing `DROP` is correct.
+                // SAFETY: the burden of ensuring that choosing `DROP` is correct
+                // is being placed upon whoever instantiates this struct.
                 unsafe {
                     D::from(self.ptr);
                 }
