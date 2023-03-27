@@ -1,4 +1,4 @@
-use crossbeam_utils::CachePadded;
+use crossbeam_utils::{Backoff, CachePadded};
 use std::alloc::{alloc, dealloc, Layout, LayoutError};
 use std::cell::UnsafeCell;
 use std::mem::{align_of, size_of, ManuallyDrop};
@@ -44,6 +44,7 @@ impl<T: Send + Sync> AutoLocalArc<T> {
                         thread_id: thread_id(),
                         src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
                         finish_cnt: AtomicUsize::new(0),
+                        finished: AtomicBool::new(false),
                     }))
                     .into_ptr()
                     .as_ptr(),
@@ -104,6 +105,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                             thread_id: tid,
                             ref_cnt: AtomicUsize::new(0),
                             finish_cnt: AtomicUsize::new(0),
+                            finished: AtomicBool::new(false),
                         }))
                         .into_ptr()
                         .as_ptr(),
@@ -304,6 +306,13 @@ struct InnerArc<T: Send + Sync> {
 impl<T: Send + Sync> Drop for InnerArc<T> {
     #[inline]
     fn drop(&mut self) {
+        // wait for all caches to finish.
+        for cache in self.cache.iter() {
+            let mut backoff = Backoff::new();
+            while !unsafe { &*cache.0 }.finished.load(Ordering::Acquire) {
+                backoff.snooze();
+            }
+        }
         // use `Release` in order to make sure all usages of the internal value happen before this
         self.dropping.store(true, Ordering::Release);
     }
@@ -317,6 +326,7 @@ struct Cache<T: Send + Sync> {
     debt: AtomicUsize, // this debt count may only be updated by threads other than the current one - this has a `detached` flag as its last bit
     ref_cnt: AtomicUsize, // this ref cnt may only be updated by the current thread
     finish_cnt: AtomicUsize,
+    finished: AtomicBool,
 }
 
 impl<T: Send + Sync> Cache<T> {
@@ -360,10 +370,15 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
             unsafe { &*cache }
                 .debt
                 .fetch_or(DETACHED_FLAG, Ordering::AcqRel);
+            unsafe { &*cache }.finished.store(true, Ordering::Release);
             fence(Ordering::Acquire);
+
             // we are the first "(cache) node", so we need to free the memory
             unsafe {
-                drop_slow::<T>(unsafe { &*cache }.parent.cast_mut());
+                drop_slow::<T>(unsafe { &*cache }.parent.cast_mut()); // FIXME: there's a bug in here because
+                                                                          // FIXME: the dropping flag is aliased by the mut
+                                                                          // FIXME: reference to the cache when the reference to the
+                                                                          // FIXME: guard gets created.
             }
 
             #[cold]
@@ -422,6 +437,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
 
                     super_cache.finish_cnt.fetch_add(1, Ordering::AcqRel);
                 }
+                unsafe { cache.as_ref().unwrap() }.finished.store(true, Ordering::Release);
             }
         }
     }
