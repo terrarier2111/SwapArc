@@ -1,11 +1,11 @@
 use crossbeam_utils::{Backoff, CachePadded};
 use std::alloc::{alloc, dealloc, Layout, LayoutError};
 use std::cell::UnsafeCell;
-use std::mem::{align_of, size_of, ManuallyDrop};
+use std::mem::{align_of, size_of, ManuallyDrop, transmute};
 use std::ops::Deref;
 use std::process::abort;
 use std::ptr::{null_mut, NonNull};
-use std::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering, AtomicU8};
 use std::{mem, ptr, thread};
 use thread_local::ThreadLocal;
 
@@ -43,8 +43,7 @@ impl<T: Send + Sync> AutoLocalArc<T> {
                         debt: AtomicUsize::new(0),
                         thread_id: thread_id(),
                         src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
-                        finish_cnt: AtomicUsize::new(0),
-                        finished: AtomicBool::new(false),
+                        finished: AtomicUsize::new(FinishedMsg::default().0),
                     }))
                     .into_ptr()
                     .as_ptr(),
@@ -64,9 +63,9 @@ impl<T: Send + Sync> AutoLocalArc<T> {
     }
 }
 
-/// We have to choose a lower highest ref cnt than the std lib as we are using the last bit to store metadata
+/// We have to choose a lower highest ref cnt than the std lib as we are using the last 2 bits to store metadata
 const MAX_SOFT_REFCOUNT: usize = MAX_HARD_REFCOUNT / 2;
-const MAX_HARD_REFCOUNT: usize = isize::MAX as usize / 2;
+const MAX_HARD_REFCOUNT: usize = isize::MAX as usize / 2.pow(2);
 
 impl<T: Send + Sync> Clone for AutoLocalArc<T> {
     #[inline]
@@ -104,8 +103,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                             debt: AtomicUsize::new(0),
                             thread_id: tid,
                             ref_cnt: AtomicUsize::new(0),
-                            finish_cnt: AtomicUsize::new(0),
-                            finished: AtomicBool::new(false),
+                            finished: AtomicUsize::new(FinishedMsg::default().0),
                         }))
                         .into_ptr()
                         .as_ptr(),
@@ -122,7 +120,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 if debt > 0 {
                     // we have a retry loop here in case the debt's updater hasn't finished yet
                     let mut finish_cnt = local_cache.wait_for::<false>(ref_cnt);
-                    if !is_deleted(finish_cnt) {
+                    if finish_cnt.ty() != FinishedMsgTy::Seen {
                         println!("battle race!");
                         // the other thread didn't see our increment in time, so we have to wait!
                         cleanup_cache::<true, T>(local_cache_ptr, local_cache.guard(), false);
@@ -158,7 +156,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     if debt > 0 {
                         // we have a retry loop here in case the debt's updater hasn't finished yet
                         let finish_cnt = local_cache.wait_for::<false>(ref_cnt);
-                        if !is_deleted(finish_cnt) {
+                        if finish_cnt.ty() != FinishedMsgTy::Seen {
                             println!("battle race!");
                             // the other thread didn't see our increment in time, so we have to wait!
                             cleanup_cache::<true, T>(local_cache_ptr, local_cache.guard(), false);
@@ -172,7 +170,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     local_cache.ref_cnt.store(2, Ordering::Release);
                     // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
                     local_cache.debt.store(0, Ordering::Release);
-                    local_cache.finish_cnt.store(0, Ordering::Release);
+                    local_cache.finished.store(FinishedMsg::default().0, Ordering::Release);
                     // remove the reference to the external cache, as we moved it to our own cache instead
                     *unsafe { &mut *self.cache.get() } = local_cache_ptr;
                 }
@@ -234,7 +232,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             if ref_cnt == strip_flags(debt) {
                 // we have a retry loop here in case the debt's updater hasn't finished yet
                 let finish_cnt = cache.wait_for::<false>(ref_cnt);
-                if !is_deleted(finish_cnt) {
+                if finish_cnt.ty() != FinishedMsgTy::Seen {
                     // we know that the thread we waited on freed the reference
                     let guard = cache.guard();
                     drop(cache);
@@ -309,13 +307,62 @@ impl<T: Send + Sync> Drop for InnerArc<T> {
         // wait for all caches to finish.
         for cache in self.cache.iter() {
             let mut backoff = Backoff::new();
-            while !unsafe { &*cache.0 }.finished.load(Ordering::Acquire) {
+            while FinishedMsg(unsafe { &*cache.0 }.finished.load(Ordering::Acquire)).ty() != FinishedMsgTy::Finished {
                 backoff.snooze();
             }
         }
         // use `Release` in order to make sure all usages of the internal value happen before this
         self.dropping.store(true, Ordering::Release);
     }
+}
+
+#[derive(Copy, Clone, PartialEq, Default)]
+#[repr(usize)]
+enum FinishedMsgTy {
+    #[default]
+    NotFinished = 0,
+    Finished = 1,
+    NotSeen = 2,
+    Seen = 3,
+}
+
+impl FinishedMsgTy {
+
+    #[inline]
+    fn into_raw(self) -> usize {
+        self as usize
+    }
+
+    #[inline]
+    unsafe fn from_raw(raw: usize) -> Self {
+        transmute(raw)
+    }
+
+}
+
+const FINISHED_MSG_TY_MASK: usize = (1 << (usize::BITS - 1)) | (1 << (usize::BITS - 2));
+const FINISHED_MSG_TY_OFFSET: u32 = usize::BITS - 2;
+
+#[derive(Copy, Clone, Default)]
+struct FinishedMsg(usize);
+
+impl FinishedMsg {
+
+    #[inline]
+    fn new(id: usize, ty: FinishedMsgTy) -> Self {
+        Self(id | (ty.into_raw() << FINISHED_MSG_TY_OFFSET))
+    }
+
+    #[inline]
+    fn ty(self) -> FinishedMsgTy {
+        unsafe { FinishedMsgTy::from_raw((self.0 & FINISHED_MSG_TY_MASK) >> FINISHED_MSG_TY_OFFSET) }
+    }
+
+    #[inline]
+    fn id(self) -> usize {
+        self.0 & !FINISHED_MSG_TY_MASK
+    }
+
 }
 
 #[repr(C)]
@@ -325,8 +372,7 @@ struct Cache<T: Send + Sync> {
     src: AtomicPtr<CachePadded<Cache<T>>>,
     debt: AtomicUsize, // this debt count may only be updated by threads other than the current one - this has a `detached` flag as its last bit
     ref_cnt: AtomicUsize, // this ref cnt may only be updated by the current thread
-    finish_cnt: AtomicUsize,
-    finished: AtomicBool,
+    finished: AtomicUsize, // this contains the finish_cnt of the messenger and the message type in the last two bits (see `Finished` for their meaning)
 }
 
 impl<T: Send + Sync> Cache<T> {
@@ -339,13 +385,13 @@ impl<T: Send + Sync> Cache<T> {
         }
     }
 
-    fn wait_for<const OWNS_LOCAL_REF: bool>(&self, ref_cnt: usize) -> usize {
-        let mut finish_cnt = self.finish_cnt.load(Ordering::Acquire);
+    fn wait_for<const OWNS_LOCAL_REF: bool>(&self, ref_cnt: usize) -> FinishedMsg {
+        let mut finish_msg = FinishedMsg(self.finished.load(Ordering::Acquire));
         let local_add = if OWNS_LOCAL_REF { 1 } else { 0 };
-        while ref_cnt != strip_flags(finish_cnt) + local_add {
-            finish_cnt = self.finish_cnt.load(Ordering::Acquire);
+        while ref_cnt != finish_msg.id() + local_add {
+            finish_msg = FinishedMsg(self.finished.load(Ordering::Acquire));
         }
-        finish_cnt
+        finish_msg
     }
 }
 
@@ -370,7 +416,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
             unsafe { &*cache }
                 .debt
                 .fetch_or(DETACHED_FLAG, Ordering::AcqRel);
-            unsafe { &*cache }.finished.store(true, Ordering::Release);
+            // unsafe { &*cache }.finished.store(FinishedMsg::new(debt, FinishedMsgTy::Finished).0, Ordering::Release); // FIXME: do we need this?
             fence(Ordering::Acquire);
 
             // we are the first "(cache) node", so we need to free the memory
@@ -424,20 +470,14 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
 
                         // fence(Ordering::AcqRel);
                         super_cache
-                            .finish_cnt
-                            .store(strip_flags(debt) | DELETION_FLAG, Ordering::Release);
+                            .finished
+                            .store(FinishedMsg::new(debt, FinishedMsgTy::Finished).0, Ordering::Release);
+                    } else {
+                        super_cache.finished.store(FinishedMsg::new(debt, FinishedMsgTy::NotFinished).0, Ordering::Release);
                     }
                     // fence(Ordering::AcqRel);
-                } else {
-                    // println!("other add from thread {} for thread {} refs {} debt {}", thread_id(), super_cache.thread_id, ref_cnt, debt);
-                    // println!("other add for thread {} refs {} debt {}", super_cache.thread_id, ref_cnt, debt);
-                    // println!("other add refs {} debt {}", ref_cnt, debt);
-                    // fence(Ordering::AcqRel);
-
-
-                    super_cache.finish_cnt.fetch_add(1, Ordering::AcqRel);
                 }
-                unsafe { cache.as_ref().unwrap() }.finished.store(true, Ordering::Release);
+                // unsafe { cache.as_ref().unwrap() }.finished.store(FinishedMsg::new(debt, FinishedMsgTy::Finished).0, Ordering::Release); // FIXME: do we have to do this?
             }
         }
     }
@@ -450,12 +490,20 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
     detached
 }
 
+struct Metadata {
+    thread_id: AtomicUsize,
+    ref_cnt: AtomicUsize,
+}
+
 unsafe impl<T: Send + Sync> Send for Cache<T> {}
 unsafe impl<T: Send + Sync> Sync for Cache<T> {}
 
 #[derive(Clone)]
 #[repr(transparent)]
 struct DetachablePtr<T: Send + Sync>(*mut CachePadded<Cache<T>>);
+
+unsafe impl<T: Send + Sync> Send for DetachablePtr<T> {}
+unsafe impl<T: Send + Sync> Sync for DetachablePtr<T> {}
 
 /*
 impl<T: Send + Sync> DetachablePtr<T> {
@@ -500,8 +548,6 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
         }
     }
 }
-
-unsafe impl<T: Send + Sync> Send for DetachablePtr<T> {}
 
 #[inline]
 fn thread_id() -> u64 {
