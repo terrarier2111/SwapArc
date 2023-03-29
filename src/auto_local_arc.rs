@@ -120,7 +120,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     if finish_cnt.ty() != FinishedMsgTy::Deleted && finish_cnt.ty() != FinishedMsgTy::Finished {
                         println!("battle race!");
                         // the other thread didn't see our increment in time, so we have to wait!
-                        cleanup_cache::<true, T>(local_cache_ptr, false);
+                        cleanup_cache::<true, T>(local_cache_ptr, false, finish_cnt.id());
                     }
                 }
                 // the local cache has no valid references anymore
@@ -156,7 +156,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                         if finish_cnt.ty() != FinishedMsgTy::Deleted {
                             println!("battle race!");
                             // the other thread didn't see our increment in time, so we have to wait!
-                            cleanup_cache::<true, T>(local_cache_ptr, false);
+                            cleanup_cache::<true, T>(local_cache_ptr, false, finish_cnt.id());
                         }
                     }
                     println!("racing load!");
@@ -202,7 +202,8 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
     fn drop(&mut self) {
         let cache_ptr = unsafe { *self.cache.get() };
         let cache = unsafe { &*cache_ptr };
-        if cache.thread_id == thread_id() {
+        let tid = thread_id();
+        if cache.thread_id == tid {
             if cache.thread_id == 0 {
                println!("start dropping local!");
                 for _ in 0..10 {
@@ -229,11 +230,11 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             if ref_cnt == strip_flags(debt) {
                 // we have a retry loop here in case the debt's updater hasn't finished yet
                 let finish_cnt = cache.wait_for::<false>(ref_cnt);
-                if finish_cnt.ty() != FinishedMsgTy::Deleted {
+                if finish_cnt.ty() != FinishedMsgTy::Deleted && finish_cnt.ty() != FinishedMsgTy::Finished {
                     // we know that the thread we waited on freed the reference
                     drop(cache);
                     // there are no external refs alive
-                    cleanup_cache::<true, T>(cache_ptr, is_detached(debt));
+                    cleanup_cache::<true, T>(cache_ptr, is_detached(debt), finish_cnt.id());
                 } else {
                     // FIXME: do we have to do smth here?
                     println!("weird other thingy \"smth\"!");
@@ -252,20 +253,17 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
                 // FIXME: so what we need to do is add further validation after this check
                 // FIXME: this is probably in form of HazardPointers or the like
                 // we have a retry loop here in case the debt's updater hasn't finished yet
-                let _finish_cnt = cache.wait_for::<true>(ref_cnt);
+                let finish_cnt = cache.wait_for::<true>(ref_cnt);
 
                 // FIXME: NEW: there is probably a race condition here - what if cache's owner increases its reference count here
                 // FIXME: and we free its cache just down below?
 
                 drop(cache);
                 // there are no external refs alive
-                if !cleanup_cache::<true, T>(cache_ptr, is_detached(debt)) {
-                    let ty = if is_detached(debt) {
-                        FinishedMsgTy::Deleted
-                    } else {
-                        FinishedMsgTy::Finished
-                    };
-                    cache.finished.store(FinishedMsg::new(ref_cnt, ty).0, Ordering::Release);
+                if !cleanup_cache::<true, T>(cache_ptr, is_detached(debt), finish_cnt.id()) {
+                    cache.finished.store(FinishedMsg::new(ref_cnt, FinishedMsgTy::Finished).0, Ordering::Release);
+                } else {
+                    cache.finished.store(FinishedMsg::new(ref_cnt, FinishedMsgTy::Deleted).0, Ordering::Release);
                 }
             }
         }
@@ -297,10 +295,15 @@ struct InnerArc<T: Send + Sync> {
 impl<T: Send + Sync> Drop for InnerArc<T> {
     #[inline]
     fn drop(&mut self) {
+        println!("dropping central struct!");
         // wait for all caches to finish.
         for cache in self.cache.iter() {
             let mut backoff = Backoff::new();
-            while FinishedMsg(unsafe { &*cache.0.unwrap().as_ptr() }.finished.load(Ordering::Acquire)).ty() != FinishedMsgTy::Finished {
+            loop {
+                let msg = FinishedMsg(unsafe { &*cache.0.unwrap().as_ptr() }.finished.load(Ordering::Acquire));
+                if msg.ty() == FinishedMsgTy::Finished || msg.ty() == FinishedMsgTy::Deleted { // FIXME: do we need to accept `Deleted` as well?
+                    break;
+                }
                 backoff.snooze();
             }
         }
@@ -385,7 +388,9 @@ impl<T: Send + Sync> Cache<T> {
 fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
     cache: *const CachePadded<Cache<T>>,
     detached: bool,
+    msg_id: usize,
 ) -> bool {
+    println!("cleanup cache {}", detached);
     if UPDATE_SUPER {
         // FIXME: when freeing the own memory, we still have a reference to it and thus UB
         // FIXME: the same thing is the case when freeing the major allocation
@@ -402,15 +407,12 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
             unsafe { &*cache }
                 .debt
                 .fetch_or(DETACHED_FLAG, Ordering::AcqRel);
-            // unsafe { &*cache }.finished.store(FinishedMsg::new(debt, FinishedMsgTy::Finished).0, Ordering::Release); // FIXME: do we need this?
+            unsafe { &*cache }.finished.store(FinishedMsg::new(msg_id, FinishedMsgTy::Finished).0, Ordering::Release);
             fence(Ordering::Acquire);
 
             // we are the first "(cache) node", so we need to free the memory
             unsafe {
-                drop_slow::<T>(unsafe { &*cache }.parent.cast_mut()); // FIXME: there's a bug in here because
-                                                                          // FIXME: the dropping flag is aliased by the mut
-                                                                          // FIXME: reference to the cache when the reference to the
-                                                                          // FIXME: guard gets created.
+                drop_slow::<T>(unsafe { &*cache }.parent.cast_mut());
             }
 
             #[cold]
@@ -441,30 +443,22 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
             // check if we should cleanup the super cache
             if strip_flags(debt) == ref_cnt {
                 // we have a retry loop here in case the debt's updater hasn't finished yet
-                let _finish_cnt = super_cache.wait_for::<true>(ref_cnt); // FIXME: can a data race occur here?
+                let finish_cnt = super_cache.wait_for::<true>(ref_cnt); // FIXME: can a data race occur here?
                 // fence(Ordering::AcqRel);
 
                 drop(super_cache);
 
                 fence(Ordering::AcqRel);
-                if !cleanup_cache::<true, T>(super_cache_ptr, super_detached) {
+                if !cleanup_cache::<true, T>(super_cache_ptr, super_detached, finish_cnt.id()) {
                     // we only update the finish_cnt if the cleanup performed isn't final
                     // i.e if the backing allocation wasn't freed.
 
                     // fence(Ordering::AcqRel);
                     super_cache
                         .finished
-                        .store(FinishedMsg::new(debt, if super_detached {
-                            FinishedMsgTy::Deleted
-                        } else {
-                            FinishedMsgTy::Finished
-                        }).0, Ordering::Release);
+                        .store(FinishedMsg::new(debt, FinishedMsgTy::Finished).0, Ordering::Release);
                 } else {
-                    super_cache.finished.store(FinishedMsg::new(debt, if super_detached {
-                        FinishedMsgTy::NotDeleted
-                    } else {
-                        FinishedMsgTy::NotFinished
-                    }).0, Ordering::Release);
+                    super_cache.finished.store(FinishedMsg::new(debt, FinishedMsgTy::Deleted).0, Ordering::Release);
                 }
                 // fence(Ordering::AcqRel);
             }
@@ -499,7 +493,7 @@ impl<T: Send + Sync> DetachablePtr<T> {
 
     unsafe fn cleanup(&mut self) {
         if let Some(cache) = self.0.take() {
-            cleanup_cache::<false, T>(cache.as_ptr(), true);
+            cleanup_cache::<false, T>(cache.as_ptr(), true, 0);
         }
     }
 
@@ -529,7 +523,7 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
                 let cache_ptr = cache_ptr.as_ptr();
                 drop(cache);
                 fence(Ordering::AcqRel);
-                cleanup_cache::<false, T>(cache_ptr, true); // FIXME: do we have to set a marker here?
+                cleanup_cache::<false, T>(cache_ptr, true, 0); // FIXME: do we have to set a marker here?
             }
         }
     }
