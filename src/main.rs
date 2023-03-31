@@ -121,12 +121,12 @@ fn main() {
     // let tmp = AutoLocalArc::new(3);
     let tmp = AutoLocalArc::new(3);
     let mut threads = vec![];
-    for _ in 0../*1*//*6*//*8*/7
+    for _ in 0../*1*//*6*//*8*/1
     /*20*//*5*//*1*/
     {
         let tmp = tmp.clone();
         threads.push(thread::spawn(move || {
-            for _ in 0..4000
+            for _ in 0..1
             /*200000*//*200*/
             {
                 let l1 = tmp.clone();

@@ -63,7 +63,7 @@ impl<T: Send + Sync> AutoLocalArc<T> {
 
 /// We have to choose a lower highest ref cnt than the std lib as we are using the last 2 bits to store metadata
 const MAX_SOFT_REFCOUNT: usize = MAX_HARD_REFCOUNT / 2;
-const MAX_HARD_REFCOUNT: usize = isize::MAX as usize / 2_usize.pow(2);
+const MAX_HARD_REFCOUNT: usize = usize::MAX / 2 / 2_usize.pow(2);
 
 impl<T: Send + Sync> Clone for AutoLocalArc<T> {
     #[inline]
@@ -83,7 +83,20 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     handle_large_ref_count(cache, ref_cnt);
                 }
             }
+
+            let guessed_debt = cache.debt.load(Ordering::Acquire);
+
             cache.ref_cnt.store(ref_cnt + 1, Ordering::Release);
+
+            let checked_debt = cache.debt.load(Ordering::Acquire);
+
+            if guessed_debt != checked_debt {
+                // there is a potential for a race, store the previous debt as an indicator to wait for
+                // on destruction of the cache
+
+                // self.wait_for.store(guessed_debt, Ordering::Release);
+            }
+
             cache_ptr
         } else {
             // we aren't the owner, now we have to do some more work
@@ -229,7 +242,12 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             // TODO: we could add a fastpath here for debt == 0
             if ref_cnt == strip_flags(debt) {
                 // we have a retry loop here in case the debt's updater hasn't finished yet
-                let finish_cnt = cache.wait_for::<false>(ref_cnt);
+                println!("waiting for... refs {} debt {}", ref_cnt, debt);
+                // let finish_cnt = cache.wait_for::<false>(ref_cnt);
+                let finish_cnt = cache.finished.compare_exchange(0,
+                                                                 FinishedMsg::new(ref_cnt, FinishedMsgTy::Finished).0,
+                                                                 Ordering::Release, Ordering::Relaxed);
+                println!("finished waiting for refs {} debt {}", ref_cnt, debt);
                 if finish_cnt.ty() != FinishedMsgTy::Deleted && finish_cnt.ty() != FinishedMsgTy::Finished {
                     // we know that the thread we waited on freed the reference
                     drop(cache);
@@ -379,6 +397,7 @@ impl<T: Send + Sync> Cache<T> {
         let mut finish_msg = FinishedMsg(self.finished.load(Ordering::Acquire));
         let local_add = if OWNS_LOCAL_REF { 1 } else { 0 };
         while ref_cnt != finish_msg.id() + local_add {
+            println!("wait curr: got {} expected {}", finish_msg.id(), ref_cnt);
             finish_msg = FinishedMsg(self.finished.load(Ordering::Acquire));
         }
         finish_msg
