@@ -126,7 +126,7 @@ fn main() {
     {
         let tmp = tmp.clone();
         threads.push(thread::spawn(move || {
-            for _ in 0..4000
+            for _ in 0..400
             /*200000*//*200*/
             {
                 let l1 = tmp.clone();
