@@ -8,6 +8,7 @@ use std::ptr::{null_mut, NonNull};
 use std::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering, AtomicU8, AtomicU64};
 use std::{mem, ptr, thread};
 use lazy_static::lazy_static;
+use likely_stable::unlikely;
 use thread_local::ThreadLocal;
 
 // FIXME: NOTE: the version of thread_local that is used changes the behavior of this!
@@ -90,7 +91,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             // we aren't the owner, now we have to do some more work
 
             let inner = self.inner;
-            let (local_cache_ptr, meta) = unsafe { self
+            let (local_cache_ptr, local_meta) = unsafe { self
                 .inner()
                 .cache
                 .get_val_and_meta_or(|| {
@@ -110,18 +111,17 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             let local_cache_ptr = unsafe { local_cache_ptr.0.unwrap_unchecked() };
             let local_cache = unsafe { local_cache_ptr.as_ref() };
             // the ref count here can't change, as we are the only thread which is able to access it.
-            let ref_cnt = meta.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
-            let debt = meta.debt.load(Ordering::Acquire);
+            let ref_cnt = local_meta.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
+            let debt = local_meta.debt.load(Ordering::Acquire);
 
             // check if the local cache's instance is still valid.
             if ref_cnt == debt {
                 if debt > 0 {
                     // we have a retry loop here in case the debt's updater hasn't finished yet
-                    let mut finish_cnt = local_cache.wait_for::<false>(ref_cnt);
-                    if finish_cnt.ty() != FinishedMsgTy::Deleted && finish_cnt.ty() != FinishedMsgTy::Finished {
-                        println!("battle race!");
-                        // the other thread didn't see our increment in time, so we have to wait!
-                        cleanup_cache::<true, T>(local_cache_ptr, false);
+                    let mut backoff = Backoff::new();
+                    // wait for the other thread to clean up
+                    while local_meta.thread_id.load(Ordering::Acquire) != INVALID_TID {
+                        backoff.snooze();
                     }
                 }
                 // the local cache has no valid references anymore
@@ -131,6 +131,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 meta.ref_cnt.store(2, Ordering::Release);
                 // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
                 meta.debt.store(0, Ordering::Release);
+                meta.thread_id.store(tid, Ordering::Release);
                 // remove the reference to the external cache, as we moved it to our own cache instead
                 *unsafe { &mut *self.cache.get() } = local_cache_ptr;
             } else {
@@ -152,11 +153,10 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 if debt == ref_cnt {
                     if debt > 0 {
                         // we have a retry loop here in case the debt's updater hasn't finished yet
-                        let finish_cnt = local_cache.wait_for::<false>(ref_cnt);
-                        if finish_cnt.ty() != FinishedMsgTy::Deleted {
-                            println!("battle race!");
-                            // the other thread didn't see our increment in time, so we have to wait!
-                            cleanup_cache::<true, T>(local_cache_ptr, false);
+                        let mut backoff = Backoff::new();
+                        // wait for the other thread to clean up
+                        while local_meta.thread_id.load(Ordering::Acquire) != INVALID_TID {
+                            backoff.snooze();
                         }
                     }
                     println!("racing load!");
@@ -167,6 +167,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     meta.ref_cnt.store(2, Ordering::Release);
                     // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
                     meta.debt.store(0, Ordering::Release);
+                    meta.thread_id.store(tid, Ordering::Release);
                     // remove the reference to the external cache, as we moved it to our own cache instead
                     *unsafe { &mut *self.cache.get() } = local_cache_ptr;
                 }
@@ -193,7 +194,8 @@ unsafe fn handle_large_ref_count<T: Send + Sync>(cache: *mut CachePadded<Cache<T
     // note: the `detached` flag can't be set because this method is only called with the `local_cache` as the `cache` parameter
     let debt = meta.debt.swap(0, Ordering::Relaxed); // FIXME: can the lack of synchronization between these two updates lead to race conditions?
     let ref_cnt = ref_cnt - debt;
-    meta.ref_cnt.store(ref_cnt, Ordering::Relaxed);
+    meta
+        .ref_cnt.store(ref_cnt, Ordering::Relaxed);
     if ref_cnt > MAX_HARD_REFCOUNT {
         abort();
     }
@@ -201,7 +203,8 @@ unsafe fn handle_large_ref_count<T: Send + Sync>(cache: *mut CachePadded<Cache<T
 
 impl<T: Send + Sync> Drop for AutoLocalArc<T> {
     #[inline]
-    fn drop(&mut self) {
+    fn drop(
+        &mut self) {
         let cache_ptr = unsafe { *self.cache.get() };
         let cache = unsafe { cache_ptr.as_ref() };
         let meta_ptr = unsafe { cache_ptr.as_ptr().cast::<Metadata>().byte_offset(ThreadLocal::<CachePadded<Cache<T>>, Metadata>::val_to_meta_offset()) };
@@ -234,23 +237,14 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             // println!("debt: {}\nref_cnt: {}", strip_flags(debt), ref_cnt);
             // TODO: we could add a fastpath here for debt == 0
             if ref_cnt == strip_flags(debt) {
-                // we have a retry loop here in case the debt's updater hasn't finished yet
-                let finish_cnt = cache.wait_for::<false>(ref_cnt);
-                if finish_cnt.ty() != FinishedMsgTy::Deleted && finish_cnt.ty() != FinishedMsgTy::Finished {
-                    // we know that the thread we waited on freed the reference
-                    drop(cache);
-                    // there are no external refs alive
-                    cleanup_cache::<true, T>(cache_ptr, is_detached(debt));
-                } else {
-                    // FIXME: do we have to do smth here?
-                    println!("weird other thingy \"smth\"!");
-                }
+                cleanup_cache::<true, T>(cache_ptr, is_detached(debt), tid); // FIXME: we don't need to check for an expected TID here.
             }
             guard.store(null_mut(), Ordering::Release);
         } else {
             println!("non-local cache ptr drop!");
             let guard = GUARDS.get_or_default();
             guard.store(cache_ptr.as_ptr().cast(), Ordering::Release);
+            let cache_tid = cache.thread_id;
             let debt = meta.debt.fetch_add(1, Ordering::AcqRel) + 1;
             if strip_flags(debt) > MAX_HARD_REFCOUNT {
                 abort();
@@ -258,18 +252,13 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             fence(Ordering::Acquire);
             let ref_cnt = unsafe { (cache as *const CachePadded<Cache<T>>).cast::<Metadata>().byte_offset(ThreadLocal::<CachePadded<Cache<T>>, Metadata>::val_to_meta_offset()).as_ref().unwrap_unchecked() }.ref_cnt.load(Ordering::Acquire);
             if strip_flags(debt) == ref_cnt {
-                // FIXME: ref_cnt can probably race with `debt` here
-                // FIXME: so what we need to do is add further validation after this check
-                // FIXME: this is probably in form of HazardPointers or the like
-                // we have a retry loop here in case the debt's updater hasn't finished yet
-                let finish_cnt = cache.wait_for::<true>(ref_cnt);
 
                 // FIXME: NEW: there is probably a race condition here - what if cache's owner increases its reference count here
                 // FIXME: and we free its cache just down below?
 
                 drop(cache);
                 // there are no external refs alive
-                cleanup_cache::<true, T>(cache_ptr, is_detached(debt));
+                cleanup_cache::<true, T>(cache_ptr, is_detached(debt), cache_tid);
             }
             guard.store(null_mut(), Ordering::Release);
         }
@@ -381,7 +370,15 @@ impl<T: Send + Sync> Cache<T> {
 fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
     cache: NonNull<CachePadded<Cache<T>>>,
     detached: bool,
+    exp_tid: u64,
 ) -> bool {
+    let meta_ptr = unsafe { cache.as_ptr().cast::<Metadata>().byte_offset(ThreadLocal::<CachePadded<Cache<T>>, Metadata>::val_to_meta_offset()) };
+    let meta = unsafe { &*meta_ptr };
+
+    if unlikely(meta.thread_id.compare_exchange(exp_tid, INVALID_TID, Ordering::AcqRel, Ordering::Relaxed).is_err()) {
+        return false;
+    }
+
     println!("cleanup cache {}", detached);
     if UPDATE_SUPER {
         // FIXME: when freeing the own memory, we still have a reference to it and thus UB
@@ -421,6 +418,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
             let super_cache = unsafe { super_cache_ptr.as_ref() };
             let super_meta_ptr = unsafe { src.cast::<Metadata>().byte_offset(ThreadLocal::<CachePadded<Cache<T>>, Metadata>::val_to_meta_offset()) };
             let super_meta = unsafe { &*super_meta_ptr };
+            let super_tid = super_cache.thread_id;
             let debt = super_meta.debt.fetch_add(1, Ordering::AcqRel) + 1; // we add 1 at the end to make sure we use the post-update value
             /*// this fence protects the following load of `ref_cnt` from being moved before the guard increment.
             fence(Ordering::Acquire);*/
@@ -435,26 +433,13 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
             // FIXME: the entries in order to get rid of this last fetch_add
             let ref_cnt = super_meta.ref_cnt.load(Ordering::Acquire);
 
-            // check if we should cleanup the super cache
-            if strip_flags(debt) == ref_cnt {
-                // we have a retry loop here in case the debt's updater hasn't finished yet
-                let finish_cnt = super_cache.wait_for::<true>(ref_cnt); // FIXME: can a data race occur here?
-                // fence(Ordering::AcqRel);
-
+            // check if we should cleanup the super cache by first checking the reference count and then checking if
+            // the super cache cleaned up by itself
+            if strip_flags(debt) == ref_cnt/* && super_thread_id == super_meta.thread_id.load(Ordering::Acquire)*/ {
                 drop(super_cache);
 
                 fence(Ordering::AcqRel);
-                if !cleanup_cache::<true, T>(super_cache_ptr, super_detached) {
-                    // we only update the finish_cnt if the cleanup performed isn't final
-                    // i.e if the backing allocation wasn't freed.
-
-                    // fence(Ordering::AcqRel);
-                    /*super_cache
-                        .finished
-                        .store(FinishedMsg::new(debt, FinishedMsgTy::Finished).0, Ordering::Release);*/
-                }/* else {
-                    super_cache.finished.store(FinishedMsg::new(debt, FinishedMsgTy::Deleted).0, Ordering::Release);
-                }*/
+                cleanup_cache::<true, T>(super_cache_ptr, super_detached, super_tid);
                 // fence(Ordering::AcqRel);
             }
             // unsafe { cache.as_ref().unwrap() }.finished.store(FinishedMsg::new(debt, FinishedMsgTy::Finished).0, Ordering::Release); // FIXME: do we have to do this?
@@ -497,7 +482,7 @@ impl<T: Send + Sync> DetachablePtr<T> {
 
     unsafe fn cleanup(&mut self) {
         if let Some(cache) = self.0.take() {
-            cleanup_cache::<false, T>(cache, true);
+            cleanup_cache::<false, T>(cache, true, thread_id());
         }
     }
 
@@ -519,25 +504,36 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
             // doesn't necessarily have to be the same as the one
             // owning the cache and we have to make sure that all decrements happened before this.
             let ref_cnt = meta.ref_cnt.load(Ordering::Acquire);
+            let tid = cache.thread_id;
             // mark the cache as detached in order to allow other threads to see
             let debt = meta.debt.fetch_or(DETACHED_FLAG, Ordering::AcqRel); // TODO: try avoiding having to do this RMW for most cases by adding a fast path
             // FIXME: are we sure that ref_cnt's last desired value is already visible to us here?
             if debt == ref_cnt {
-                // fence(Ordering::AcqRel);
-                // we have a retry loop here in case the debt's updater hasn't finished yet
-                cache.wait_for::<false>(ref_cnt);
+                // we don't have to wait for other threads to finish as they will access
+                // the cache which is available as long as there are threads accessing the
+                // central data structure and not the backing allocation which can get deallocated
+                // at any point in time.
                 drop(cache);
                 fence(Ordering::AcqRel);
-                cleanup_cache::<false, T>(cache_ptr, true); // FIXME: do we have to set a marker here?
+                cleanup_cache::<false, T>(cache_ptr, true, tid); // FIXME: do we have to set a marker here?
             }
         }
     }
 }
 
+const INVALID_TID: u64 = u64::MAX;
+
 #[inline]
 fn thread_id() -> u64 {
-    // thread::current().id().as_u64().get()
-    thread_id::get() as u64
+    // let tid = thread::current().id().as_u64().get();
+    let tid = thread_id::get() as u64;
+
+    if unlikely(tid == INVALID_TID) {
+        // we can't have any thread id be our INVALID_TID
+        abort();
+    }
+
+    tid
 }
 
 // this is for `debt` and indicates that the thread local cache containing
