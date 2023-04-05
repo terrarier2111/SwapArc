@@ -81,7 +81,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             let ref_cnt = meta.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
             if ref_cnt > MAX_SOFT_REFCOUNT {
                 unsafe {
-                    handle_large_ref_count(cache, ref_cnt);
+                    handle_large_ref_count((cache as *const CachePadded<Cache<T>>).cast_mut(), ref_cnt);
                 }
             }
             meta.ref_cnt.store(ref_cnt + 1, Ordering::Release);
@@ -138,7 +138,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 // if we fail, just fall back to the slow path
                 if ref_cnt > MAX_SOFT_REFCOUNT {
                     unsafe {
-                        handle_large_ref_count(local_cache, ref_cnt);
+                        handle_large_ref_count((local_cache as *const CachePadded<Cache<T>>).cast_mut(), ref_cnt);
                     }
                 }
                 meta.ref_cnt.store(ref_cnt + 1, Ordering::Release);
@@ -184,13 +184,16 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
 
 /// Safety: this method may only be called with the local cache as the `cache` parameter.
 #[cold]
-unsafe fn handle_large_ref_count<T: Send + Sync>(cache: &CachePadded<Cache<T>>, ref_cnt: usize) {
+unsafe fn handle_large_ref_count<T: Send + Sync>(cache: *mut CachePadded<Cache<T>>, ref_cnt: usize) {
     panic!("error!");
+
+    let meta = unsafe { cache.cast::<Metadata>().byte_offset(ThreadLocal::<CachePadded<Cache<T>>, Metadata>::val_to_meta_offset()).as_ref().unwrap_unchecked() };
+
     // try to recover by decrementing the `debt` count from the `ref_cnt` and setting the `debt` count to 0
     // note: the `detached` flag can't be set because this method is only called with the `local_cache` as the `cache` parameter
-    let debt = cache.debt.swap(0, Ordering::Relaxed); // FIXME: can the lack of synchronization between these two updates lead to race conditions?
+    let debt = meta.debt.swap(0, Ordering::Relaxed); // FIXME: can the lack of synchronization between these two updates lead to race conditions?
     let ref_cnt = ref_cnt - debt;
-    cache.ref_cnt.store(ref_cnt, Ordering::Relaxed);
+    meta.ref_cnt.store(ref_cnt, Ordering::Relaxed);
     if ref_cnt > MAX_HARD_REFCOUNT {
         abort();
     }
@@ -253,7 +256,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
                 abort();
             }
             fence(Ordering::Acquire);
-            let ref_cnt = cache.ref_cnt.load(Ordering::Acquire);
+            let ref_cnt = unsafe { (cache as *const CachePadded<Cache<T>>).cast::<Metadata>().byte_offset(ThreadLocal::<CachePadded<Cache<T>>, Metadata>::val_to_meta_offset()).as_ref().unwrap_unchecked() }.ref_cnt.load(Ordering::Acquire);
             if strip_flags(debt) == ref_cnt {
                 // FIXME: ref_cnt can probably race with `debt` here
                 // FIXME: so what we need to do is add further validation after this check
@@ -393,7 +396,8 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
         // there are no external refs alive
         if src.is_null() {
             println!("delete main thingy: {}", thread_id());
-            unsafe { cache.as_ref() }
+            let meta_ptr = unsafe { src.cast::<Metadata>().byte_offset(ThreadLocal::<CachePadded<Cache<T>>, Metadata>::val_to_meta_offset()) };
+            unsafe { meta_ptr.as_ref().unwrap_unchecked() }
                 .debt
                 .fetch_or(DETACHED_FLAG, Ordering::AcqRel);
             // unsafe { cache.as_ref() }.finished.store(FinishedMsg::new(msg_id, FinishedMsgTy::Finished).0, Ordering::Release);
