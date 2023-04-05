@@ -120,7 +120,7 @@ fn main() {
     // let tmp = Arc::new(ArcSwap::new(Arc::new(3)));
     // let tmp = AutoLocalArc::new(3);
     let tmp = AutoLocalArc::new(3);
-    let mut threads = vec![];
+    /*let mut threads = vec![];
     for _ in 0../*1*//*6*//*8*/7
     /*20*//*5*//*1*/
     {
@@ -143,7 +143,7 @@ fn main() {
     println!("awaiting stuff!");
     threads
         .into_iter()
-        .for_each(|thread| thread.join()/*.unwrap().join()*/.unwrap());
+        .for_each(|thread| thread.join()/*.unwrap().join()*/.unwrap());*/
     thread::sleep(Duration::from_secs(10));
     /*let mut threads = vec![];
     for _ in 0..5/*20*//*5*//*1*/ {
