@@ -8,7 +8,7 @@ use std::ptr::{null_mut, NonNull};
 use std::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering, AtomicU8, AtomicU64};
 use std::{mem, ptr, thread};
 use lazy_static::lazy_static;
-use likely_stable::unlikely;
+use likely_stable::{likely, unlikely};
 use thread_local::ThreadLocal;
 
 // FIXME: NOTE: the version of thread_local that is used changes the behavior of this!
@@ -132,10 +132,10 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 local_cache.src.store(cache_ptr.as_ptr(), Ordering::Release);
                                                                      // this is `2` because we need a reference for the current thread's instance and
                                                                      // because the newly created instance needs a reference as well.
-                meta.ref_cnt.store(2, Ordering::Release);
+                local_meta.ref_cnt.store(2, Ordering::Release);
                 // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
-                meta.debt.store(0, Ordering::Release);
-                meta.thread_id.store(tid, Ordering::Release);
+                local_meta.debt.store(0, Ordering::Release);
+                local_meta.thread_id.store(tid, Ordering::Release);
                 // remove the reference to the external cache, as we moved it to our own cache instead
                 *unsafe { &mut *self.cache.get() } = local_cache_ptr;
             } else {
@@ -146,13 +146,13 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                         handle_large_ref_count((local_cache as *const CachePadded<Cache<T>>).cast_mut(), ref_cnt);
                     }
                 }
-                meta.ref_cnt.store(ref_cnt + 1, Ordering::Release);
+                local_meta.ref_cnt.store(ref_cnt + 1, Ordering::Release);
                 // sync with the local store
                 fence(Ordering::Acquire); // FIXME: is this even required?
                 // FIXME: here is probably a possibility for a race condition (what if we have one of the instances on another thread and it gets freed right
                 // FIXME: after we check if ref_cnt == debt?) this can probably be fixed by checking again right after increasing the ref_count and
                 // FIXME: handling failure by doing what we would have done if the local cache had no valid references to begin with.
-                let debt = meta.debt.load(Ordering::Acquire);
+                let debt = local_meta.debt.load(Ordering::Acquire);
                 // we don't need to strip the flags here as we know that `debt` isn't detached.
                 if debt == ref_cnt {
                     if debt > 0 {
@@ -168,10 +168,10 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     local_cache.src.store(cache_ptr.as_ptr(), Ordering::Release);
                                                                          // this is `2` because we need a reference for the current thread's instance and
                                                                          // because the newly created instance needs a reference as well.
-                    meta.ref_cnt.store(2, Ordering::Release);
+                    local_meta.ref_cnt.store(2, Ordering::Release);
                     // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
-                    meta.debt.store(0, Ordering::Release);
-                    meta.thread_id.store(tid, Ordering::Release);
+                    local_meta.debt.store(0, Ordering::Release);
+                    local_meta.thread_id.store(tid, Ordering::Release);
                     // remove the reference to the external cache, as we moved it to our own cache instead
                     *unsafe { &mut *self.cache.get() } = local_cache_ptr;
                 }
@@ -214,12 +214,6 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
         let meta = unsafe { &*meta_ptr };
         let tid = thread_id();
         if cache.thread_id == tid {
-            if cache.thread_id == 0 {
-               println!("start dropping local!");
-                for _ in 0..10 {
-                    println!("eeee");
-                }
-            }
             let ref_cnt = meta.ref_cnt.load(Ordering::Relaxed);
             // println!("dropping {}", ref_cnt);
             let guard = unsafe { cache.guard.as_ref() };
@@ -230,14 +224,6 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             fence(Ordering::Acquire);
             // `ref_cnt` can't race with `debt` here because we are the only ones who are able to update `ref_cnt`
             let debt = meta.debt.load(Ordering::Acquire);
-            // let fin = cache.finish_cnt.load(Ordering::Acquire);
-            if cache.thread_id == 0 {
-                println!(
-                    "local drop: {} refs: {} debt: {}",
-                    cache.thread_id, ref_cnt, debt/*, fin*/
-                );
-            }
-            // println!("debt: {}\nref_cnt: {}", strip_flags(debt), ref_cnt);
             // TODO: we could add a fastpath here for debt == 0
             if ref_cnt == strip_flags(debt) {
                 cleanup_cache::<true, T>(cache_ptr, is_detached(debt), tid); // FIXME: we don't need to check for an expected TID here.
@@ -287,7 +273,6 @@ struct InnerArc<T: Send + Sync> {
 impl<T: Send + Sync> Drop for InnerArc<T> {
     #[inline]
     fn drop(&mut self) {
-        println!("dropping central struct!");
         // wait for all caches to finish.
         for cache in GUARDS.iter() {
             let mut backoff = Backoff::new();
@@ -319,13 +304,8 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
     let meta_ptr = unsafe { cache.as_ref().meta };
     let meta = unsafe { &*meta_ptr };
 
-    if unlikely(meta.thread_id.compare_exchange(exp_tid, INVALID_TID, Ordering::AcqRel, Ordering::Relaxed).is_err()) {
-        println!("wrong tid!");
-        return false;
-    }
-
     println!("cleanup cache {}", detached);
-    if UPDATE_SUPER {
+    if UPDATE_SUPER && likely(meta.thread_id.compare_exchange(exp_tid, INVALID_TID, Ordering::AcqRel, Ordering::Relaxed).is_ok()) {
         // FIXME: when freeing the own memory, we still have a reference to it and thus UB
         // FIXME: the same thing is the case when freeing the major allocation
         // println!("cleanup cache: {}", unsafe { &*cache }.ref_cnt.load(Ordering::Relaxed));
