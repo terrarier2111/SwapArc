@@ -362,6 +362,7 @@ fn bench_other_multi(bencher: &mut Bencher) {
 }*/
 
 #[bench]
+/*
 fn bench_us_multi(bencher: &mut Bencher) {
     let tmp: Arc<SwapArcIntermediateTLS<i32, Arc<i32>, 0>> =
         Arc::new(SwapArcIntermediateTLS::new(Arc::new(0)));
@@ -402,7 +403,7 @@ fn bench_us_multi(bencher: &mut Bencher) {
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
     });
-}
+}*/
 
 /*
 #[bench]
@@ -442,6 +443,7 @@ fn bench_other_multi(bencher: &mut Bencher) {
     });
 }*/
 
+/*
 #[bench]
 fn bench_us_single(bencher: &mut Bencher) {
     let tmp: Arc<SwapArcIntermediateTLS<i32, Arc<i32>, 0>> =
@@ -479,7 +481,7 @@ fn bench_us_single(bencher: &mut Bencher) {
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
     });
-}
+}*/
 
 /*
 #[bench]
@@ -511,6 +513,7 @@ fn bench_other_single(bencher: &mut Bencher) {
     });
 }*/
 
+/*
 #[bench]
 fn bench_us_read_heavy_single(bencher: &mut Bencher) {
     let tmp: Arc<SwapArcIntermediateTLS<i32, Arc<i32>, 0>> =
@@ -559,7 +562,7 @@ fn bench_us_read_light_single(bencher: &mut Bencher) {
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
     });
-}
+}*/
 
 #[bench]
 fn bench_arc_read_heavy_single(bencher: &mut Bencher) {
@@ -1008,6 +1011,7 @@ fn bench_spreaded_read_light_multi_local(bencher: &mut Bencher) {
     });
 }
 
+/*
 #[bench]
 fn bench_other_read_light_single(bencher: &mut Bencher) {
     let tmp = Arc::new(ArcSwap::new(Arc::new(3)));
@@ -1122,7 +1126,7 @@ fn bench_other_read_heavy_multi(bencher: &mut Bencher) {
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
     });
-}
+}*/
 
 fn test_us_multi() {
     let arc = Arc::new(4);
