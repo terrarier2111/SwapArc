@@ -6,6 +6,7 @@
 #![feature(bench_black_box)]
 #![feature(thread_id_value)]
 #![feature(pointer_byte_offsets)]
+#![feature(thread_local)]
 
 mod auto_local_arc;
 mod cached_arc;

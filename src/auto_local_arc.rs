@@ -7,6 +7,8 @@ use std::process::abort;
 use std::ptr::{null_mut, NonNull};
 use std::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering, AtomicU8, AtomicU64};
 use std::{mem, ptr, thread};
+use std::collections::HashSet;
+use std::sync::Mutex;
 use lazy_static::lazy_static;
 use likely_stable::{likely, unlikely};
 use thread_local::ThreadLocal;
@@ -41,7 +43,6 @@ impl<T: Send + Sync> AutoLocalArc<T> {
                         parent: inner,
                         thread_id: thread_id(),
                         src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
-                        guard: unsafe { NonNull::new_unchecked((GUARDS.get_or_default() as *const AtomicPtr<()>).cast_mut()) },
                         meta,
                     }))
                         .into_ptr(),
@@ -80,7 +81,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
         let tid = thread_id();
 
         let cache = if cache.thread_id == tid {
-            println!("increment local cnt");
+            // println!("increment local cnt");
             // we are the owner of this cache, just perform a simple increment
 
             let ref_cnt = meta.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
@@ -92,7 +93,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             meta.ref_cnt.store(ref_cnt + 1, Ordering::Release);
             cache_ptr
         } else {
-            println!("increment non-local cnt");
+            // println!("increment non-local cnt");
             // we aren't the owner, now we have to do some more work
 
             let inner = self.inner;
@@ -106,7 +107,6 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                             parent: inner,
                             src: AtomicPtr::new(cache_ptr.as_ptr()),
                             thread_id: tid,
-                            guard: unsafe { NonNull::new_unchecked((GUARDS.get_or_default() as *const AtomicPtr<()>).cast_mut()) },
                             meta,
                         }))
                         .into_ptr(),
@@ -224,7 +224,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
                     println!("eeee");
                 }
             }
-            println!("decrement local cnt!");
+            // println!("decrement local cnt!");
             let ref_cnt = meta.ref_cnt.load(Ordering::Relaxed);
             // println!("dropping {}", ref_cnt);
             meta.state.store(CACHE_STATE_IN_USE, Ordering::Release);
@@ -235,10 +235,10 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             // `ref_cnt` can't race with `debt` here because we are the only ones who are able to update `ref_cnt`
             let debt = meta.debt.load(Ordering::Acquire);
             if cache.thread_id == 0 {
-                println!(
+                /*println!(
                     "local drop: {} refs: {} debt: {}",
                     cache.thread_id, ref_cnt, debt/*, fin*/
-                );
+                );*/
             }
             // println!("debt: {}\nref_cnt: {}", strip_flags(debt), ref_cnt);
             // TODO: we could add a fastpath here for debt == 0
@@ -247,8 +247,8 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             }
             meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
         } else {
-            println!("non-local cache ptr drop!");
-            let guard = GUARDS.get_or_default();
+            // println!("non-local cache ptr drop!");
+            let guard = unsafe { guard().as_ref().unwrap_unchecked() };
             guard.store(cache_ptr.as_ptr().cast(), Ordering::Release);
             let cache_tid = cache.thread_id;
             let debt = meta.debt.fetch_add(1, Ordering::AcqRel) + 1;
@@ -266,7 +266,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
                 // there are no external refs alive
                 cleanup_cache::<true, T>(cache_ptr, is_detached(debt), cache_tid);
             }
-            guard.store(null_mut(), Ordering::Release);
+            guard.store(dummy_addr().cast_mut(), Ordering::Release);
         }
     }
 }
@@ -291,17 +291,19 @@ impl<T: Send + Sync> Drop for InnerArc<T> {
     #[inline]
     fn drop(&mut self) {
         println!("dropping central struct!");
-        // wait for all caches to finish.
-        for cache in GUARDS.iter() {
+        // wait for all non-local cache users to finish
+        for cache in GUARDS.lock().unwrap().iter() {
+            let cache = unsafe { (*cache as *const AtomicPtr<()>).as_ref().unwrap_unchecked() };
             let mut backoff = Backoff::new();
             while cache.load(Ordering::Acquire).cast_const() == (self as *const InnerArc<T>).cast() {
                 backoff.snooze();
             }
         }
 
+        // wait for all local cache users to finish
         for cache in self.cache.iter() {
             let mut backoff = Backoff::new();
-            // wait until the local thread is done using its thingy
+            // wait until the local thread is done using its cache
             let state = &unsafe { cache.0.as_ref().meta.as_ref().unwrap_unchecked() }.state;
             while state.load(Ordering::Acquire) != CACHE_STATE_IDLE {
                 backoff.snooze();
@@ -315,7 +317,6 @@ impl<T: Send + Sync> Drop for InnerArc<T> {
 #[repr(C)]
 struct Cache<T: Send + Sync> {
     parent: NonNull<InnerArc<T>>,
-    guard: NonNull<AtomicPtr<()>>,
     thread_id: u64,
     meta: *const Metadata, // FIXME: make this NonNull
     src: AtomicPtr<CachePadded<Cache<T>>>,
@@ -448,7 +449,7 @@ impl<T: Send + Sync> DetachablePtr<T> {
 impl<T: Send + Sync> Drop for DetachablePtr<T> {
     #[inline]
     fn drop(&mut self) {
-        // println!("dropping detachable ptr: {}", cache.thread_id);
+        println!("dropping detachable ptr");
         let cache = unsafe { self.0.as_ref() };
         let meta_ptr = unsafe { TLocal::<T>::val_meta_ptr_from_val(NonNull::new_unchecked(self as *mut Self)) };
         let meta = unsafe { meta_ptr.meta_ptr().as_ref() };
@@ -571,6 +572,37 @@ impl<T> Drop for SizedBox<T> {
     }
 }
 
+static DUMMY: u8 = 0;
+
+#[inline(always)]
+fn dummy_addr() -> *const () {
+    (&DUMMY as *const u8).cast()
+}
+
 lazy_static! {
-    static ref GUARDS: ThreadLocal<AtomicPtr<()>> = ThreadLocal::new();
+    static ref GUARDS: Mutex<HashSet<usize>> = Mutex::new(HashSet::new());
+}
+
+#[thread_local]
+static GUARD: AtomicPtr<()> = AtomicPtr::new(null_mut());
+thread_local! { static DROP_GUARD: DropGuard = const { DropGuard }; }
+
+struct DropGuard;
+
+impl Drop for DropGuard {
+    fn drop(&mut self) {
+        GUARDS.lock().unwrap().remove(&((&GUARD as *const AtomicPtr<()>) as usize));
+    }
+}
+
+// This method may only be called locally.
+fn guard() -> *const AtomicPtr<()> {
+    if GUARD.load(Ordering::Relaxed) == null_mut() {
+        // initialize guard
+        DROP_GUARD.with(|_| {});
+
+        GUARDS.lock().unwrap().insert((&GUARD as *const AtomicPtr<()>) as usize);
+        GUARD.store(dummy_addr().cast_mut(), Ordering::Relaxed);
+    }
+    &GUARD as *const _
 }

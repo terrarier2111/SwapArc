@@ -1,4 +1,5 @@
 #![feature(core_intrinsics)]
+#![feature(thread_local)]
 
 use std::sync::Arc;
 
