@@ -266,7 +266,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
                 // there are no external refs alive
                 cleanup_cache::<true, T>(cache_ptr, is_detached(debt), cache_tid);
             }
-            guard.store(dummy_addr().cast_mut(), Ordering::Release);
+            guard.store(sentinel_addr().cast_mut(), Ordering::Release);
         }
     }
 }
@@ -572,11 +572,11 @@ impl<T> Drop for SizedBox<T> {
     }
 }
 
-static DUMMY: u8 = 0;
+static SENTINEL: u8 = 0;
 
 #[inline(always)]
-fn dummy_addr() -> *const () {
-    (&DUMMY as *const u8).cast()
+fn sentinel_addr() -> *const () {
+    (&SENTINEL as *const u8).cast()
 }
 
 lazy_static! {
@@ -602,7 +602,7 @@ fn guard() -> *const AtomicPtr<()> {
         DROP_GUARD.with(|_| {});
 
         GUARDS.lock().unwrap().insert((&GUARD as *const AtomicPtr<()>) as usize);
-        GUARD.store(dummy_addr().cast_mut(), Ordering::Relaxed);
+        GUARD.store(sentinel_addr().cast_mut(), Ordering::Relaxed);
     }
     &GUARD as *const _
 }
