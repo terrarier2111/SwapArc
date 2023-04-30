@@ -400,6 +400,8 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
         // of atomics happen-before this.
         fence(Ordering::Acquire);
         unsafe { SizedBox::from_ptr(cache) };
+
+        // FIXME: free threadid inside threadlocal here.
     }
     detached
 }
