@@ -1,7 +1,7 @@
 use crossbeam_utils::{Backoff, CachePadded};
 use std::alloc::{alloc, dealloc, Layout, LayoutError};
 use std::cell::UnsafeCell;
-use std::mem::{align_of, size_of, ManuallyDrop, transmute};
+use std::mem::{align_of, size_of, ManuallyDrop, transmute, MaybeUninit};
 use std::ops::Deref;
 use std::process::abort;
 use std::ptr::{null_mut, NonNull};
@@ -284,7 +284,7 @@ impl<T: Send + Sync> Deref for AutoLocalArc<T> {
 #[repr(C)]
 struct InnerArc<T: Send + Sync> {
     val: T,
-    cache: ThreadLocal<DetachablePtr<T>, Metadata>,
+    cache: ThreadLocal<DetachablePtr<T>, Metadata<T>>,
 }
 
 impl<T: Send + Sync> Drop for InnerArc<T> {
@@ -318,7 +318,7 @@ impl<T: Send + Sync> Drop for InnerArc<T> {
 struct Cache<T: Send + Sync> {
     parent: NonNull<InnerArc<T>>,
     thread_id: u64,
-    meta: *const Metadata, // FIXME: make this NonNull
+    meta: *const Metadata<T>, // FIXME: make this NonNull
     src: AtomicPtr<CachePadded<Cache<T>>>,
 }
 
@@ -406,19 +406,31 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
     detached
 }
 
-#[derive(Default)]
-struct Metadata {
+struct Metadata<T: Send + Sync> {
     thread_id: AtomicU64,
     ref_cnt: AtomicUsize, // this ref cnt may only be updated by the current thread
     debt: AtomicUsize, // this debt count may only be updated by threads other than the current one - this has a `detached` flag as its last bit
     state: AtomicU8,
+    cache: UnsafeCell<MaybeUninit<Cache<T>>>,
+}
+
+impl<T: Send + Sync> Default for Metadata<T> {
+    fn default() -> Self {
+        Self {
+            thread_id: Default::default(),
+            ref_cnt: Default::default(),
+            debt: Default::default(),
+            state: Default::default(),
+            cache: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
 }
 
 const CACHE_STATE_IDLE: u8 = 0;
 const CACHE_STATE_IN_USE: u8 = 1;
 const CACHE_STATE_FINISH: u8 = 2;
 
-impl thread_local::Metadata for Metadata {
+impl<T: Send + Sync> thread_local::Metadata for Metadata<T> {
     fn set_default(&self) {
         self.thread_id.store(thread_id(), Ordering::Release);
         self.ref_cnt.store(1, Ordering::Release);
@@ -480,7 +492,7 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
     }
 }
 
-type TLocal<T> = ThreadLocal<DetachablePtr<T>, Metadata>;
+type TLocal<T> = ThreadLocal<DetachablePtr<T>, Metadata<T>>;
 
 const INVALID_TID: u64 = u64::MAX;
 
