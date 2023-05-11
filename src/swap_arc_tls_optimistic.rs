@@ -11,7 +11,7 @@ use std::ops::Deref;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
-use thread_local::ThreadLocal;
+use thread_local::{EntryToken, RefAccess, ThreadLocal};
 
 /// A `SwapArc` is a data structure that allows for an `Arc`
 /// to be passed around and swapped out with other `Arc`s.
@@ -120,7 +120,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
     /// Loads the reference counted stored value partially.
     pub fn load<'a>(&'a self) -> SwapArcIntermediateGuard<'a, T, D, METADATA_BITS> {
-        let parent = self.thread_local.get_or(|| {
+        let parent_ref = self.thread_local.get_or(|_| {
             let curr = self.load_internal();
             let curr_ptr = curr.fake_ref.as_ptr();
             // increase the reference count
@@ -146,7 +146,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     },
                 }),
             })
-        });
+        }, |_| {});
+        let parent = parent_ref.value();
         // SAFETY: This is safe because we know that we are the only thread that
         // is able to access the thread local data at this time and said data has to be initialized
         // and we also know, that the pointer has to be non-null
@@ -161,7 +162,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             // SAFETY: this is safe because the pointer contained inside `curr.ptr` is guaranteed to always be valid
             let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
             return SwapArcIntermediateGuard {
-                parent,
+                parent: parent_ref,
                 fake_ref,
                 gen_cnt: data.curr.gen_cnt,
             };
@@ -170,7 +171,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         #[cold]
         fn load_slow<'a, T, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(
             this: &'a SwapArcIntermediateTLS<T, D, { META_DATA_BITS }>,
-            parent: &'a LocalData<T, D, META_DATA_BITS>,
+            parent_ref: EntryToken<'a, RefAccess, CachePadded<LocalData<T, D, { META_DATA_BITS }>>>,
             data: &mut LocalDataInner<T, D>,
         ) -> SwapArcIntermediateGuard<'a, T, D, META_DATA_BITS> {
             fn load_new_slow<'a, T, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(
@@ -199,6 +200,8 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 (new_ptr, gen_cnt)
             }
 
+            let parent = parent_ref.value();
+
             // the following conditional relies on preconditions provided by the caller (`load`)
             // to be precise we rely on `parent.ptr` to be different from `curr.ptr`
             if data.new.ref_cnt == 0 {
@@ -207,7 +210,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // was acquired through `D::as_ptr` and points to a valid instance of `D`.
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
                 return SwapArcIntermediateGuard {
-                    parent,
+                    parent: parent_ref,
                     fake_ref,
                     gen_cnt,
                 };
@@ -222,7 +225,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // creation.
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
                 return SwapArcIntermediateGuard {
-                    parent,
+                    parent: parent_ref,
                     fake_ref,
                     gen_cnt: data.curr.gen_cnt,
                 };
@@ -248,7 +251,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // contains a valid ptr inside its `ptr` field.
                     let fake_ref = ManuallyDrop::new(unsafe { D::from(data.new.ptr) });
                     return SwapArcIntermediateGuard {
-                        parent,
+                        parent: parent_ref,
                         fake_ref,
                         gen_cnt: data.new.gen_cnt,
                     };
@@ -309,7 +312,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // to ensure that it's safe to dereference
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
                 return SwapArcIntermediateGuard {
-                    parent,
+                    parent: parent_ref,
                     fake_ref,
                     gen_cnt,
                 };
@@ -319,14 +322,14 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // and thus we know that `intermediate.ptr` has to be a valid value.
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(data.intermediate.ptr) });
                 return SwapArcIntermediateGuard {
-                    parent: &parent,
+                    parent: parent_ref,
                     fake_ref,
                     gen_cnt: data.intermediate.gen_cnt,
                 };
             }
         }
 
-        load_slow(self, parent, data)
+        load_slow(self, parent_ref, data)
     }
 
     /// Loads the reference counted value that's currently stored
@@ -344,7 +347,7 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         // as it, itself is protected by other atomics, so we can use `Relaxed`
         let curr_meta = Self::get_metadata(self.intermediate_ptr.load(Ordering::Relaxed));
         SwapArcIntermediatePtrGuard {
-            parent: guard.parent,
+            parent: guard.parent.value(),
             // TODO: use this once strict provenance got stabilized!
             // ptr: guard.fake_ref.as_ptr().map_addr(|x| x | curr_meta),
             ptr: (guard.fake_ref.as_ptr() as usize | curr_meta) as *const T,
@@ -996,7 +999,7 @@ pub struct SwapArcIntermediateGuard<
     D: DataPtrConvert<T> = Arc<T>,
     const METADATA_BITS: u32 = 0,
 > {
-    parent: &'a LocalData<T, D, METADATA_BITS>,
+    parent: EntryToken<'a, RefAccess, CachePadded<LocalData<T, D, METADATA_BITS>>>,
     fake_ref: ManuallyDrop<D>,
     gen_cnt: usize,
 }
@@ -1009,12 +1012,12 @@ impl<T, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
         // SAFETY: This is safe because we know that we are the only thread that
         // is able to access the thread local data at this time and said data has to be initialized
         // and we also know, that the pointer has to be non-null
-        let data = unsafe { self.parent.inner.get().as_mut().unwrap_unchecked() };
+        let data = unsafe { self.parent.value().inner.get().as_mut().unwrap_unchecked() };
         // release the reference we hold
         if likely(self.gen_cnt == data.curr.gen_cnt) {
             data.curr.ref_cnt -= 1;
         } else {
-            slow_drop(self.parent, data, self.gen_cnt);
+            slow_drop(self.parent.value(), data, self.gen_cnt);
         }
         #[cold]
         fn slow_drop<T, D: DataPtrConvert<T>, const METADATA_BITS: u32>(

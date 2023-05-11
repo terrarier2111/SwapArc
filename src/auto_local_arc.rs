@@ -414,6 +414,9 @@ struct Metadata<T: Send + Sync> {
     cache: UnsafeCell<MaybeUninit<Cache<T>>>,
 }
 
+unsafe impl<T: Send + Sync> Send for Metadata<T> {}
+unsafe impl<T: Send + Sync> Sync for Metadata<T> {}
+
 impl<T: Send + Sync> Default for Metadata<T> {
     fn default() -> Self {
         Self {
