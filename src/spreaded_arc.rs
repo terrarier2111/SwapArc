@@ -1,3 +1,4 @@
+/*
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::intrinsics::{likely, unlikely};
@@ -130,3 +131,4 @@ struct Cache<T: Send + Sync> {
 
 unsafe impl<T: Send + Sync> Send for Cache<T> {}
 unsafe impl<T: Send + Sync> Sync for Cache<T> {}
+*/

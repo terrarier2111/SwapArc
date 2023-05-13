@@ -36,7 +36,7 @@ impl<T: Send + Sync> AutoLocalArc<T> {
         .into_ptr();
         let cache = unsafe { inner.as_ref() }
             .cache
-            .get_val_and_meta_or(|meta| {
+            .get_or(|meta| {
                 // println!("inserting: {}", thread_id());
                 DetachablePtr(
                     SizedBox::new(CachePadded::new(Cache {
@@ -50,7 +50,7 @@ impl<T: Send + Sync> AutoLocalArc<T> {
             }, |meta| {
                 meta.ref_cnt.store(1, Ordering::Release);
                 meta.thread_id.store(thread_id(), Ordering::Release);
-            }).0.0;
+            }).value().0;
         let ret = Self {
             inner,
             cache: cache.into(),
@@ -97,10 +97,10 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             // we aren't the owner, now we have to do some more work
 
             let inner = self.inner;
-            let (local_cache_ptr, local_meta) = unsafe { self
+            let cached = unsafe { self
                 .inner()
                 .cache
-                .get_val_and_meta_or(|meta| {
+                .get_or(|meta| {
                     println!("inserting: {}", tid);
                     DetachablePtr(
                         SizedBox::new(CachePadded::new(Cache {
@@ -114,6 +114,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 }, |meta| {/*
                     meta.thread_id.store(tid, Ordering::Release);
                 */}) };
+            let (local_cache_ptr, local_meta) = (cached.value(), cached.meta());
             let local_cache_ptr = local_cache_ptr.0;
             let local_cache = unsafe { local_cache_ptr.as_ref() };
             // the ref count here can't change, as we are the only thread which is able to access it.
@@ -304,7 +305,7 @@ impl<T: Send + Sync> Drop for InnerArc<T> {
         for cache in self.cache.iter() {
             let mut backoff = Backoff::new();
             // wait until the local thread is done using its cache
-            let state = &unsafe { cache.0.as_ref().meta.as_ref().unwrap_unchecked() }.state;
+            let state = &unsafe { cache.value().0.as_ref().meta.as_ref().unwrap_unchecked() }.state;
             while state.load(Ordering::Acquire) != CACHE_STATE_IDLE {
                 backoff.snooze();
             }

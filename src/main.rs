@@ -25,8 +25,6 @@ use std::{mem, thread};
 #[cfg(test)]
 extern crate test;
 use crate::auto_local_arc::AutoLocalArc;
-use crate::cached_arc::CachedArc;
-use crate::spreaded_arc::SpreadedArc;
 #[cfg(test)]
 use arc_swap::ArcSwap;
 #[cfg(test)]
