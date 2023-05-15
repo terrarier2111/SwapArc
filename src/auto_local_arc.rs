@@ -13,8 +13,6 @@ use lazy_static::lazy_static;
 use likely_stable::{likely, unlikely};
 use thread_local::{ThreadLocal, UnsafeToken};
 
-// FIXME: NOTE: the version of thread_local that is used changes the behavior of this!
-
 // Debt(t) <= Debt(t + 1)
 // Refs >= Debt
 // Refs(t + 1) >= Debt(t)
@@ -243,6 +241,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             // println!("debt: {}\nref_cnt: {}", strip_flags(debt), ref_cnt);
             // TODO: we could add a fastpath here for debt == 0
             if ref_cnt == strip_flags(debt) {
+                // FIXME: this doesn't finish!
                 cleanup_cache::<true, T>(cache_ptr, is_detached(debt), tid); // FIXME: we don't need to check for an expected TID here.
             }
             meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
@@ -300,17 +299,22 @@ impl<T: Send + Sync> Drop for InnerArc<T> {
             }
         }
 
+        println!("awaited caches!");
+
         // wait for all local cache users to finish
         for cache in self.cache.iter() {
             let mut backoff = Backoff::new();
             // wait until the local thread is done using its cache
             let state = &unsafe { cache.meta() }.state;
+            println!("cache: {:?}", cache.meta() as *const Metadata<T>);
             while state.load(Ordering::Acquire) != CACHE_STATE_IDLE {
                 backoff.snooze();
+                // println!("state: {}", state.load(Ordering::Acquire));
             }
             // signal to the destructor that we are finished.
             state.store(CACHE_STATE_FINISH, Ordering::Release);
         }
+        println!("awaited cache users!");
     }
 }
 
@@ -330,7 +334,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
     let token = unsafe { cache.as_ref().token.duplicate() };
     let meta = unsafe { token.meta() };
 
-    println!("cleanup cache {}", detached);
+    println!("cleanup cache {:?} : {}", meta as *const Metadata<T>, detached);
     if UPDATE_SUPER && likely(meta.thread_id.compare_exchange(exp_tid, INVALID_TID, Ordering::AcqRel, Ordering::Relaxed).is_ok()) {
         // FIXME: when freeing the own memory, we still have a reference to it and thus UB
         // FIXME: the same thing is the case when freeing the major allocation
@@ -343,10 +347,13 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
         let src = unsafe { cache.as_ref() }.src.load(Ordering::Acquire);
         // there are no external refs alive
         if src.is_null() {
-            println!("delete main thingy: {}", thread_id());
+            println!("delete main thingy: {:?} : {}", meta as *const Metadata<T>, thread_id());
             meta
                 .debt
                 .fetch_or(DETACHED_FLAG, Ordering::AcqRel);
+            // signal that we are finished so we don't accidentally loop indefinitely in the `InnerArc`
+            // destructor as we don't reach our update here "normally".
+            meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
             // unsafe { cache.as_ref() }.finished.store(FinishedMsg::new(msg_id, FinishedMsgTy::Finished).0, Ordering::Release);
             fence(Ordering::Acquire);
 
@@ -465,9 +472,9 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
     fn drop(&mut self) {
         println!("dropping detachable ptr");
         let meta = unsafe { self.0.meta() };
-        let cache = unsafe { (&*meta.cache.get()).assume_init_ref() };
 
         if meta.state.load(Ordering::Acquire) != CACHE_STATE_FINISH {
+            let cache = unsafe { (&*meta.cache.get()).assume_init_ref() };
             // println!("dropping detachable ptr!");
 
             // ORDERING: This is `Acquire` as the dropping thread
