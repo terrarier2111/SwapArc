@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 use lazy_static::lazy_static;
 use likely_stable::{likely, unlikely};
-use thread_local::ThreadLocal;
+use thread_local::{ThreadLocal, UnsafeToken};
 
 // FIXME: NOTE: the version of thread_local that is used changes the behavior of this!
 
@@ -34,26 +34,26 @@ impl<T: Send + Sync> AutoLocalArc<T> {
             cache: Default::default(),
         })
         .into_ptr();
-        let cache = unsafe { inner.as_ref() }
+        let cache = unsafe { inner.as_ref()
             .cache
-            .get_or(|meta| {
+            .get_or(|token| {
                 // println!("inserting: {}", thread_id());
                 DetachablePtr(
-                    SizedBox::new(CachePadded::new(Cache {
-                        parent: inner,
-                        thread_id: thread_id(),
-                        src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
-                        meta,
-                    }))
-                        .into_ptr(),
+                   token
                 )
             }, |meta| {
+                unsafe { &mut *meta.cache.get() }.write(CachePadded::new(Cache {
+                    parent: inner,
+                    src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
+                    thread_id: thread_id(),
+                    meta,
+                }));
                 meta.ref_cnt.store(1, Ordering::Release);
                 meta.thread_id.store(thread_id(), Ordering::Release);
-            }).value().0;
+            }).meta().cache.get().as_ref().unwrap_unchecked().as_ptr() };
         let ret = Self {
             inner,
-            cache: cache.into(),
+            cache: UnsafeCell::new(unsafe { NonNull::new_unchecked(cache.cast_mut()) }),
         };
         ret
     }
@@ -100,22 +100,23 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             let cached = unsafe { self
                 .inner()
                 .cache
-                .get_or(|meta| {
+                .get_or(|token| {
                     println!("inserting: {}", tid);
                     DetachablePtr(
-                        SizedBox::new(CachePadded::new(Cache {
-                            parent: inner,
-                            src: AtomicPtr::new(cache_ptr.as_ptr()),
-                            thread_id: tid,
-                            meta,
-                        }))
-                        .into_ptr(),
+                        token
                     )
-                }, |meta| {/*
+                }, |meta| {
+                    unsafe { &mut *meta.cache.get() }.write(CachePadded::new(Cache {
+                        parent: inner,
+                        src: AtomicPtr::new(cache_ptr.as_ptr()),
+                        thread_id: tid,
+                        meta,
+                    }));
+                    /*
                     meta.thread_id.store(tid, Ordering::Release);
                 */}) };
-            let (local_cache_ptr, local_meta) = (cached.value(), cached.meta());
-            let local_cache_ptr = local_cache_ptr.0;
+            let local_meta = cached.meta();
+            let local_cache_ptr = unsafe { NonNull::new_unchecked((&*local_meta.cache.get()).as_ptr().cast_mut()) };
             let local_cache = unsafe { local_cache_ptr.as_ref() };
             // the ref count here can't change, as we are the only thread which is able to access it.
             let ref_cnt = local_meta.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
@@ -285,7 +286,7 @@ impl<T: Send + Sync> Deref for AutoLocalArc<T> {
 #[repr(C)]
 struct InnerArc<T: Send + Sync> {
     val: T,
-    cache: ThreadLocal<DetachablePtr<T>, Metadata<T>>,
+    cache: ThreadLocal<DetachablePtr<T>, Metadata<T>, false>,
 }
 
 impl<T: Send + Sync> Drop for InnerArc<T> {
@@ -305,7 +306,7 @@ impl<T: Send + Sync> Drop for InnerArc<T> {
         for cache in self.cache.iter() {
             let mut backoff = Backoff::new();
             // wait until the local thread is done using its cache
-            let state = &unsafe { cache.value().0.as_ref().meta.as_ref().unwrap_unchecked() }.state;
+            let state = &unsafe { cache.meta() }.state;
             while state.load(Ordering::Acquire) != CACHE_STATE_IDLE {
                 backoff.snooze();
             }
@@ -400,7 +401,6 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
         // ORDERING: We use a fence here in order to ensure that all other operations and uses
         // of atomics happen-before this.
         fence(Ordering::Acquire);
-        unsafe { SizedBox::from_ptr(cache) };
 
         // FIXME: free threadid inside threadlocal here.
     }
@@ -412,7 +412,7 @@ struct Metadata<T: Send + Sync> {
     ref_cnt: AtomicUsize, // this ref cnt may only be updated by the current thread
     debt: AtomicUsize, // this debt count may only be updated by threads other than the current one - this has a `detached` flag as its last bit
     state: AtomicU8,
-    cache: UnsafeCell<MaybeUninit<Cache<T>>>,
+    cache: UnsafeCell<MaybeUninit<CachePadded<Cache<T>>>>,
 }
 
 unsafe impl<T: Send + Sync> Send for Metadata<T> {}
@@ -444,9 +444,8 @@ impl<T: Send + Sync> thread_local::Metadata for Metadata<T> {
 unsafe impl<T: Send + Sync> Send for Cache<T> {}
 unsafe impl<T: Send + Sync> Sync for Cache<T> {}
 
-#[derive(Clone)]
 #[repr(transparent)]
-struct DetachablePtr<T: Send + Sync>(NonNull<CachePadded<Cache<T>>>);
+struct DetachablePtr<T: Send + Sync>(UnsafeToken<DetachablePtr<T>, Metadata<T>, false>);
 
 unsafe impl<T: Send + Sync> Send for DetachablePtr<T> {}
 unsafe impl<T: Send + Sync> Sync for DetachablePtr<T> {}
@@ -468,9 +467,8 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
     #[inline]
     fn drop(&mut self) {
         println!("dropping detachable ptr");
-        let cache = unsafe { self.0.as_ref() };
-        let meta_ptr = unsafe { TLocal::<T>::val_meta_ptr_from_val(NonNull::new_unchecked(self as *mut Self)) };
-        let meta = unsafe { meta_ptr.meta_ptr().as_ref() };
+        let meta = unsafe { self.0.meta() };
+        let cache = unsafe { (&*meta.cache.get()).assume_init_ref() };
 
         if meta.state.load(Ordering::Acquire) != CACHE_STATE_FINISH {
             // println!("dropping detachable ptr!");
@@ -490,13 +488,13 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
                 // at any point in time.
                 drop(cache);
                 fence(Ordering::AcqRel);
-                cleanup_cache::<false, T>(self.0, true, tid); // FIXME: do we have to set a marker here?
+                cleanup_cache::<false, T>(unsafe { NonNull::new_unchecked((cache as *const CachePadded<Cache<T>>).cast_mut()) }, true, tid); // FIXME: do we have to set a marker here?
             }
         }
     }
 }
 
-type TLocal<T> = ThreadLocal<DetachablePtr<T>, Metadata<T>>;
+type TLocal<T> = ThreadLocal<DetachablePtr<T>, Metadata<T>, false>;
 
 const INVALID_TID: u64 = u64::MAX;
 

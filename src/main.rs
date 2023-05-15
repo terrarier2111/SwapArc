@@ -194,6 +194,7 @@ fn main() {
     }*/
 }
 
+/*
 fn bad_bench_us_multi() {
     let tmp: Arc<SwapArcIntermediateTLS<i32, Arc<i32>, 0>> =
         Arc::new(SwapArcIntermediateTLS::new(Arc::new(0)));
@@ -1208,7 +1209,7 @@ fn test_us_single() {
     threads
         .into_iter()
         .for_each(|thread| thread.join().unwrap());
-}
+}*/
 
 /*
 fn test_leak_arc(arc: &Arc<i32>) {
