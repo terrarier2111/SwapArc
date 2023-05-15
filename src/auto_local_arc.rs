@@ -41,15 +41,15 @@ impl<T: Send + Sync> AutoLocalArc<T> {
                 DetachablePtr(
                    token
                 )
-            }, |meta| {
-                unsafe { &mut *meta.cache.get() }.write(CachePadded::new(Cache {
+            }, |token| {
+                unsafe { &mut *token.meta().cache.get() }.write(CachePadded::new(Cache {
                     parent: inner,
                     src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
                     thread_id: thread_id(),
-                    meta,
+                    token: token.clone().into_unsafe_token(),
                 }));
-                meta.ref_cnt.store(1, Ordering::Release);
-                meta.thread_id.store(thread_id(), Ordering::Release);
+                token.meta().ref_cnt.store(1, Ordering::Release);
+                token.meta().thread_id.store(thread_id(), Ordering::Release);
             }).meta().cache.get().as_ref().unwrap_unchecked().as_ptr() };
         let ret = Self {
             inner,
@@ -73,8 +73,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
     fn clone(&self) -> Self {
         let cache_ptr = unsafe { *self.cache.get() };
         let cache = unsafe { cache_ptr.as_ref() };
-        let meta_ptr = cache.meta;
-        let meta = unsafe { &*meta_ptr };
+        let meta = unsafe { cache.token.meta() };
 
         // check if we are the owner of this alarc's cache
 
@@ -105,12 +104,12 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     DetachablePtr(
                         token
                     )
-                }, |meta| {
-                    unsafe { &mut *meta.cache.get() }.write(CachePadded::new(Cache {
+                }, |token| {
+                    unsafe { &mut *token.meta().cache.get() }.write(CachePadded::new(Cache {
                         parent: inner,
                         src: AtomicPtr::new(cache_ptr.as_ptr()),
                         thread_id: tid,
-                        meta,
+                        token: token.into_unsafe_token(),
                     }));
                     /*
                     meta.thread_id.store(tid, Ordering::Release);
@@ -196,7 +195,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
 unsafe fn handle_large_ref_count<T: Send + Sync>(cache: *mut CachePadded<Cache<T>>, ref_cnt: usize) {
     panic!("error!");
 
-    let meta = unsafe { cache.as_ref().unwrap_unchecked().meta.as_ref().unwrap_unchecked() };
+    let meta = unsafe { cache.as_ref().unwrap_unchecked().token.meta() };
 
     // try to recover by decrementing the `debt` count from the `ref_cnt` and setting the `debt` count to 0
     // note: the `detached` flag can't be set because this method is only called with the `local_cache` as the `cache` parameter
@@ -216,8 +215,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
         &mut self) {
         let cache_ptr = unsafe { *self.cache.get() };
         let cache = unsafe { cache_ptr.as_ref() };
-        let meta_ptr = unsafe { cache_ptr.as_ref().meta };
-        let meta = unsafe { &*meta_ptr };
+        let meta = unsafe { cache_ptr.as_ref().token.meta() };
         let tid = thread_id();
         if cache.thread_id == tid {
             if cache.thread_id == 0 {
@@ -258,7 +256,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
                 abort();
             }
             fence(Ordering::Acquire);
-            let ref_cnt = unsafe { cache.meta.as_ref().unwrap_unchecked() }.ref_cnt.load(Ordering::Acquire);
+            let ref_cnt = unsafe { cache.token.meta() }.ref_cnt.load(Ordering::Acquire);
             if strip_flags(debt) == ref_cnt {
 
                 // FIXME: NEW: there is probably a race condition here - what if cache's owner increases its reference count here
@@ -320,7 +318,7 @@ impl<T: Send + Sync> Drop for InnerArc<T> {
 struct Cache<T: Send + Sync> {
     parent: NonNull<InnerArc<T>>,
     thread_id: u64,
-    meta: *const Metadata<T>, // FIXME: make this NonNull
+    token: UnsafeToken<DetachablePtr<T>, Metadata<T>, false>,
     src: AtomicPtr<CachePadded<Cache<T>>>,
 }
 
@@ -329,8 +327,8 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
     detached: bool,
     exp_tid: u64,
 ) -> bool {
-    let meta_ptr = unsafe { cache.as_ref().meta };
-    let meta = unsafe { &*meta_ptr };
+    let token = unsafe { cache.as_ref().token.duplicate() };
+    let meta = unsafe { token.meta() };
 
     println!("cleanup cache {}", detached);
     if UPDATE_SUPER && likely(meta.thread_id.compare_exchange(exp_tid, INVALID_TID, Ordering::AcqRel, Ordering::Relaxed).is_ok()) {
@@ -368,8 +366,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
 
             let super_cache_ptr = unsafe { NonNull::new_unchecked(src) };
             let super_cache = unsafe { super_cache_ptr.as_ref() };
-            let super_meta_ptr = unsafe { super_cache.meta };
-            let super_meta = unsafe { &*super_meta_ptr };
+            let super_meta = unsafe { super_cache.token.meta() };
             let super_tid = super_cache.thread_id;
             let debt = super_meta.debt.fetch_add(1, Ordering::AcqRel) + 1; // we add 1 at the end to make sure we use the post-update value
             /*// this fence protects the following load of `ref_cnt` from being moved before the guard increment.
@@ -402,7 +399,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
         // of atomics happen-before this.
         fence(Ordering::Acquire);
 
-        // FIXME: free threadid inside threadlocal here.
+        unsafe { token.destruct(); }
     }
     detached
 }
