@@ -37,7 +37,7 @@ impl<T: Send + Sync> AutoLocalArc<T> {
             .get_or(|token| {
                 // println!("inserting: {}", thread_id());
                 DetachablePtr(
-                   token
+                   Some(token)
                 )
             }, |token| {
                 unsafe { &mut *token.meta().cache.get() }.write(CachePadded::new(Cache {
@@ -100,7 +100,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 .get_or(|token| {
                     println!("inserting: {}", tid);
                     DetachablePtr(
-                        token
+                        Some(token)
                     )
                 }, |token| {
                     unsafe { &mut *token.meta().cache.get() }.write(CachePadded::new(Cache {
@@ -242,7 +242,11 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             // TODO: we could add a fastpath here for debt == 0
             if ref_cnt == strip_flags(debt) {
                 // FIXME: this doesn't finish!
-                cleanup_cache::<true, T>(cache_ptr, is_detached(debt), tid); // FIXME: we don't need to check for an expected TID here.
+                if cleanup_cache::<true, T>(cache_ptr, is_detached(debt), tid) { // FIXME: we don't need to check for an expected TID here.
+                    // don't modify the state anymore as it might have been deallocated or be reassociated with another
+                    // thread's entry
+                    return;
+                }
             }
             meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
         } else {
@@ -286,9 +290,10 @@ struct InnerArc<T: Send + Sync> {
     cache: ThreadLocal<DetachablePtr<T>, Metadata<T>, false>,
 }
 
-impl<T: Send + Sync> Drop for InnerArc<T> {
+impl<T: Send + Sync> InnerArc<T> {
+
     #[inline]
-    fn drop(&mut self) {
+    fn prepare_drop(&self) {
         println!("dropping central struct!");
         // wait for all non-local cache users to finish
         for cache in GUARDS.lock().unwrap().iter() {
@@ -315,6 +320,16 @@ impl<T: Send + Sync> Drop for InnerArc<T> {
             state.store(CACHE_STATE_FINISH, Ordering::Release);
         }
         println!("awaited cache users!");
+    }
+
+}
+
+impl<T: Send + Sync> Drop for InnerArc<T> {
+    #[inline]
+    fn drop(&mut self) {
+        for mut entry in self.cache.iter_mut() {
+            *entry.value_mut() = DetachablePtr(None);
+        }
     }
 }
 
@@ -364,6 +379,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
 
             #[cold]
             unsafe fn drop_slow<T: Send + Sync>(ptr: NonNull<InnerArc<T>>) {
+                unsafe { ptr.as_ref() }.prepare_drop();
                 drop(unsafe { SizedBox::from_ptr(ptr) });
             }
             return true;
@@ -449,7 +465,7 @@ unsafe impl<T: Send + Sync> Send for Cache<T> {}
 unsafe impl<T: Send + Sync> Sync for Cache<T> {}
 
 #[repr(transparent)]
-struct DetachablePtr<T: Send + Sync>(UnsafeToken<DetachablePtr<T>, Metadata<T>, false>);
+struct DetachablePtr<T: Send + Sync>(Option<UnsafeToken<DetachablePtr<T>, Metadata<T>, false>>);
 
 unsafe impl<T: Send + Sync> Send for DetachablePtr<T> {}
 unsafe impl<T: Send + Sync> Sync for DetachablePtr<T> {}
@@ -471,28 +487,30 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
     #[inline]
     fn drop(&mut self) {
         println!("dropping detachable ptr");
-        let meta = unsafe { self.0.meta() };
+        if let Some(entry) = self.0.as_ref() {
+            let meta = unsafe { entry.meta() };
 
-        if meta.state.load(Ordering::Acquire) != CACHE_STATE_FINISH {
-            let cache = unsafe { (&*meta.cache.get()).assume_init_ref() };
-            // println!("dropping detachable ptr!");
+            if meta.state.load(Ordering::Acquire) != CACHE_STATE_FINISH {
+                let cache = unsafe { (&*meta.cache.get()).assume_init_ref() };
+                // println!("dropping detachable ptr!");
 
-            // ORDERING: This is `Acquire` as the dropping thread
-            // doesn't necessarily have to be the same as the one
-            // owning the cache and we have to make sure that all decrements happened before this.
-            let ref_cnt = meta.ref_cnt.load(Ordering::Acquire);
-            let tid = cache.thread_id;
-            // mark the cache as detached in order to allow other threads to see
-            let debt = meta.debt.fetch_or(DETACHED_FLAG, Ordering::AcqRel); // TODO: try avoiding having to do this RMW for most cases by adding a fast path
-            // FIXME: are we sure that ref_cnt's last desired value is already visible to us here?
-            if debt == ref_cnt {
-                // we don't have to wait for other threads to finish as they will access
-                // the cache which is available as long as there are threads accessing the
-                // central data structure and not the backing allocation which can get deallocated
-                // at any point in time.
-                drop(cache);
-                fence(Ordering::AcqRel);
-                cleanup_cache::<false, T>(unsafe { NonNull::new_unchecked((cache as *const CachePadded<Cache<T>>).cast_mut()) }, true, tid); // FIXME: do we have to set a marker here?
+                // ORDERING: This is `Acquire` as the dropping thread
+                // doesn't necessarily have to be the same as the one
+                // owning the cache and we have to make sure that all decrements happened before this.
+                let ref_cnt = meta.ref_cnt.load(Ordering::Acquire);
+                let tid = cache.thread_id;
+                // mark the cache as detached in order to allow other threads to see
+                let debt = meta.debt.fetch_or(DETACHED_FLAG, Ordering::AcqRel); // TODO: try avoiding having to do this RMW for most cases by adding a fast path
+                // FIXME: are we sure that ref_cnt's last desired value is already visible to us here?
+                if debt == ref_cnt {
+                    // we don't have to wait for other threads to finish as they will access
+                    // the cache which is available as long as there are threads accessing the
+                    // central data structure and not the backing allocation which can get deallocated
+                    // at any point in time.
+                    drop(cache);
+                    fence(Ordering::AcqRel);
+                    cleanup_cache::<false, T>(unsafe { NonNull::new_unchecked((cache as *const CachePadded<Cache<T>>).cast_mut()) }, true, tid); // FIXME: do we have to set a marker here?
+                }
             }
         }
     }
