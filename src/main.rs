@@ -17,7 +17,7 @@ use crate::swap_arc_tls_optimistic::SwapArcIntermediateTLS;
 use std::hint::{black_box, spin_loop};
 use std::mem::transmute;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{mem, thread};
@@ -29,6 +29,8 @@ use crate::auto_local_arc::AutoLocalArc;
 use arc_swap::ArcSwap;
 #[cfg(test)]
 use test::Bencher;
+
+pub(crate) static TID: AtomicUsize = AtomicUsize::new(0);
 
 fn main() {
     /*for _ in 0..10 {
@@ -118,7 +120,7 @@ fn main() {
     threads.into_iter().for_each(|thread| thread.join().unwrap());*/
     // let tmp = Arc::new(ArcSwap::new(Arc::new(3)));
     // let tmp = AutoLocalArc::new(3);
-    let tmp = AutoLocalArc::new(3);
+    /*let tmp = AutoLocalArc::new(3);
     let mut threads = vec![];
     for _ in 0../*1*//*6*//*8*/7
     /*20*//*5*//*1*/
@@ -143,7 +145,37 @@ fn main() {
     threads
         .into_iter()
         .for_each(|thread| thread.join()/*.unwrap().join()*/.unwrap());
-    thread::sleep(Duration::from_secs(10));
+    thread::sleep(Duration::from_secs(10));*/
+    TID.store(thread_id::get(), Ordering::Release);
+    let tmp = AutoLocalArc::new(3);
+    let mut threads = vec![];
+    for _ in 0..10
+    /*5*//*1*/
+    {
+        let tmp = tmp.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..2000
+            /*200*/
+            {
+                let l1 = tmp.clone();
+                black_box(l1);
+            }
+        }));
+    }
+    let mut fin = 0;
+    threads
+        .into_iter()
+        .for_each(|thread| {
+            thread.join().unwrap();
+            println!("finished thread: {}", fin);
+            fin += 1;
+        });
+    println!("finished all!");
+
+
+
+
+
     /*let mut threads = vec![];
     for _ in 0..5/*20*//*5*//*1*/ {
         let tmp = tmp.clone();
@@ -513,7 +545,6 @@ fn bench_other_single(bencher: &mut Bencher) {
     });
 }*/
 
-/*
 #[bench]
 fn bench_us_read_heavy_single(bencher: &mut Bencher) {
     let tmp: Arc<SwapArcIntermediateTLS<i32, Arc<i32>, 0>> =
@@ -612,7 +643,6 @@ fn bench_arc_read_light_single(bencher: &mut Bencher) {
     });
 }
 
-/*
 #[bench]
 fn bench_arc_read_heavy_multi(bencher: &mut Bencher) {
     let tmp = Arc::new(3);
@@ -637,7 +667,7 @@ fn bench_arc_read_heavy_multi(bencher: &mut Bencher) {
         }
         threads.into_iter().for_each(|thread| thread.join().unwrap());
     });
-}*/
+}
 
 #[bench]
 fn bench_arc_read_light_multi(bencher: &mut Bencher) {
@@ -671,6 +701,7 @@ fn bench_arc_read_light_multi(bencher: &mut Bencher) {
     });
 }
 
+/*
 #[bench]
 fn bench_alarc_read_heavy_single(bencher: &mut Bencher) {
     let tmp = AutoLocalArc::new(3);
@@ -693,7 +724,7 @@ fn bench_alarc_read_heavy_single(bencher: &mut Bencher) {
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
     });
-}
+}*/
 
 #[bench]
 fn bench_alarc_read_light_single(bencher: &mut Bencher) {
@@ -719,6 +750,7 @@ fn bench_alarc_read_light_single(bencher: &mut Bencher) {
     });
 }
 
+/*
 #[bench]
 fn bench_alarc_read_heavy_multi(bencher: &mut Bencher) {
     let tmp = AutoLocalArc::new(3);
@@ -749,7 +781,7 @@ fn bench_alarc_read_heavy_multi(bencher: &mut Bencher) {
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
     });
-}
+}*/
 
 #[bench]
 fn bench_alarc_read_light_multi(bencher: &mut Bencher) {
@@ -783,6 +815,7 @@ fn bench_alarc_read_light_multi(bencher: &mut Bencher) {
     });
 }
 
+/*
 #[bench]
 fn bench_cached_read_heavy_single(bencher: &mut Bencher) {
     let tmp = CachedArc::new(3);
@@ -1010,6 +1043,7 @@ fn bench_spreaded_read_light_multi_local(bencher: &mut Bencher) {
             .for_each(|thread| thread.join().unwrap());
     });
 }
+*/
 
 /*
 #[bench]
@@ -1209,7 +1243,7 @@ fn test_us_single() {
     threads
         .into_iter()
         .for_each(|thread| thread.join().unwrap());
-}*/
+}
 
 /*
 fn test_leak_arc(arc: &Arc<i32>) {

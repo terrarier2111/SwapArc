@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use lazy_static::lazy_static;
 use likely_stable::{likely, unlikely};
 use thread_local::{ThreadLocal, UnsafeToken};
+use crate::TID;
 
 // Debt(t) <= Debt(t + 1)
 // Refs >= Debt
@@ -98,7 +99,6 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 .inner()
                 .cache
                 .get_or(|token| {
-                    println!("inserting: {}", tid);
                     DetachablePtr(
                         Some(token)
                     )
@@ -164,7 +164,6 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                             backoff.snooze();
                         }
                     }
-                    println!("racing load!");
                     // the local cache has no valid references anymore
                     local_cache.src.store(cache_ptr.as_ptr(), Ordering::Release);
                                                                          // this is `2` because we need a reference for the current thread's instance and
@@ -216,12 +215,6 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
         let meta = unsafe { cache_ptr.as_ref().token.meta() };
         let tid = thread_id();
         if cache.thread_id == tid {
-            if cache.thread_id == 0 {
-               println!("start dropping local!");
-                for _ in 0..10 {
-                    println!("eeee");
-                }
-            }
             // println!("decrement local cnt!");
             let ref_cnt = meta.ref_cnt.load(Ordering::Relaxed);
             // println!("dropping {}", ref_cnt);
@@ -232,15 +225,16 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             fence(Ordering::Acquire);
             // `ref_cnt` can't race with `debt` here because we are the only ones who are able to update `ref_cnt`
             let debt = meta.debt.load(Ordering::Acquire);
-            if cache.thread_id == 0 {
-                /*println!(
-                    "local drop: {} refs: {} debt: {}",
-                    cache.thread_id, ref_cnt, debt/*, fin*/
-                );*/
+            if tid == TID.load(Ordering::Acquire) as u64 {
+                println!(
+                "local drop: {} refs: {} debt: {}",
+                cache.thread_id, ref_cnt, debt/*, fin*/
+            );
             }
             // println!("debt: {}\nref_cnt: {}", strip_flags(debt), ref_cnt);
             // TODO: we could add a fastpath here for debt == 0
             if ref_cnt == strip_flags(debt) {
+                println!("rc is debt!");
                 // FIXME: this doesn't finish!
                 if cleanup_cache::<true, T>(cache_ptr, is_detached(debt), tid) { // FIXME: we don't need to check for an expected TID here.
                     // don't modify the state anymore as it might have been deallocated or be reassociated with another
@@ -294,7 +288,6 @@ impl<T: Send + Sync> InnerArc<T> {
 
     #[inline]
     fn prepare_drop(&self) {
-        println!("dropping central struct!");
         // wait for all non-local cache users to finish
         for cache in GUARDS.lock().unwrap().iter() {
             let cache = unsafe { (*cache as *const AtomicPtr<()>).as_ref().unwrap_unchecked() };
@@ -304,14 +297,11 @@ impl<T: Send + Sync> InnerArc<T> {
             }
         }
 
-        println!("awaited caches!");
-
         // wait for all local cache users to finish
         for cache in self.cache.iter() {
             let mut backoff = Backoff::new();
             // wait until the local thread is done using its cache
             let state = &unsafe { cache.meta() }.state;
-            println!("cache: {:?}", cache.meta() as *const Metadata<T>);
             while state.load(Ordering::Acquire) != CACHE_STATE_IDLE {
                 backoff.snooze();
                 // println!("state: {}", state.load(Ordering::Acquire));
@@ -319,7 +309,6 @@ impl<T: Send + Sync> InnerArc<T> {
             // signal to the destructor that we are finished.
             state.store(CACHE_STATE_FINISH, Ordering::Release);
         }
-        println!("awaited cache users!");
     }
 
 }
@@ -349,7 +338,6 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
     let token = unsafe { cache.as_ref().token.duplicate() };
     let meta = unsafe { token.meta() };
 
-    println!("cleanup cache {:?} : {}", meta as *const Metadata<T>, detached);
     if UPDATE_SUPER && likely(meta.thread_id.compare_exchange(exp_tid, INVALID_TID, Ordering::AcqRel, Ordering::Relaxed).is_ok()) {
         // FIXME: when freeing the own memory, we still have a reference to it and thus UB
         // FIXME: the same thing is the case when freeing the major allocation
@@ -362,7 +350,6 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
         let src = unsafe { cache.as_ref() }.src.load(Ordering::Acquire);
         // there are no external refs alive
         if src.is_null() {
-            println!("delete main thingy: {:?} : {}", meta as *const Metadata<T>, thread_id());
             meta
                 .debt
                 .fetch_or(DETACHED_FLAG, Ordering::AcqRel);
@@ -379,8 +366,14 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
 
             #[cold]
             unsafe fn drop_slow<T: Send + Sync>(ptr: NonNull<InnerArc<T>>) {
+                println!("start cleanup main!");
+
                 unsafe { ptr.as_ref() }.prepare_drop();
+                println!("cleanup main!");
+
                 drop(unsafe { SizedBox::from_ptr(ptr) });
+
+                println!("cleaned up main!");
             }
             return true;
         } else {
@@ -486,7 +479,6 @@ impl<T: Send + Sync> DetachablePtr<T> {
 impl<T: Send + Sync> Drop for DetachablePtr<T> {
     #[inline]
     fn drop(&mut self) {
-        println!("dropping detachable ptr");
         if let Some(entry) = self.0.as_ref() {
             let meta = unsafe { entry.meta() };
 
