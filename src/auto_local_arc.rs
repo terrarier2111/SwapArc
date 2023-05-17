@@ -234,7 +234,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             // println!("debt: {}\nref_cnt: {}", strip_flags(debt), ref_cnt);
             // TODO: we could add a fastpath here for debt == 0
             if ref_cnt == strip_flags(debt) {
-                println!("rc is debt!");
+                println!("rc is debt: {}", is_detached(debt));
                 // FIXME: this doesn't finish!
                 if cleanup_cache::<true, T>(cache_ptr, is_detached(debt), tid) { // FIXME: we don't need to check for an expected TID here.
                     // don't modify the state anymore as it might have been deallocated or be reassociated with another
@@ -255,6 +255,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             fence(Ordering::Acquire);
             let ref_cnt = unsafe { cache.token.meta() }.ref_cnt.load(Ordering::Acquire);
             if strip_flags(debt) == ref_cnt {
+                println!("rc is debt external {} | {}", tid, cache.thread_id);
 
                 // FIXME: NEW: there is probably a race condition here - what if cache's owner increases its reference count here
                 // FIXME: and we free its cache just down below?
