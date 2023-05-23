@@ -149,7 +149,7 @@ fn main() {
     TID.store(thread_id::get(), Ordering::Release);
     let tmp = AutoLocalArc::new(3);
     let mut threads = vec![];
-    for _ in 0..10
+    for _ in 0..10/*10*/
     /*5*//*1*/
     {
         let tmp = tmp.clone();
@@ -171,6 +171,7 @@ fn main() {
             fin += 1;
         });
     println!("finished all!");
+    thread::sleep(Duration::from_millis(50));
 
 
 
