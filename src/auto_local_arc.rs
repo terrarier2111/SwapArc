@@ -30,6 +30,10 @@ use crate::TID;
 // FIXME: but the debt has its flag set and as such the values are not actually completely the same.
 // FIXME: also the master entry of the returned alternative entry usually gets cleaned up before the alternative entry gets acquired.
 
+// FIXME: for the other time when the program doesn't finish, there's a couple of "failed to swap TID"-messages floating around
+// FIXME: and the issue is that the expected tid is equal to the current tid but the cache's tid is not the same as the current tid
+// FIXME: and as such the comparison fails (for detached caches)
+
 pub struct AutoLocalArc<T: Send + Sync> {
     inner: NonNull<InnerArc<T>>,
     cache: UnsafeCell<NonNull<CachePadded<Cache<T>>>>,
@@ -285,11 +289,11 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             if tid == TID.load(Ordering::Acquire) as u64 {
                 println!(
                     "FAILED local drop: {} refs: {} debt: {} | glob {} | tid {} address {:?}",
-                    cache.thread_id, ref_cnt, debt/*, fin*/, TID.load(Ordering::Acquire), tid, cache_ptr.as_ptr()
+                    cache_tid, ref_cnt, debt/*, fin*/, TID.load(Ordering::Acquire), tid, cache_ptr.as_ptr()
                 );
             }
             if strip_flags(debt) == ref_cnt {
-                // println!("rc is debt external curr {} | cached_id {} | debt {} | stripped {} | rc {}", tid, cache.thread_id, debt, strip_flags(debt), ref_cnt);
+                println!("rc is debt external curr {} | cached_id {} | debt {} | stripped {} | rc {}", tid, cache_tid, debt, strip_flags(debt), ref_cnt);
 
                 // FIXME: NEW: there is probably a race condition here - what if cache's owner increases its reference count here
                 // FIXME: and we free its cache just down below?
