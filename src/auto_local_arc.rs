@@ -34,6 +34,8 @@ use crate::TID;
 // FIXME: and the issue is that the expected tid is equal to the current tid but the cache's tid is not the same as the current tid
 // FIXME: and as such the comparison fails (for detached caches)
 
+// FIXME: but sometimes the hang even happens without any "failed to swap TID"-messages.
+
 pub struct AutoLocalArc<T: Send + Sync> {
     inner: NonNull<InnerArc<T>>,
     cache: UnsafeCell<NonNull<CachePadded<Cache<T>>>>,
@@ -154,8 +156,13 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     // we have a retry loop here in case the debt's updater hasn't finished yet
                     let mut backoff = Backoff::new();
                     // wait for the other thread to clean up
+                    let mut iter = 0;
                     while local_meta.thread_id.load(Ordering::Acquire) != INVALID_TID {
                         backoff.snooze();
+                        iter += 1;
+                        if iter % 100000 == 0 {
+                            println!("itering 1!");
+                        }
                     }
                 }
                 // the local cache has no valid references anymore
@@ -165,7 +172,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 local_meta.ref_cnt.store(2, Ordering::Release);
                 // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
                 local_meta.debt.store(0, Ordering::Release);
-                local_meta.thread_id.store(tid, Ordering::Release);
+                local_meta.thread_id.store(local_cache.thread_id/*tid*/, Ordering::Release); // FIXME: why does this work with "local_cache.thread_id" but not with "tid"? they should be equivalent
                 local_meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
                 // remove the reference to the external cache, as we moved it to our own cache instead
                 *unsafe { &mut *self.cache.get() } = local_cache_ptr;
@@ -190,8 +197,13 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                         // we have a retry loop here in case the debt's updater hasn't finished yet
                         let mut backoff = Backoff::new();
                         // wait for the other thread to clean up
+                        let mut iter = 0;
                         while local_meta.thread_id.load(Ordering::Acquire) != INVALID_TID {
                             backoff.snooze();
+                            iter += 1;
+                            if iter % 100000 == 0 {
+                                println!("itering 2!");
+                            }
                         }
                     }
                     // the local cache has no valid references anymore
@@ -201,7 +213,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     local_meta.ref_cnt.store(2, Ordering::Release);
                     // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
                     local_meta.debt.store(0, Ordering::Release);
-                    local_meta.thread_id.store(tid, Ordering::Release);
+                    local_meta.thread_id.store(local_cache.thread_id/*tid*/, Ordering::Release); // FIXME: why does this work with "local_cache.thread_id" but not with "tid"? they should be equivalent
                     local_meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
                     // remove the reference to the external cache, as we moved it to our own cache instead
                     *unsafe { &mut *self.cache.get() } = local_cache_ptr;
@@ -503,6 +515,7 @@ const CACHE_STATE_FINISH: u8 = 2;
 
 impl<T: Send + Sync> thread_local::Metadata for Metadata<T> {
     fn set_default(&self) {
+        panic!("this shouldn't be called!");
         self.thread_id.store(thread_id(), Ordering::Release);
         self.ref_cnt.store(1, Ordering::Release);
     }

@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{mem, thread};
+use std::backtrace::Backtrace;
 
 #[cfg(test)]
 extern crate test;
@@ -166,6 +167,12 @@ fn main() {
     threads
         .into_iter()
         .for_each(|thread| {
+            /*if !thread.is_finished() {
+                thread::sleep(Duration::from_millis(1000));
+                if !thread.is_finished() {
+
+                }
+            }*/
             thread.join().unwrap();
             println!("finished thread: {}", fin);
             fin += 1;
