@@ -36,6 +36,9 @@ use crate::TID;
 
 // FIXME: but sometimes the hang even happens without any "failed to swap TID"-messages.
 
+
+// FIXME: all instances of tid and cache.thread_id differing are in alternative caches!
+
 pub struct AutoLocalArc<T: Send + Sync> {
     inner: NonNull<InnerArc<T>>,
     cache: UnsafeCell<NonNull<CachePadded<Cache<T>>>>,
@@ -172,7 +175,10 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 local_meta.ref_cnt.store(2, Ordering::Release);
                 // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
                 local_meta.debt.store(0, Ordering::Release);
-                local_meta.thread_id.store(local_cache.thread_id/*tid*/, Ordering::Release); // FIXME: why does this work with "local_cache.thread_id" but not with "tid"? they should be equivalent
+                if local_cache.thread_id != tid {
+                    println!("differing ids: cache {:?} cache_tid {} curr {}", local_cache as *const _, local_cache.thread_id, tid);
+                }
+                local_meta.thread_id.store(tid, Ordering::Release);
                 local_meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
                 // remove the reference to the external cache, as we moved it to our own cache instead
                 *unsafe { &mut *self.cache.get() } = local_cache_ptr;
@@ -213,7 +219,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     local_meta.ref_cnt.store(2, Ordering::Release);
                     // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
                     local_meta.debt.store(0, Ordering::Release);
-                    local_meta.thread_id.store(local_cache.thread_id/*tid*/, Ordering::Release); // FIXME: why does this work with "local_cache.thread_id" but not with "tid"? they should be equivalent
+                    local_meta.thread_id.store(tid, Ordering::Release);
                     local_meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
                     // remove the reference to the external cache, as we moved it to our own cache instead
                     *unsafe { &mut *self.cache.get() } = local_cache_ptr;
@@ -479,6 +485,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
         // of atomics happen-before this.
         fence(Ordering::Acquire);
 
+        println!("destructed {:?}", cache.as_ptr());
         // println!("destructing: {:?}", unsafe { transmute::<_, *const ()>(token.duplicate()) });
         unsafe { token.destruct(); }
         // println!("destructed!");
@@ -569,6 +576,9 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
                     // at any point in time.
                     drop(cache);
                     fence(Ordering::AcqRel);
+                    if debt == 0 {
+                        println!("zero drop!");
+                    }
                     cleanup_cache::<false, T>(unsafe { NonNull::new_unchecked((cache as *const CachePadded<Cache<T>>).cast_mut()) }, true, tid); // FIXME: do we have to set a marker here?
                 }
             }
