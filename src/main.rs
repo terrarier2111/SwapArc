@@ -163,7 +163,6 @@ fn main() {
             }
         }));
     }
-    let mut fin = 0;
     threads
         .into_iter()
         .for_each(|thread| {
@@ -174,8 +173,6 @@ fn main() {
                 }
             }*/
             thread.join().unwrap();
-            println!("finished thread: {}", fin);
-            fin += 1;
         });
     println!("finished all!");
     thread::sleep(Duration::from_millis(50));

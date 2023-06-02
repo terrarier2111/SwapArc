@@ -63,7 +63,6 @@ impl<T: Send + Sync> AutoLocalArc<T> {
                    Some(token)
                 )
             }, |token| {
-                println!("write initial cache: {:?}", unsafe { transmute::<_, *const ()>(token) });
                 unsafe { &mut *token.meta().cache.get() }.write(CachePadded::new(Cache {
                     parent: inner,
                     src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
@@ -73,7 +72,6 @@ impl<T: Send + Sync> AutoLocalArc<T> {
                 token.meta().ref_cnt.store(1, Ordering::Release);
                 token.meta().thread_id.store(tid, Ordering::Release);
             }).meta().cache.get().as_ref().unwrap_unchecked().as_ptr() };
-        println!("initial: tid {} address {:?}", tid, cache);
         let ret = Self {
             inner,
             cache: UnsafeCell::new(unsafe { NonNull::new_unchecked(cache.cast_mut()) }),
@@ -128,7 +126,6 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                         Some(token)
                     )
                 }, |token| {
-                    println!("write cache: {:?}", unsafe { transmute::<_, *const ()>(token) });
                     unsafe { &mut *token.meta().cache.get() }.write(CachePadded::new(Cache {
                         parent: inner,
                         src: AtomicPtr::new(cache_ptr.as_ptr()),
@@ -144,10 +141,6 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             let ref_cnt = local_meta.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
             let debt = local_meta.debt.load(Ordering::Acquire);
 
-            if ref_cnt != debt && ref_cnt == strip_flags(debt) {
-                println!("weird state rc {} | debt {} | stripped {}", ref_cnt, debt, strip_flags(debt));
-            }
-
             // check if the local cache's instance is still valid.
             // check if the local cache is unused, this is the case if either
             // there are no outstanding references to the cache or it was just newly created.
@@ -159,13 +152,8 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     // we have a retry loop here in case the debt's updater hasn't finished yet
                     let mut backoff = Backoff::new();
                     // wait for the other thread to clean up
-                    let mut iter = 0;
                     while local_meta.thread_id.load(Ordering::Acquire) != INVALID_TID {
                         backoff.snooze();
-                        iter += 1;
-                        if iter % 100000 == 0 {
-                            println!("itering 1!");
-                        }
                     }
                 }
                 // the local cache has no valid references anymore
@@ -175,9 +163,6 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 local_meta.ref_cnt.store(2, Ordering::Release);
                 // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
                 local_meta.debt.store(0, Ordering::Release);
-                if local_cache.thread_id != tid {
-                    println!("differing ids: cache {:?} cache_tid {} curr {}", local_cache as *const _, local_cache.thread_id, tid);
-                }
                 local_meta.thread_id.store(tid, Ordering::Release);
                 local_meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
                 // remove the reference to the external cache, as we moved it to our own cache instead
@@ -203,13 +188,8 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                         // we have a retry loop here in case the debt's updater hasn't finished yet
                         let mut backoff = Backoff::new();
                         // wait for the other thread to clean up
-                        let mut iter = 0;
                         while local_meta.thread_id.load(Ordering::Acquire) != INVALID_TID {
                             backoff.snooze();
-                            iter += 1;
-                            if iter % 100000 == 0 {
-                                println!("itering 2!");
-                            }
                         }
                     }
                     // the local cache has no valid references anymore
@@ -239,8 +219,6 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
 /// Safety: this method may only be called with the local cache as the `cache` parameter.
 #[cold]
 unsafe fn handle_large_ref_count<T: Send + Sync>(cache: *mut CachePadded<Cache<T>>, ref_cnt: usize) {
-    panic!("error!");
-
     let meta = unsafe { cache.as_ref().unwrap_unchecked().token.meta() };
 
     // try to recover by decrementing the `debt` count from the `ref_cnt` and setting the `debt` count to 0
@@ -264,9 +242,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
         let meta = unsafe { cache_ptr.as_ref().token.meta() };
         let tid = thread_id();
         if cache.thread_id == tid {
-            // println!("decrement local cnt!");
             let ref_cnt = meta.ref_cnt.load(Ordering::Relaxed);
-            // println!("dropping {}", ref_cnt);
             meta.state.store(CACHE_STATE_IN_USE, Ordering::Release);
             meta.ref_cnt.store(ref_cnt - 1, Ordering::Release);
             let ref_cnt = ref_cnt - 1;
@@ -274,17 +250,8 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             fence(Ordering::Acquire);
             // `ref_cnt` can't race with `debt` here because we are the only ones who are able to update `ref_cnt`
             let debt = meta.debt.load(Ordering::Acquire);
-            if tid == TID.load(Ordering::Acquire) as u64 {
-                println!(
-                "local drop: {} refs: {} debt: {}",
-                cache.thread_id, ref_cnt, debt/*, fin*/
-            );
-            }
-            // println!("debt: {}\nref_cnt: {}", strip_flags(debt), ref_cnt);
             // TODO: we could add a fastpath here for debt == 0
             if ref_cnt == strip_flags(debt) {
-                println!("rc is debt: {}", is_detached(debt));
-                // FIXME: this doesn't finish!
                 if cleanup_cache::<true, T>(cache_ptr, is_detached(debt), tid) { // FIXME: we don't need to check for an expected TID here.
                     // don't modify the state anymore as it might have been deallocated or be reassociated with another
                     // thread's entry
@@ -304,15 +271,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             }
             fence(Ordering::Acquire);
             let ref_cnt = unsafe { cache.token.meta() }.ref_cnt.load(Ordering::Acquire);
-            if tid == TID.load(Ordering::Acquire) as u64 {
-                println!(
-                    "FAILED local drop: {} refs: {} debt: {} | glob {} | tid {} address {:?}",
-                    cache_tid, ref_cnt, debt/*, fin*/, TID.load(Ordering::Acquire), tid, cache_ptr.as_ptr()
-                );
-            }
             if strip_flags(debt) == ref_cnt {
-                println!("rc is debt external curr {} | cached_id {} | debt {} | stripped {} | rc {}", tid, cache_tid, debt, strip_flags(debt), ref_cnt);
-
                 // FIXME: NEW: there is probably a race condition here - what if cache's owner increases its reference count here
                 // FIXME: and we free its cache just down below?
 
@@ -361,7 +320,6 @@ impl<T: Send + Sync> InnerArc<T> {
             let state = &unsafe { cache.meta() }.state;
             while state.load(Ordering::Acquire) != CACHE_STATE_IDLE {
                 backoff.snooze();
-                // println!("state: {}", state.load(Ordering::Acquire));
             }
             // signal to the destructor that we are finished.
             state.store(CACHE_STATE_FINISH, Ordering::Release);
@@ -403,24 +361,20 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
             Ok(_) => {
                 // FIXME: when freeing the own memory, we still have a reference to it and thus UB
                 // FIXME: the same thing is the case when freeing the major allocation
-                // println!("cleanup cache: {}", unsafe { &*cache }.ref_cnt.load(Ordering::Relaxed));
                 // FIXME: check for `detached` and deallocate own memory if detached
 
 
                 // ORDERING: this is Acquire because we have to link to the previous store to `src` which might have
                 // happened on a different thread than this (the deallocating) one.
                 let src = unsafe { cache.as_ref() }.src.load(Ordering::Acquire);
-                println!("start cleanup {:?} (child of {:?})", cache.as_ptr(), src);
                 // there are no external refs alive
                 if src.is_null() {
-                    println!("major cleanup!");
                     meta
                         .debt
                         .fetch_or(DETACHED_FLAG, Ordering::AcqRel);
                     // signal that we are finished so we don't accidentally loop indefinitely in the `InnerArc`
                     // destructor as we don't reach our update here "normally".
                     meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
-                    // unsafe { cache.as_ref() }.finished.store(FinishedMsg::new(msg_id, FinishedMsgTy::Finished).0, Ordering::Release);
                     fence(Ordering::Acquire);
 
                     // we are the first "(cache) node", so we need to free the memory
@@ -430,14 +384,9 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
 
                     #[cold]
                     unsafe fn drop_slow<T: Send + Sync>(ptr: NonNull<InnerArc<T>>) {
-                        println!("start cleanup main!");
-
                         unsafe { ptr.as_ref() }.prepare_drop();
-                        println!("cleanup main!");
 
                         drop(unsafe { SizedBox::from_ptr(ptr) });
-
-                        println!("cleaned up main!");
                     }
                     return true;
                 } else {
@@ -466,29 +415,21 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
                     // the super cache cleaned up by itself
                     if strip_flags(debt) == ref_cnt/* && super_thread_id == super_meta.thread_id.load(Ordering::Acquire)*/ {
                         drop(super_cache);
-                        println!("cleanup other!");
 
                         fence(Ordering::AcqRel);
                         cleanup_cache::<true, T>(super_cache_ptr, super_detached, super_tid);
                         // fence(Ordering::AcqRel);
                     }
-                    // unsafe { cache.as_ref().unwrap() }.finished.store(FinishedMsg::new(debt, FinishedMsgTy::Finished).0, Ordering::Release); // FIXME: do we have to do this?
                 }
             }
-            Err(err) => {
-                println!("failed to swap TID {} exp {} inval {} cache {:?}", err, exp_tid, usize::MAX, cache.as_ptr());
-            }
+            Err(_) => {}
         }
     }
     if detached {
         // ORDERING: We use a fence here in order to ensure that all other operations and uses
         // of atomics happen-before this.
         fence(Ordering::Acquire);
-
-        println!("destructed {:?}", cache.as_ptr());
-        // println!("destructing: {:?}", unsafe { transmute::<_, *const ()>(token.duplicate()) });
         unsafe { token.destruct(); }
-        // println!("destructed!");
     }
     detached
 }
@@ -537,19 +478,6 @@ struct DetachablePtr<T: Send + Sync>(Option<UnsafeToken<DetachablePtr<T>, Metada
 unsafe impl<T: Send + Sync> Send for DetachablePtr<T> {}
 unsafe impl<T: Send + Sync> Sync for DetachablePtr<T> {}
 
-/*
-impl<T: Send + Sync> DetachablePtr<T> {
-
-    unsafe fn cleanup(&mut self) {
-        println!("trying to clean up!");
-        if let Some(cache) = self.0.take() {
-            println!("cleaning up....");
-            cleanup_cache::<false, T>(cache, true, cache.as_ref().thread_id);
-        }
-    }
-
-}*/
-
 impl<T: Send + Sync> Drop for DetachablePtr<T> {
     #[inline]
     fn drop(&mut self) {
@@ -558,7 +486,6 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
 
             if meta.state.load(Ordering::Acquire) != CACHE_STATE_FINISH {
                 let cache = unsafe { (&*meta.cache.get()).assume_init_ref() };
-                // println!("dropping detachable ptr!");
 
                 // ORDERING: This is `Acquire` as the dropping thread
                 // doesn't necessarily have to be the same as the one
@@ -566,7 +493,6 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
                 let ref_cnt = meta.ref_cnt.load(Ordering::Acquire);
                 let tid = cache.thread_id;
                 // mark the cache as detached in order to allow other threads to see
-                println!("detached {:?}", cache as *const CachePadded<Cache<T>>);
                 let debt = meta.debt.fetch_or(DETACHED_FLAG, Ordering::AcqRel); // TODO: try avoiding having to do this RMW for most cases by adding a fast path
                 // FIXME: are we sure that ref_cnt's last desired value is already visible to us here?
                 if debt == ref_cnt {
@@ -576,9 +502,6 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
                     // at any point in time.
                     drop(cache);
                     fence(Ordering::AcqRel);
-                    if debt == 0 {
-                        println!("zero drop!");
-                    }
                     cleanup_cache::<false, T>(unsafe { NonNull::new_unchecked((cache as *const CachePadded<Cache<T>>).cast_mut()) }, true, tid); // FIXME: do we have to set a marker here?
                 }
             }
