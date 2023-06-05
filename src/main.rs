@@ -149,7 +149,7 @@ fn main() {
     thread::sleep(Duration::from_secs(10));*/
     TID.store(thread_id::get(), Ordering::Release);
     let tmp = AutoLocalArc::new(3);
-    for _ in 0..2 {
+    for _ in 0..20 {
         let mut threads = vec![];
         for _ in 0..1
         /*5*//*1*/
@@ -604,7 +604,6 @@ fn bench_us_read_light_single(bencher: &mut Bencher) {
     });
 }*/
 
-/*
 #[bench]
 fn bench_arc_read_heavy_single(bencher: &mut Bencher) {
     let tmp = Arc::new(3);
@@ -654,6 +653,33 @@ fn bench_arc_read_light_single(bencher: &mut Bencher) {
 }
 
 #[bench]
+fn bench_arc_read_light_single_many(bencher: &mut Bencher) {
+    let tmp = Arc::new(3);
+    bencher.iter(|| {
+        for _ in 0..1000 {
+            let mut threads = vec![];
+            for _ in 0..1
+            /*5*//*1*/
+            {
+                let tmp = tmp.clone();
+                threads.push(thread::spawn(move || {
+                    for _ in 0..20
+                    /*200*/
+                    {
+                        let l1 = tmp.clone();
+                        black_box(l1);
+                    }
+                }));
+            }
+            threads
+                .into_iter()
+                .for_each(|thread| thread.join().unwrap());
+        }
+    });
+}
+
+/*
+#[bench]
 fn bench_arc_read_heavy_multi(bencher: &mut Bencher) {
     let tmp = Arc::new(3);
     bencher.iter(|| {
@@ -677,7 +703,7 @@ fn bench_arc_read_heavy_multi(bencher: &mut Bencher) {
         }
         threads.into_iter().for_each(|thread| thread.join().unwrap());
     });
-}
+}*/
 
 #[bench]
 fn bench_arc_read_light_multi(bencher: &mut Bencher) {
@@ -709,9 +735,8 @@ fn bench_arc_read_light_multi(bencher: &mut Bencher) {
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
     });
-}*/
+}
 
-/*
 #[bench]
 fn bench_alarc_read_heavy_single(bencher: &mut Bencher) {
     let tmp = AutoLocalArc::new(3);
@@ -734,7 +759,7 @@ fn bench_alarc_read_heavy_single(bencher: &mut Bencher) {
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
     });
-}*/
+}
 
 #[bench]
 fn bench_alarc_read_light_single(bencher: &mut Bencher) {
@@ -760,7 +785,32 @@ fn bench_alarc_read_light_single(bencher: &mut Bencher) {
     });
 }
 
-/*
+#[bench]
+fn bench_alarc_read_light_single_many(bencher: &mut Bencher) {
+    let tmp = AutoLocalArc::new(3);
+    bencher.iter(|| {
+        for _ in 0..1000 {
+            let mut threads = vec![];
+            for _ in 0..1
+            /*5*//*1*/
+            {
+                let tmp = tmp.clone();
+                threads.push(thread::spawn(move || {
+                    for _ in 0..20
+                    /*200*/
+                    {
+                        let l1 = tmp.clone();
+                        black_box(l1);
+                    }
+                }));
+            }
+            threads
+                .into_iter()
+                .for_each(|thread| thread.join().unwrap());
+        }
+    });
+}
+
 #[bench]
 fn bench_alarc_read_heavy_multi(bencher: &mut Bencher) {
     let tmp = AutoLocalArc::new(3);
@@ -791,9 +841,8 @@ fn bench_alarc_read_heavy_multi(bencher: &mut Bencher) {
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
     });
-}*/
+}
 
-/*
 #[bench]
 fn bench_alarc_read_light_multi(bencher: &mut Bencher) {
     let tmp = AutoLocalArc::new(3);
@@ -824,7 +873,7 @@ fn bench_alarc_read_light_multi(bencher: &mut Bencher) {
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
     });
-}*/
+}
 
 /*
 #[bench]

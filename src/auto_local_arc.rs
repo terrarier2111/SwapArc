@@ -496,14 +496,6 @@ const CACHE_STATE_IDLE: u8 = 0;
 const CACHE_STATE_IN_USE: u8 = 1;
 const CACHE_STATE_FINISH: u8 = 2;
 
-impl<T: Send + Sync> thread_local::Metadata for Metadata<T> {
-    fn set_default(&self) {
-        panic!("this shouldn't be called!");
-        self.thread_id.store(thread_id(), Ordering::Release);
-        self.ref_cnt.store(1, Ordering::Release);
-    }
-}
-
 unsafe impl<T: Send + Sync> Send for Cache<T> {}
 unsafe impl<T: Send + Sync> Sync for Cache<T> {}
 
