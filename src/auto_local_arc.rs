@@ -14,6 +14,8 @@ use likely_stable::{likely, unlikely};
 use thread_local::{ThreadLocal, UnsafeToken};
 use crate::TID;
 
+const DEBUG: bool = false;
+
 // Debt(t) <= Debt(t + 1)
 // Refs >= Debt
 // Refs(t + 1) >= Debt(t)
@@ -48,6 +50,7 @@ unsafe impl<T: Send + Sync> Send for AutoLocalArc<T> {}
 unsafe impl<T: Send + Sync> Sync for AutoLocalArc<T> {}
 
 impl<T: Send + Sync> AutoLocalArc<T> {
+    #[no_mangle]
     pub fn new(val: T) -> Self {
         let inner = SizedBox::new(InnerArc {
             val,
@@ -63,7 +66,9 @@ impl<T: Send + Sync> AutoLocalArc<T> {
                    Some(token)
                 )
             }, |token| {
-                println!("write initial cache: {:?}", unsafe { transmute::<_, *const ()>(token) });
+                if DEBUG {
+                    println!("write initial cache: {:?}", unsafe { transmute::<_, *const ()>(token) });
+                }
                 unsafe { &mut *token.meta().cache.get() }.write(CachePadded::new(Cache {
                     parent: inner,
                     src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
@@ -73,7 +78,9 @@ impl<T: Send + Sync> AutoLocalArc<T> {
                 token.meta().ref_cnt.store(1, Ordering::Release);
                 token.meta().thread_id.store(tid, Ordering::Release);
             }).meta().cache.get().as_ref().unwrap_unchecked().as_ptr() };
-        println!("initial: tid {} address {:?}", tid, cache);
+        if DEBUG {
+            println!("initial: tid {} address {:?}", tid, cache);
+        }
         let ret = Self {
             inner,
             cache: UnsafeCell::new(unsafe { NonNull::new_unchecked(cache.cast_mut()) }),
@@ -128,7 +135,9 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                         Some(token)
                     )
                 }, |token| {
-                    println!("write cache: {:?}", unsafe { transmute::<_, *const ()>(token) });
+                    if DEBUG {
+                        println!("write cache: {:?}", unsafe { transmute::<_, *const ()>(token) });
+                    }
                     unsafe { &mut *token.meta().cache.get() }.write(CachePadded::new(Cache {
                         parent: inner,
                         src: AtomicPtr::new(cache_ptr.as_ptr()),
@@ -145,7 +154,9 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             let debt = local_meta.debt.load(Ordering::Acquire);
 
             if ref_cnt != debt && ref_cnt == strip_flags(debt) {
-                println!("weird state rc {} | debt {} | stripped {}", ref_cnt, debt, strip_flags(debt));
+                if DEBUG {
+                    println!("weird state rc {} | debt {} | stripped {}", ref_cnt, debt, strip_flags(debt));
+                }
             }
 
             // check if the local cache's instance is still valid.
@@ -176,7 +187,9 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 *unsafe { &mut *self.cache.get() } = local_cache_ptr;
             } else {
                 if local_cache.thread_id != tid {
-                    println!("differing ids: cache {:?} cache_tid {} curr {}", local_cache as *const _, local_cache.thread_id, tid);
+                    if DEBUG {
+                        println!("differing ids: cache {:?} cache_tid {} curr {}", local_cache as *const _, local_cache.thread_id, tid);
+                    }
                 }
                 // the local cache is still in use, try simply incrementing its counter
                 // if we fail, just fall back to the slow path
@@ -262,15 +275,19 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             fence(Ordering::Acquire);
             // `ref_cnt` can't race with `debt` here because we are the only ones who are able to update `ref_cnt`
             let debt = meta.debt.load(Ordering::Acquire);
-            if tid == TID.load(Ordering::Acquire) as u64 {
-                println!(
-                    "local drop: {} refs: {} debt: {}",
-                    cache.thread_id, ref_cnt, debt/*, fin*/
-                );
+            if DEBUG {
+                if tid == TID.load(Ordering::Acquire) as u64 {
+                    println!(
+                        "local drop: {} refs: {} debt: {}",
+                        cache.thread_id, ref_cnt, debt/*, fin*/
+                    );
+                }
             }
             // TODO: we could add a fastpath here for debt == 0
             if ref_cnt == strip_flags(debt) {
-                println!("rc is debt: {}", is_detached(debt));
+                if DEBUG {
+                    println!("rc is debt: {}", is_detached(debt));
+                }
                 if cleanup_cache::<true, T>(cache_ptr, is_detached(debt), tid) { // FIXME: we don't need to check for an expected TID here.
                     // don't modify the state anymore as it might have been deallocated or be reassociated with another
                     // thread's entry
@@ -290,14 +307,18 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             }
             fence(Ordering::Acquire);
             let ref_cnt = unsafe { cache.token.meta() }.ref_cnt.load(Ordering::Acquire);
-            if tid == TID.load(Ordering::Acquire) as u64 {
-                println!(
-                    "FAILED local drop: {} refs: {} debt: {} | glob {} | tid {} address {:?}",
-                    cache_tid, ref_cnt, debt/*, fin*/, TID.load(Ordering::Acquire), tid, cache_ptr.as_ptr()
-                );
+            if DEBUG {
+                if tid == TID.load(Ordering::Acquire) as u64 {
+                    println!(
+                        "FAILED local drop: {} refs: {} debt: {} | glob {} | tid {} address {:?}",
+                        cache_tid, ref_cnt, debt/*, fin*/, TID.load(Ordering::Acquire), tid, cache_ptr.as_ptr()
+                    );
+                }
             }
             if strip_flags(debt) == ref_cnt {
-                println!("rc is debt external curr {} | cached_id {} | debt {} | stripped {} | rc {}", tid, cache_tid, debt, strip_flags(debt), ref_cnt);
+                if DEBUG {
+                    println!("rc is debt external curr {} | cached_id {} | debt {} | stripped {} | rc {}", tid, cache_tid, debt, strip_flags(debt), ref_cnt);
+                }
                 // FIXME: NEW: there is probably a race condition here - what if cache's owner increases its reference count here
                 // FIXME: and we free its cache just down below?
 
@@ -393,10 +414,14 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
                 // ORDERING: this is Acquire because we have to link to the previous store to `src` which might have
                 // happened on a different thread than this (the deallocating) one.
                 let src = unsafe { cache.as_ref() }.src.load(Ordering::Acquire);
-                println!("start cleanup {:?} (child of {:?}) token {:?}", cache.as_ptr(), src, unsafe { transmute::<_, *const ()>(token.duplicate()) });
+                if DEBUG {
+                    println!("start cleanup {:?} (child of {:?}) token {:?}", cache.as_ptr(), src, unsafe { transmute::<_, *const ()>(token.duplicate()) });
+                }
                 // there are no external refs alive
                 if src.is_null() {
-                    println!("major cleanup!");
+                    if DEBUG {
+                        println!("major cleanup!");
+                    }
                     meta
                         .debt
                         .fetch_or(DETACHED_FLAG, Ordering::AcqRel);
@@ -412,12 +437,18 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
 
                     #[cold]
                     unsafe fn drop_slow<T: Send + Sync>(ptr: NonNull<InnerArc<T>>) {
-                        println!("start cleanup main!");
+                        if DEBUG {
+                            println!("start cleanup main!");
+                        }
                         unsafe { ptr.as_ref() }.prepare_drop();
-                        println!("cleanup main!");
+                        if DEBUG {
+                            println!("cleanup main!");
+                        }
 
                         drop(unsafe { SizedBox::from_ptr(ptr) });
-                        println!("cleaned up main!");
+                        if DEBUG {
+                            println!("cleaned up main!");
+                        }
                     }
                     return true;
                 } else {
@@ -446,7 +477,9 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
                     // the super cache cleaned up by itself
                     if strip_flags(debt) == ref_cnt/* && super_thread_id == super_meta.thread_id.load(Ordering::Acquire)*/ {
                         drop(super_cache);
-                        println!("cleanup other!");
+                        if DEBUG {
+                            println!("cleanup other!");
+                        }
 
                         fence(Ordering::AcqRel);
                         cleanup_cache::<true, T>(super_cache_ptr, super_detached, super_tid);
@@ -455,7 +488,9 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
                 }
             }
             Err(err) => {
-                println!("failed to swap TID {} exp {} inval {} cache {:?}", err, exp_tid, usize::MAX, cache.as_ptr());
+                if DEBUG {
+                    println!("failed to swap TID {} exp {} inval {} cache {:?}", err, exp_tid, usize::MAX, cache.as_ptr());
+                }
             }
         }
     }
@@ -463,7 +498,9 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
         // ORDERING: We use a fence here in order to ensure that all other operations and uses
         // of atomics happen-before this.
         fence(Ordering::Acquire);
-        println!("destructed {:?}", cache.as_ptr());
+        if DEBUG {
+            println!("destructed {:?}", cache.as_ptr());
+        }
         unsafe { token.destruct(); }
     }
     detached
@@ -520,7 +557,9 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
                 let ref_cnt = meta.ref_cnt.load(Ordering::Acquire);
                 let tid = cache.thread_id;
                 // mark the cache as detached in order to allow other threads to see
-                println!("detached {:?}", cache as *const CachePadded<Cache<T>>);
+                if DEBUG {
+                    println!("detached {:?}", cache as *const CachePadded<Cache<T>>);
+                }
                 let debt = meta.debt.fetch_or(DETACHED_FLAG, Ordering::AcqRel); // TODO: try avoiding having to do this RMW for most cases by adding a fast path
                 // FIXME: are we sure that ref_cnt's last desired value is already visible to us here?
                 if debt == ref_cnt {
@@ -531,7 +570,9 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
                     drop(cache);
                     fence(Ordering::AcqRel);
                     if debt == 0 {
-                        println!("zero drop!");
+                        if DEBUG {
+                            println!("zero drop!");
+                        }
                     }
                     cleanup_cache::<false, T>(unsafe { NonNull::new_unchecked((cache as *const CachePadded<Cache<T>>).cast_mut()) }, true, tid); // FIXME: do we have to set a marker here?
                 }
@@ -542,14 +583,28 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
 
 type TLocal<T> = ThreadLocal<DetachablePtr<T>, Metadata<T>, false>;
 
-const INVALID_TID: u64 = u64::MAX;
+const INVALID_TID: u64 = u64::MAX - 1;
+const NOT_PRESENT: u64 = u64::MAX;
+
+#[thread_local]
+static mut ACTUAL_TID: u64 = NOT_PRESENT;
 
 #[inline]
 fn thread_id() -> u64 {
+    let act_tid = unsafe { ACTUAL_TID };
+    if act_tid == NOT_PRESENT {
+        let ret = actual_tid();
+        unsafe { ACTUAL_TID = ret; }
+        return ret;
+    }
+    act_tid
+}
+
+fn actual_tid() -> u64 {
     // let tid = thread::current().id().as_u64().get();
     let tid = thread_id::get() as u64;
 
-    if unlikely(tid == INVALID_TID) {
+    if unlikely(tid >= INVALID_TID) {
         // we can't have any thread id be our INVALID_TID
         abort();
     }
