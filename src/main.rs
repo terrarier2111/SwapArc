@@ -7,6 +7,7 @@
 #![feature(thread_id_value)]
 #![feature(pointer_byte_offsets)]
 #![feature(thread_local)]
+#![feature(const_collections_with_hasher)]
 
 mod auto_local_arc;
 mod cached_arc;
@@ -147,16 +148,90 @@ fn main() {
         .into_iter()
         .for_each(|thread| thread.join()/*.unwrap().join()*/.unwrap());
     thread::sleep(Duration::from_secs(10));*/
-    TID.store(thread_id::get(), Ordering::Release);
+    /*TID.store(thread_id::get(), Ordering::Release);
     let tmp = AutoLocalArc::new(3);
     for _ in 0..20 {
+        for _ in 0..1000 {
+            let mut threads = vec![];
+            for _ in 0..1
+            /*5*//*1*/
+            {
+                let tmp = tmp.clone();
+                threads.push(thread::spawn(move || {
+                    for _ in 0..20
+                    /*200*/
+                    {
+                        let l1 = tmp.clone();
+                        black_box(l1);
+                    }
+                }));
+            }
+            threads
+                .into_iter()
+                .for_each(|thread| thread.join().unwrap());
+        }*/
+
+
+    let tmp = AutoLocalArc::new(3);
+   /*     let mut threads = vec![];
+        for _ in 0..1
+        /*5*//*1*/
+        {
+            let tmp = tmp.clone();
+            threads.push(thread::spawn(move || {
+                let mut threads = vec![];
+                for x in 0..2000000000
+                /*200*/
+                {
+                    let l1 = tmp.clone();
+                    black_box(l1);
+                    if x % 1000000 == 0 {
+                        let tmp = tmp.clone();
+                        threads.push(thread::spawn(move || {
+                            for _ in 0..200000
+                            /*200*/
+                            {
+                                let l1 = tmp.clone();
+                                black_box(l1);
+                            }
+                        }));
+                    }
+                }
+                threads
+                    .into_iter()
+                    .for_each(|thread| thread.join().unwrap());
+            }));
+        }
+        threads
+            .into_iter()
+            .for_each(|thread| thread.join().unwrap());
+*/
+   /* let mut threads = vec![];
+    for _ in 0..20
+    /*5*//*1*/
+    {
+        let tmp = tmp.clone();
+        threads.push(thread::spawn(move || {
+            for _ in 0..200000
+            /*200*/
+            {
+                let l1 = tmp.clone();
+                black_box(l1);
+            }
+        }));
+    }
+    threads
+        .into_iter()
+        .for_each(|thread| thread.join().unwrap());*/
+
+    for _ in 0..1000 {
         let mut threads = vec![];
         for _ in 0..1
         /*5*//*1*/
         {
             let tmp = tmp.clone();
             threads.push(thread::spawn(move || {
-                for _ in 0..2000
+                for _ in 0..20
                 /*200*/
                 {
                     let l1 = tmp.clone();
@@ -166,73 +241,8 @@ fn main() {
         }
         threads
             .into_iter()
-            .for_each(|thread| {
-                /*if !thread.is_finished() {
-                thread::sleep(Duration::from_millis(1000));
-                if !thread.is_finished() {
-
-                }
-            }*/
-                thread.join().unwrap();
-            });
-        println!("finished!");
-        thread::sleep(Duration::from_millis(50));
+            .for_each(|thread| thread.join().unwrap());
     }
-    println!("finished all!");
-    thread::sleep(Duration::from_millis(50));
-
-
-
-
-
-    /*let mut threads = vec![];
-    for _ in 0..5/*20*//*5*//*1*/ {
-        let tmp = tmp.clone();
-        threads.push(thread::spawn(move || {
-            for _ in 0..200/*20000*//*200*/ {
-                /*let l1 = tmp.load();
-                let l2 = tmp.load();
-                let l3 = tmp.load();
-                let l4 = tmp.load();
-                let l5 = tmp.load();
-                black_box(l1);
-                black_box(l2);
-                black_box(l3);
-                black_box(l4);
-                black_box(l5);*/
-                let l1 = tmp.clone();
-                black_box(l1);
-            }
-        }));
-    }
-    /*for _ in 0..20/*5*//*1*/ {
-        let tmp = tmp.clone();
-        threads.push(thread::spawn(move || {
-            for _ in 0..20000/*200*/ {
-                tmp.update(Arc::new(rand::random()));
-            }
-        }));
-    }*/
-    threads.into_iter().for_each(|thread| thread.join().unwrap());*/
-    /*let tmp1 = tmp.clone();
-    thread::spawn(move || {
-        let l1 = tmp1.clone();
-        black_box(l1);
-    });
-    for _ in 0..200/*20000*//*200*/ {
-        /*let l1 = tmp.load();
-        let l2 = tmp.load();
-        let l3 = tmp.load();
-        let l4 = tmp.load();
-        let l5 = tmp.load();
-        black_box(l1);
-        black_box(l2);
-        black_box(l3);
-        black_box(l4);
-        black_box(l5);*/
-        let l1 = tmp.clone();
-        black_box(l1);
-    }*/
 }
 
 /*
@@ -603,7 +613,7 @@ fn bench_us_read_light_single(bencher: &mut Bencher) {
             .for_each(|thread| thread.join().unwrap());
     });
 }*/
-
+/*
 #[bench]
 fn bench_arc_read_heavy_single(bencher: &mut Bencher) {
     let tmp = Arc::new(3);
@@ -650,10 +660,10 @@ fn bench_arc_read_light_single(bencher: &mut Bencher) {
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
     });
-}
+}*/
 
 #[bench]
-fn bench_arc_read_light_single_many(bencher: &mut Bencher) {
+fn bench_abrc_read_light_single_many(bencher: &mut Bencher) {
     let tmp = Arc::new(3);
     bencher.iter(|| {
         for _ in 0..1000 {

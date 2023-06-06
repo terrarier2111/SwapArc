@@ -7,10 +7,10 @@ use std::process::abort;
 use std::ptr::{null_mut, NonNull};
 use std::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize, Ordering, AtomicU8, AtomicU64};
 use std::{mem, ptr, thread};
-use std::collections::HashSet;
+use std::hash::BuildHasherDefault;
 use std::sync::Mutex;
-use lazy_static::lazy_static;
 use likely_stable::{likely, unlikely};
+use rustc_hash::{FxHasher, FxHashSet};
 use thread_local::{ThreadLocal, UnsafeToken};
 use crate::TID;
 
@@ -43,7 +43,7 @@ const DEBUG: bool = false;
 
 pub struct AutoLocalArc<T: Send + Sync> {
     inner: NonNull<InnerArc<T>>,
-    cache: UnsafeCell<NonNull<CachePadded<Cache<T>>>>,
+    cache: UnsafeCell<NonNull<Cache<T>>>,
 }
 
 unsafe impl<T: Send + Sync> Send for AutoLocalArc<T> {}
@@ -69,12 +69,12 @@ impl<T: Send + Sync> AutoLocalArc<T> {
                 if DEBUG {
                     println!("write initial cache: {:?}", unsafe { transmute::<_, *const ()>(token) });
                 }
-                unsafe { &mut *token.meta().cache.get() }.write(CachePadded::new(Cache {
+                unsafe { &mut *token.meta().cache.get() }.write(Cache {
                     parent: inner,
                     src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
                     thread_id: tid,
                     token: token.clone().into_unsafe_token(),
-                }));
+                });
                 token.meta().ref_cnt.store(1, Ordering::Release);
                 token.meta().thread_id.store(tid, Ordering::Release);
             }).meta().cache.get().as_ref().unwrap_unchecked().as_ptr() };
@@ -114,9 +114,9 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             // we are the owner of this cache, just perform a simple increment
 
             let ref_cnt = meta.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
-            if ref_cnt > MAX_SOFT_REFCOUNT {
+            if unlikely(ref_cnt > MAX_SOFT_REFCOUNT) {
                 unsafe {
-                    handle_large_ref_count((cache as *const CachePadded<Cache<T>>).cast_mut(), ref_cnt);
+                    handle_large_ref_count((cache as *const Cache<T>).cast_mut(), ref_cnt);
                 }
             }
             meta.ref_cnt.store(ref_cnt + 1, Ordering::Release);
@@ -138,12 +138,12 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     if DEBUG {
                         println!("write cache: {:?}", unsafe { transmute::<_, *const ()>(token) });
                     }
-                    unsafe { &mut *token.meta().cache.get() }.write(CachePadded::new(Cache {
+                    unsafe { &mut *token.meta().cache.get() }.write(Cache {
                         parent: inner,
                         src: AtomicPtr::new(cache_ptr.as_ptr()),
                         thread_id: tid,
                         token: token.into_unsafe_token(),
-                    }));
+                    });
                     fresh = true;
                 }) };
             let local_meta = cached.meta();
@@ -193,9 +193,9 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 }
                 // the local cache is still in use, try simply incrementing its counter
                 // if we fail, just fall back to the slow path
-                if ref_cnt > MAX_SOFT_REFCOUNT {
+                if unlikely(ref_cnt > MAX_SOFT_REFCOUNT) {
                     unsafe {
-                        handle_large_ref_count((local_cache as *const CachePadded<Cache<T>>).cast_mut(), ref_cnt);
+                        handle_large_ref_count((local_cache as *const Cache<T>).cast_mut(), ref_cnt);
                     }
                 }
                 local_meta.ref_cnt.store(ref_cnt + 1, Ordering::Release);
@@ -241,7 +241,8 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
 
 /// Safety: this method may only be called with the local cache as the `cache` parameter.
 #[cold]
-unsafe fn handle_large_ref_count<T: Send + Sync>(cache: *mut CachePadded<Cache<T>>, ref_cnt: usize) {
+#[inline(never)]
+unsafe fn handle_large_ref_count<T: Send + Sync>(cache: *mut Cache<T>, ref_cnt: usize) {
     panic!("error!");
 
     let meta = unsafe { cache.as_ref().unwrap_unchecked().token.meta() };
@@ -389,14 +390,14 @@ struct Cache<T: Send + Sync> {
     parent: NonNull<InnerArc<T>>,
     thread_id: u64,
     token: UnsafeToken<DetachablePtr<T>, Metadata<T>, false>,
-    src: AtomicPtr<CachePadded<Cache<T>>>,
+    src: AtomicPtr<Cache<T>>,
 }
 
 // This gets called when the debt and the ref_cnt in a cache are the same
 // and thus we know no outstanding references (neither local nor external)
 // to the cache are left and we can clean up the cache without issues.
 fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
-    cache: NonNull<CachePadded<Cache<T>>>,
+    cache: NonNull<Cache<T>>,
     detached: bool,
     exp_tid: u64,
 ) -> bool {
@@ -511,7 +512,7 @@ struct Metadata<T: Send + Sync> {
     ref_cnt: AtomicUsize, // this ref cnt may only be updated by the current thread
     debt: AtomicUsize, // this debt count may only be updated by threads other than the current one - this has a `detached` flag as its last bit
     state: AtomicU8,
-    cache: UnsafeCell<MaybeUninit<CachePadded<Cache<T>>>>,
+    cache: UnsafeCell<MaybeUninit<Cache<T>>>,
 }
 
 unsafe impl<T: Send + Sync> Send for Metadata<T> {}
@@ -558,7 +559,7 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
                 let tid = cache.thread_id;
                 // mark the cache as detached in order to allow other threads to see
                 if DEBUG {
-                    println!("detached {:?}", cache as *const CachePadded<Cache<T>>);
+                    println!("detached {:?}", cache as *const Cache<T>);
                 }
                 let debt = meta.debt.fetch_or(DETACHED_FLAG, Ordering::AcqRel); // TODO: try avoiding having to do this RMW for most cases by adding a fast path
                 // FIXME: are we sure that ref_cnt's last desired value is already visible to us here?
@@ -574,7 +575,7 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
                             println!("zero drop!");
                         }
                     }
-                    cleanup_cache::<false, T>(unsafe { NonNull::new_unchecked((cache as *const CachePadded<Cache<T>>).cast_mut()) }, true, tid); // FIXME: do we have to set a marker here?
+                    cleanup_cache::<false, T>(unsafe { NonNull::new_unchecked((cache as *const Cache<T>).cast_mut()) }, true, tid); // FIXME: do we have to set a marker here?
                 }
             }
         }
@@ -600,6 +601,8 @@ fn thread_id() -> u64 {
     act_tid
 }
 
+#[cold]
+#[inline(never)]
 fn actual_tid() -> u64 {
     // let tid = thread::current().id().as_u64().get();
     let tid = thread_id::get() as u64;
@@ -699,9 +702,11 @@ fn sentinel_addr() -> *const () {
     (&SENTINEL as *const u8).cast()
 }
 
-lazy_static! {
-    static ref GUARDS: Mutex<HashSet<usize>> = Mutex::new(HashSet::new());
-}
+static GUARDS: Mutex<FxHashSet<usize>> = Mutex::new(FxHashSet::with_hasher({
+    if size_of::<BuildHasherDefault<FxHasher>>() != size_of::<()>() || align_of::<BuildHasherDefault<FxHasher>>() != align_of::<()>() {
+        panic!("Unexpected layout of BuildHasherDefault");
+    }
+    unsafe { transmute::<(), BuildHasherDefault<FxHasher>>(()) }})); // FIXME: this is unsound, use const constructor, once its available!
 
 #[thread_local]
 static GUARD: AtomicPtr<()> = AtomicPtr::new(null_mut());
@@ -721,8 +726,8 @@ fn guard() -> *const AtomicPtr<()> {
         // initialize guard
         DROP_GUARD.with(|_| {});
 
-        GUARDS.lock().unwrap().insert((&GUARD as *const AtomicPtr<()>) as usize);
         GUARD.store(sentinel_addr().cast_mut(), Ordering::Relaxed);
+        GUARDS.lock().unwrap().insert((&GUARD as *const AtomicPtr<()>) as usize);
     }
     &GUARD as *const _
 }
