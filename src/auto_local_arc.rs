@@ -1,6 +1,6 @@
 use crossbeam_utils::{Backoff, CachePadded};
 use std::alloc::{alloc, dealloc, Layout, LayoutError};
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::mem::{align_of, size_of, ManuallyDrop, transmute, MaybeUninit};
 use std::ops::Deref;
 use std::process::abort;
@@ -99,17 +99,15 @@ const MAX_SOFT_REFCOUNT: usize = MAX_HARD_REFCOUNT / 2;
 const MAX_HARD_REFCOUNT: usize = isize::MAX as usize / 2_usize.pow(2);
 
 impl<T: Send + Sync> Clone for AutoLocalArc<T> {
-    #[inline]
     fn clone(&self) -> Self {
         let cache_ptr = unsafe { *self.cache.get() };
         let cache = unsafe { cache_ptr.as_ref() };
-        let meta = unsafe { cache.token.meta() };
-
         // check if we are the owner of this alarc's cache
 
         let tid = thread_id();
 
         let cache = if cache.thread_id == tid {
+            let meta = unsafe { cache.token.meta() };
             // println!("increment local cnt");
             // we are the owner of this cache, just perform a simple increment
 
@@ -154,6 +152,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             let debt = local_meta.debt.load(Ordering::Acquire);
 
             if ref_cnt != debt && ref_cnt == strip_flags(debt) {
+                // FIXME: this actually still happens, why?
                 if DEBUG {
                     println!("weird state rc {} | debt {} | stripped {}", ref_cnt, debt, strip_flags(debt));
                 }
@@ -165,6 +164,12 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             // we strip the `detached` flag here as it may still be set from a previous cache
             // and as such even though it is not relevant anymore it is still present on the `debt`.
             // FIXME: why is the flag mostly there on alternative entries but not on other entries?
+
+            if fresh && ref_cnt != strip_flags(debt) {
+                // FIXME: if this doesn't happen, we can get rid of `fresh`!
+                panic!("weird state!!!! fresh important!");
+            }
+
             if ref_cnt == strip_flags(debt) || fresh {
                 if debt > 0/* && !fresh*/ { // FIXME: should we really not wait if the entry is fresh?
                     // we have a retry loop here in case the debt's updater hasn't finished yet
@@ -260,12 +265,11 @@ unsafe fn handle_large_ref_count<T: Send + Sync>(cache: *mut Cache<T>, ref_cnt: 
 }
 
 impl<T: Send + Sync> Drop for AutoLocalArc<T> {
-    #[inline]
     fn drop(
         &mut self) {
         let cache_ptr = unsafe { *self.cache.get() };
         let cache = unsafe { cache_ptr.as_ref() };
-        let meta = unsafe { cache_ptr.as_ref().token.meta() };
+        let meta = unsafe { cache.token.meta() };
         let tid = thread_id();
         if cache.thread_id == tid {
             let ref_cnt = meta.ref_cnt.load(Ordering::Relaxed);
@@ -280,7 +284,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
                 if tid == TID.load(Ordering::Acquire) as u64 {
                     println!(
                         "local drop: {} refs: {} debt: {}",
-                        cache.thread_id, ref_cnt, debt/*, fin*/
+                        cache.thread_id, ref_cnt, debt
                     );
                 }
             }
@@ -303,11 +307,8 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             guard.store(cache_ptr.as_ptr().cast(), Ordering::Release);
             let cache_tid = cache.thread_id;
             let debt = meta.debt.fetch_add(1, Ordering::AcqRel) + 1;
-            if strip_flags(debt) > MAX_HARD_REFCOUNT {
-                abort();
-            }
             fence(Ordering::Acquire);
-            let ref_cnt = unsafe { cache.token.meta() }.ref_cnt.load(Ordering::Acquire);
+            let ref_cnt = meta.ref_cnt.load(Ordering::Acquire);
             if DEBUG {
                 if tid == TID.load(Ordering::Acquire) as u64 {
                     println!(
@@ -355,7 +356,7 @@ impl<T: Send + Sync> InnerArc<T> {
         // wait for all non-local cache users to finish
         for cache in GUARDS.lock().unwrap().iter() {
             let cache = unsafe { (*cache as *const AtomicPtr<()>).as_ref().unwrap_unchecked() };
-            let mut backoff = Backoff::new();
+            let backoff = Backoff::new();
             while cache.load(Ordering::Acquire).cast_const() == (self as *const InnerArc<T>).cast() {
                 backoff.snooze();
             }
@@ -363,7 +364,7 @@ impl<T: Send + Sync> InnerArc<T> {
 
         // wait for all local cache users to finish
         for cache in self.cache.iter() {
-            let mut backoff = Backoff::new();
+            let backoff = Backoff::new();
             // wait until the local thread is done using its cache
             let state = &unsafe { cache.meta() }.state;
             while state.load(Ordering::Acquire) != CACHE_STATE_IDLE {
@@ -405,7 +406,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
     let meta = unsafe { token.meta() };
 
     if UPDATE_SUPER {
-        match meta.thread_id.compare_exchange(exp_tid, INVALID_TID, Ordering::AcqRel, Ordering::Relaxed) {
+        match meta.thread_id.compare_exchange(exp_tid, INVALID_TID, Ordering::AcqRel, Ordering::Relaxed) { // FIXME: can we get tid of this (at least in some cases)
             Ok(_) => {
                 // FIXME: when freeing the own memory, we still have a reference to it and thus UB
                 // FIXME: the same thing is the case when freeing the major allocation
@@ -588,22 +589,22 @@ const INVALID_TID: u64 = u64::MAX - 1;
 const NOT_PRESENT: u64 = u64::MAX;
 
 #[thread_local]
-static mut ACTUAL_TID: u64 = NOT_PRESENT;
+static ACTUAL_TID: Cell<u64> = Cell::new(NOT_PRESENT);
 
 #[inline]
 fn thread_id() -> u64 {
-    let act_tid = unsafe { ACTUAL_TID };
-    if act_tid == NOT_PRESENT {
-        let ret = actual_tid();
-        unsafe { ACTUAL_TID = ret; }
-        return ret;
+    let act_tid = ACTUAL_TID.get();
+    if unlikely(act_tid == NOT_PRESENT) {
+        let tid = set_actual_tid();
+
+        return tid;
     }
     act_tid
 }
 
 #[cold]
 #[inline(never)]
-fn actual_tid() -> u64 {
+fn set_actual_tid() -> u64 {
     // let tid = thread::current().id().as_u64().get();
     let tid = thread_id::get() as u64;
 
@@ -611,6 +612,8 @@ fn actual_tid() -> u64 {
         // we can't have any thread id be our INVALID_TID
         abort();
     }
+
+    ACTUAL_TID.set(tid);
 
     tid
 }
@@ -646,7 +649,7 @@ impl<T> SizedBox<T> {
             alloc.write(val);
         }
         Self {
-            alloc_ptr: NonNull::new(alloc).unwrap(), // FIXME: can we make this unchecked?
+            alloc_ptr: NonNull::new(alloc).unwrap(),
         }
     }
 
