@@ -99,6 +99,7 @@ const MAX_SOFT_REFCOUNT: usize = MAX_HARD_REFCOUNT / 2;
 const MAX_HARD_REFCOUNT: usize = isize::MAX as usize / 2_usize.pow(2);
 
 impl<T: Send + Sync> Clone for AutoLocalArc<T> {
+    #[inline]
     fn clone(&self) -> Self {
         let cache_ptr = unsafe { *self.cache.get() };
         let cache = unsafe { cache_ptr.as_ref() };
@@ -265,6 +266,7 @@ unsafe fn handle_large_ref_count<T: Send + Sync>(cache: *mut Cache<T>, ref_cnt: 
 }
 
 impl<T: Send + Sync> Drop for AutoLocalArc<T> {
+    #[inline]
     fn drop(
         &mut self) {
         let cache_ptr = unsafe { *self.cache.get() };
@@ -644,12 +646,15 @@ impl<T> SizedBox<T> {
     fn new(val: T) -> Self {
         // SAFETY: The layout we provided was checked at compiletime, so it has to be initialized correctly
         let alloc = unsafe { alloc(Self::LAYOUT) }.cast::<T>();
+        if alloc.is_null() {
+            panic!("Out of memory!");
+        }
         // FIXME: add safety comment
         unsafe {
             alloc.write(val);
         }
         Self {
-            alloc_ptr: NonNull::new(alloc).unwrap(),
+            alloc_ptr: unsafe { NonNull::new_unchecked(alloc) },
         }
     }
 
