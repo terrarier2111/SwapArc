@@ -319,7 +319,6 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
                 // FIXME: NEW: there is probably a race condition here - what if cache's owner increases its reference count here
                 // FIXME: and we free its cache just down below?
 
-                drop(cache);
                 // there are no external refs alive
                 cleanup_cache::<true, T>(cache_ptr, is_detached(debt), cache_tid);
             }
@@ -472,8 +471,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
 
                     // check if we should cleanup the super cache by first checking the reference count and then checking if
                     // the super cache cleaned up by itself
-                    if strip_flags(debt) == ref_cnt/* && super_thread_id == super_meta.thread_id.load(Ordering::Acquire)*/ {
-                        drop(super_cache);
+                    if strip_flags(debt) == ref_cnt {
                         if DEBUG {
                             println!("cleanup other!");
                         }
@@ -564,7 +562,6 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
                     // the cache which is available as long as there are threads accessing the
                     // central data structure and not the backing allocation which can get deallocated
                     // at any point in time.
-                    drop(cache);
                     fence(Ordering::AcqRel);
                     if debt == 0 {
                         if DEBUG {
