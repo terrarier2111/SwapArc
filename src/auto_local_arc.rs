@@ -94,9 +94,8 @@ impl<T: Send + Sync> AutoLocalArc<T> {
     }
 }
 
-/// We have to choose a lower highest ref cnt than the std lib as we are using the last 2 bits to store metadata
-const MAX_SOFT_REFCOUNT: usize = MAX_HARD_REFCOUNT / 2;
-const MAX_HARD_REFCOUNT: usize = isize::MAX as usize / 2_usize.pow(2);
+/// We have to choose a lower highest ref cnt because we are using the last bit to store metadata
+const MAX_REFCOUNT: usize = usize::MAX / 2_usize;
 
 impl<T: Send + Sync> Clone for AutoLocalArc<T> {
     #[inline]
@@ -113,7 +112,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             // we are the owner of this cache, just perform a simple increment
 
             let ref_cnt = meta.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
-            if unlikely(ref_cnt > MAX_SOFT_REFCOUNT) {
+            if unlikely(ref_cnt >= MAX_REFCOUNT) {
                 unsafe {
                     handle_large_ref_count((cache as *const Cache<T>).cast_mut(), ref_cnt);
                 }
@@ -199,7 +198,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 }
                 // the local cache is still in use, try simply incrementing its counter
                 // if we fail, just fall back to the slow path
-                if unlikely(ref_cnt > MAX_SOFT_REFCOUNT) {
+                if unlikely(ref_cnt >= MAX_REFCOUNT) {
                     unsafe {
                         handle_large_ref_count((local_cache as *const Cache<T>).cast_mut(), ref_cnt);
                     }
@@ -249,20 +248,21 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
 #[cold]
 #[inline(never)]
 unsafe fn handle_large_ref_count<T: Send + Sync>(cache: *mut Cache<T>, ref_cnt: usize) {
-    panic!("error!");
-
     let meta = unsafe { cache.as_ref().unwrap_unchecked().token.meta() };
 
     // try to recover by decrementing the `debt` count from the `ref_cnt` and setting the `debt` count to 0
     // note: the `detached` flag can't be set because this method is only called with the `local_cache` as the `cache` parameter
-    let debt = meta.debt.swap(0, Ordering::Relaxed); // FIXME: can the lack of synchronization between these two updates lead to race conditions?
-    let ref_cnt = ref_cnt - debt;
+    let debt = meta.debt.swap(0, Ordering::AcqRel); // FIXME: can we use a weaker ordering?
 
-    if ref_cnt > MAX_HARD_REFCOUNT {
+    if debt == 0 {
+        // ran out of references
         abort();
     }
 
-    meta.ref_cnt.store(ref_cnt, Ordering::Relaxed);
+    let ref_cnt = ref_cnt - debt;
+
+    meta.ref_cnt.store(ref_cnt, Ordering::Release);
+    abort(); // FIXME: get rid of this once the testing phase is over!
 }
 
 impl<T: Send + Sync> Drop for AutoLocalArc<T> {
