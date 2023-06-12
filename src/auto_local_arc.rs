@@ -123,7 +123,6 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             // println!("increment non-local cnt");
             // we aren't the owner, now we have to do some more work
 
-            let mut fresh = false;
             let inner = self.inner;
             let cached = unsafe { self
                 .inner()
@@ -142,7 +141,6 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                         thread_id: tid,
                         token: token.into_unsafe_token(),
                     });
-                    fresh = true;
                 }) };
             let local_meta = cached.meta();
             let local_cache_ptr = unsafe { NonNull::new_unchecked((&*local_meta.cache.get()).as_ptr().cast_mut()) };
@@ -165,15 +163,10 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             // and as such even though it is not relevant anymore it is still present on the `debt`.
             // FIXME: why is the flag mostly there on alternative entries but not on other entries?
 
-            if fresh && ref_cnt != strip_flags(debt) {
-                // FIXME: if this doesn't happen, we can get rid of `fresh`!
-                panic!("weird state!!!! fresh important!");
-            }
-
-            if ref_cnt == strip_flags(debt) || fresh {
-                if debt > 0/* && !fresh*/ { // FIXME: should we really not wait if the entry is fresh?
+            if ref_cnt == strip_flags(debt) {
+                if debt > 0 {
                     // we have a retry loop here in case the debt's updater hasn't finished yet
-                    let mut backoff = Backoff::new();
+                    let backoff = Backoff::new();
                     // wait for the other thread to clean up
                     while local_meta.thread_id.load(Ordering::Acquire) != INVALID_TID {
                         backoff.snooze();
@@ -214,7 +207,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 if debt == ref_cnt {
                     if debt > 0 {
                         // we have a retry loop here in case the debt's updater hasn't finished yet
-                        let mut backoff = Backoff::new();
+                        let backoff = Backoff::new();
                         // wait for the other thread to clean up
                         while local_meta.thread_id.load(Ordering::Acquire) != INVALID_TID {
                             backoff.snooze();
