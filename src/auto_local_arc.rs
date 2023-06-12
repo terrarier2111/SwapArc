@@ -106,7 +106,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
 
         let tid = thread_id();
 
-        let cache = if cache.thread_id == tid {
+        if cache.thread_id == tid {
             let meta = unsafe { cache.token.meta() };
             // println!("increment local cnt");
             // we are the owner of this cache, just perform a simple increment
@@ -118,93 +118,57 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 }
             }
             meta.ref_cnt.store(ref_cnt + 1, Ordering::Release);
-            cache_ptr
-        } else {
-            // println!("increment non-local cnt");
-            // we aren't the owner, now we have to do some more work
-
-            let inner = self.inner;
-            let cached = unsafe { self
-                .inner()
-                .cache
-                .get_or(|token| {
-                    DetachablePtr(
-                        Some(token)
-                    )
-                }, |token| {
-                    if DEBUG {
-                        println!("write cache: {:?}", unsafe { transmute::<_, *const ()>(token) });
-                    }
-                    unsafe { &mut *token.meta().cache.get() }.write(Cache {
-                        parent: inner,
-                        src: AtomicPtr::new(cache_ptr.as_ptr()),
-                        thread_id: tid,
-                        token: token.into_unsafe_token(),
-                    });
-                }) };
-            let local_meta = cached.meta();
-            let local_cache_ptr = unsafe { NonNull::new_unchecked((&*local_meta.cache.get()).as_ptr().cast_mut()) };
-            let local_cache = unsafe { local_cache_ptr.as_ref() };
-            // the ref count here can't change, as we are the only thread which is able to access it.
-            let ref_cnt = local_meta.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
-            let debt = local_meta.debt.load(Ordering::Acquire);
-
-            if ref_cnt != debt && ref_cnt == strip_flags(debt) {
-                // FIXME: this actually still happens, why?
-                if DEBUG {
-                    println!("weird state rc {} | debt {} | stripped {}", ref_cnt, debt, strip_flags(debt));
-                }
+            Self {
+                inner: self.inner,
+                cache: cache_ptr.into(),
             }
+        } else {
+            #[inline(never)]
+            fn clone_different_thread<T: Send + Sync>(inner: NonNull<InnerArc<T>>, tid: u64, cache_ptr: NonNull<Cache<T>>, ptr_to_cache_ptr: *mut NonNull<Cache<T>>) -> AutoLocalArc<T> {
+                // println!("increment non-local cnt");
+                // we aren't the owner, now we have to do some more work
 
-            // check if the local cache's instance is still valid.
-            // check if the local cache is unused, this is the case if either
-            // there are no outstanding references to the cache or it was just newly created.
-            // we strip the `detached` flag here as it may still be set from a previous cache
-            // and as such even though it is not relevant anymore it is still present on the `debt`.
-            // FIXME: why is the flag mostly there on alternative entries but not on other entries?
-
-            if ref_cnt == strip_flags(debt) {
-                if debt > 0 {
-                    // we have a retry loop here in case the debt's updater hasn't finished yet
-                    let backoff = Backoff::new();
-                    // wait for the other thread to clean up
-                    while local_meta.thread_id.load(Ordering::Acquire) != INVALID_TID {
-                        backoff.snooze();
-                    }
-                }
-                // the local cache has no valid references anymore
-                local_cache.src.store(cache_ptr.as_ptr(), Ordering::Release);
-                                                                     // this is `2` because we need a reference for the current thread's instance and
-                                                                     // because the newly created instance needs a reference as well.
-                local_meta.ref_cnt.store(2, Ordering::Release);
-                // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
-                local_meta.debt.store(0, Ordering::Release);
-                local_meta.thread_id.store(tid, Ordering::Release);
-                local_meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
-                // remove the reference to the external cache, as we moved it to our own cache instead
-                *unsafe { &mut *self.cache.get() } = local_cache_ptr;
-            } else {
-                if local_cache.thread_id != tid {
-                    if DEBUG {
-                        println!("differing ids: cache {:?} cache_tid {} curr {}", local_cache as *const _, local_cache.thread_id, tid);
-                    }
-                }
-                // the local cache is still in use, try simply incrementing its counter
-                // if we fail, just fall back to the slow path
-                if unlikely(ref_cnt >= MAX_REFCOUNT) {
-                    unsafe {
-                        handle_large_ref_count((local_cache as *const Cache<T>).cast_mut(), ref_cnt);
-                    }
-                }
-                local_meta.ref_cnt.store(ref_cnt + 1, Ordering::Release);
-                // sync with the local store
-                fence(Ordering::Acquire); // FIXME: is this even required?
-                // FIXME: here is probably a possibility for a race condition (what if we have one of the instances on another thread and it gets freed right
-                // FIXME: after we check if ref_cnt == debt?) this can probably be fixed by checking again right after increasing the ref_count and
-                // FIXME: handling failure by doing what we would have done if the local cache had no valid references to begin with.
+                let inner = inner;
+                let cached = unsafe { inner.as_ref()
+                    .cache
+                    .get_or(|token| {
+                        DetachablePtr(
+                            Some(token)
+                        )
+                    }, |token| {
+                        if DEBUG {
+                            println!("write cache: {:?}", unsafe { transmute::<_, *const ()>(token) });
+                        }
+                        unsafe { &mut *token.meta().cache.get() }.write(Cache {
+                            parent: inner,
+                            src: AtomicPtr::new(cache_ptr.as_ptr()),
+                            thread_id: tid,
+                            token: token.into_unsafe_token(),
+                        });
+                    }) };
+                let local_meta = cached.meta();
+                let local_cache_ptr = unsafe { NonNull::new_unchecked((&*local_meta.cache.get()).as_ptr().cast_mut()) };
+                let local_cache = unsafe { local_cache_ptr.as_ref() };
+                // the ref count here can't change, as we are the only thread which is able to access it.
+                let ref_cnt = local_meta.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
                 let debt = local_meta.debt.load(Ordering::Acquire);
-                // we don't need to strip the flags here as we know that `debt` isn't detached.
-                if debt == ref_cnt {
+
+                if ref_cnt != debt && ref_cnt == strip_flags(debt) {
+                    // FIXME: this actually still happens, why?
+                    // FIXME: this only happens for `fresh` entries!
+                    if DEBUG {
+                        println!("weird state rc {} | debt {} | stripped {}", ref_cnt, debt, strip_flags(debt));
+                    }
+                }
+
+                // check if the local cache's instance is still valid.
+                // check if the local cache is unused, this is the case if either
+                // there are no outstanding references to the cache or it was just newly created.
+                // we strip the `detached` flag here as it may still be set from a previous cache
+                // and as such even though it is not relevant anymore it is still present on the `debt`.
+                // FIXME: why is the flag mostly there on alternative entries but not on other entries?
+
+                if ref_cnt == strip_flags(debt) {
                     if debt > 0 {
                         // we have a retry loop here in case the debt's updater hasn't finished yet
                         let backoff = Backoff::new();
@@ -215,24 +179,66 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     }
                     // the local cache has no valid references anymore
                     local_cache.src.store(cache_ptr.as_ptr(), Ordering::Release);
-                                                                         // this is `2` because we need a reference for the current thread's instance and
-                                                                         // because the newly created instance needs a reference as well.
+                    // this is `2` because we need a reference for the current thread's instance and
+                    // because the newly created instance needs a reference as well.
                     local_meta.ref_cnt.store(2, Ordering::Release);
                     // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
                     local_meta.debt.store(0, Ordering::Release);
                     local_meta.thread_id.store(tid, Ordering::Release);
                     local_meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
                     // remove the reference to the external cache, as we moved it to our own cache instead
-                    *unsafe { &mut *self.cache.get() } = local_cache_ptr;
+                    *unsafe { &mut *ptr_to_cache_ptr } = local_cache_ptr;
+                } else {
+                    if local_cache.thread_id != tid {
+                        if DEBUG {
+                            println!("differing ids: cache {:?} cache_tid {} curr {}", local_cache as *const _, local_cache.thread_id, tid);
+                        }
+                    }
+                    // the local cache is still in use, try simply incrementing its counter
+                    // if we fail, just fall back to the slow path
+                    if unlikely(ref_cnt >= MAX_REFCOUNT) {
+                        unsafe {
+                            handle_large_ref_count((local_cache as *const Cache<T>).cast_mut(), ref_cnt);
+                        }
+                    }
+                    local_meta.ref_cnt.store(ref_cnt + 1, Ordering::Release);
+                    // sync with the local store
+                    fence(Ordering::Acquire); // FIXME: is this even required?
+                    // FIXME: here is probably a possibility for a race condition (what if we have one of the instances on another thread and it gets freed right
+                    // FIXME: after we check if ref_cnt == debt?) this can probably be fixed by checking again right after increasing the ref_count and
+                    // FIXME: handling failure by doing what we would have done if the local cache had no valid references to begin with.
+                    let debt = local_meta.debt.load(Ordering::Acquire);
+                    // we don't need to strip the flags here as we know that `debt` isn't detached.
+                    if debt == ref_cnt {
+                        if debt > 0 {
+                            // we have a retry loop here in case the debt's updater hasn't finished yet
+                            let backoff = Backoff::new();
+                            // wait for the other thread to clean up
+                            while local_meta.thread_id.load(Ordering::Acquire) != INVALID_TID {
+                                backoff.snooze();
+                            }
+                        }
+                        // the local cache has no valid references anymore
+                        local_cache.src.store(cache_ptr.as_ptr(), Ordering::Release);
+                        // this is `2` because we need a reference for the current thread's instance and
+                        // because the newly created instance needs a reference as well.
+                        local_meta.ref_cnt.store(2, Ordering::Release);
+                        // we update the debt after the ref_cnt because that enables us to see the `ref_cnt` update by loading `debt` using `Acquire`
+                        local_meta.debt.store(0, Ordering::Release);
+                        local_meta.thread_id.store(tid, Ordering::Release);
+                        local_meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
+                        // remove the reference to the external cache, as we moved it to our own cache instead
+                        *unsafe { &mut *ptr_to_cache_ptr } = local_cache_ptr;
+                    }
+                }
+
+                AutoLocalArc {
+                    inner,
+                    cache: local_cache_ptr.into(),
                 }
             }
 
-            local_cache_ptr
-        };
-
-        Self {
-            inner: self.inner,
-            cache: cache.into(),
+            clone_different_thread::<T>(self.inner, tid, cache_ptr, self.cache.get())
         }
     }
 }
