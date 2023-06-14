@@ -173,7 +173,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                         // we have a retry loop here in case the debt's updater hasn't finished yet
                         let backoff = Backoff::new();
                         // wait for the other thread to clean up
-                        while local_meta.thread_id.load(Ordering::Acquire) != INVALID_TID {
+                        while local_meta.thread_id.load(Ordering::Acquire) != STOP_DESTROY {
                             backoff.snooze();
                         }
                     }
@@ -211,10 +211,14 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     // we don't need to strip the flags here as we know that `debt` isn't detached.
                     if debt == ref_cnt {
                         if debt > 0 {
+                            // here we are handling the case that there was a previous use of the alarc on this thread
+                            // but all local references got dropped first and then some other thread increased the debt
+                            // and thus it might still be cleaning up the cache.
+
                             // we have a retry loop here in case the debt's updater hasn't finished yet
                             let backoff = Backoff::new();
                             // wait for the other thread to clean up
-                            while local_meta.thread_id.load(Ordering::Acquire) != INVALID_TID {
+                            while local_meta.thread_id.load(Ordering::Acquire) != STOP_DESTROY {
                                 backoff.snooze();
                             }
                         }
@@ -406,7 +410,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
     let meta = unsafe { token.meta() };
 
     if UPDATE_SUPER {
-        match meta.thread_id.compare_exchange(exp_tid, INVALID_TID, Ordering::AcqRel, Ordering::Relaxed) { // FIXME: can we get tid of this (at least in some cases)
+        match meta.thread_id.compare_exchange(exp_tid, START_DESTROY, Ordering::AcqRel, Ordering::Relaxed) { // FIXME: can we get tid of this (at least in some cases)
             Ok(_) => {
                 // FIXME: when freeing the own memory, we still have a reference to it and thus UB
                 // FIXME: the same thing is the case when freeing the major allocation
@@ -424,12 +428,14 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
                     if DEBUG {
                         println!("major cleanup!");
                     }
+                    // We don't have to do an actual RMW here as there is nothing that could modify the debt anymore.
                     meta
                         .debt
-                        .fetch_or(DETACHED_FLAG, Ordering::AcqRel);
+                        .store(meta.debt.load(Ordering::Acquire) | DETACHED_FLAG, Ordering::Release);
                     // signal that we are finished so we don't accidentally loop indefinitely in the `InnerArc`
                     // destructor as we don't reach our update here "normally".
                     meta.state.store(CACHE_STATE_IDLE, Ordering::Release);
+                    meta.thread_id.store(STOP_DESTROY, Ordering::Release); // FIXME: do we really need this?
                     fence(Ordering::Acquire);
 
                     // we are the first "(cache) node", so we need to free the memory
@@ -487,6 +493,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
                         // fence(Ordering::AcqRel);
                     }
                 }
+                meta.thread_id.store(STOP_DESTROY, Ordering::Release);
             }
             Err(err) => {
                 if DEBUG {
@@ -583,7 +590,10 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
 
 type TLocal<T> = ThreadLocal<DetachablePtr<T>, Metadata<T>, false>;
 
-const INVALID_TID: u64 = u64::MAX - 1;
+// invalid tids
+const INVALID_TID: u64 = START_DESTROY;
+const START_DESTROY: u64 = u64::MAX - 2;
+const STOP_DESTROY: u64 = u64::MAX - 1;
 const NOT_PRESENT: u64 = u64::MAX;
 
 #[thread_local]
