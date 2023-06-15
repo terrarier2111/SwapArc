@@ -298,7 +298,7 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
                 if DEBUG {
                     println!("rc is debt: {}", is_detached(debt));
                 }
-                if cleanup_cache::<true, T>(cache_ptr, is_detached(debt), tid) { // FIXME: we don't need to check for an expected TID here.
+                if cleanup_cache::<true, T>(cache_ptr, is_detached(debt), tid) {
                     // don't modify the state anymore as it might have been deallocated or be reassociated with another
                     // thread's entry
                     return;
@@ -410,7 +410,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
     let meta = unsafe { token.meta() };
 
     if UPDATE_SUPER {
-        match meta.thread_id.compare_exchange(exp_tid, START_DESTROY, Ordering::AcqRel, Ordering::Relaxed) { // FIXME: can we get tid of this (at least in some cases)
+        match meta.thread_id.compare_exchange(exp_tid, START_DESTROY, Ordering::AcqRel, Ordering::Relaxed) { // FIXME: can we get rid of this (at least in some cases)
             Ok(_) => {
                 // FIXME: when freeing the own memory, we still have a reference to it and thus UB
                 // FIXME: the same thing is the case when freeing the major allocation
