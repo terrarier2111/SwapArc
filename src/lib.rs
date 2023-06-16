@@ -4,13 +4,13 @@ use cfg_if::cfg_if;
 use crossbeam_utils::{Backoff, CachePadded};
 use likely_stable::{likely, unlikely};
 use std::borrow::Borrow;
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::fmt::{Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::mem;
 use std::mem::{align_of, ManuallyDrop};
 use std::ops::Deref;
-use std::ptr::{null, null_mut};
+use std::ptr::{null, null_mut, NonNull};
 use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thread_local::ThreadLocal;
@@ -146,7 +146,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             CachePadded::new(LocalData {
                 // SAFETY: this is safe because we know that this will only ever be accessed
                 // if there is a live reference to `self` present.
-                parent: self as *const Self,
+                // Furthermore we know that the ptr to self is valid and non-null.
+                parent: unsafe { NonNull::new_unchecked((self as *const Self).cast_mut()) },
                 inner: UnsafeCell::new(LocalDataInner {
                     next_gen_cnt: 2,
                     intermediate: LocalCounted::default(),
@@ -1326,7 +1327,7 @@ struct SwapArcStrongGuard<'a, T: Send + Sync, D: DataPtrConvert<T>, const METADA
     parent: &'a SwapArcAnyMeta<T, D, METADATA_BITS>,
     fake_ref: ManuallyDrop<D>,
     ref_src: RefSource,
-    _no_send_guard: PhantomData<RefCell<()>>, // this ensures that this struct is not sent over to other threads
+    _no_send_guard: PhantomData<UnsafeCell<()>>, // this ensures that this struct is not sent over to other threads
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
@@ -1370,7 +1371,7 @@ enum RefSource {
 }
 
 struct LocalData<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> {
-    parent: *const SwapArcAnyMeta<T, D, METADATA_BITS>, // this acts as a reference with hidden lifetime that only we know is safe because
+    parent: NonNull<SwapArcAnyMeta<T, D, METADATA_BITS>>, // this acts as a reference with hidden lifetime that only we know is safe because
     // `parent` won't be used in the drop impl and `LocalData` can only be accessed
     // through `parent`
     inner: UnsafeCell<LocalDataInner<T, D>>,
@@ -1383,7 +1384,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     fn parent(&self) -> &SwapArcAnyMeta<T, D, METADATA_BITS> {
         // SAFETY: we know that `parent` has to be alive at this point
         // because otherwise `LocalData` wouldn't be alive.
-        unsafe { self.parent.as_ref().unwrap_unchecked() }
+        unsafe { self.parent.as_ref() }
     }
 }
 
