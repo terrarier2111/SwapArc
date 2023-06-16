@@ -343,10 +343,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 };
             }
 
-            // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-            // as it, itself is protected by other atomics, so we can use `Relaxed`
             let intermediate = SwapArcAnyMeta::<T, D, { META_DATA_BITS }>::strip_metadata(
-                parent.parent().intermediate_ptr.load(Ordering::Acquire),
+                parent.parent().intermediate_ptr.load(Ordering::Acquire), // FIXME: make an ordering comment!
             );
             // check if there is a new intermediate value and that the intermediate value has been verified to be usable
             let (ptr, gen_cnt) = if intermediate != data.new.ptr {
@@ -950,19 +948,15 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// metadata passed in the `metadata` parameter.
     pub fn update_metadata(&self, metadata: usize) {
         let backoff = Backoff::new();
-        // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-        // as it, itself is protected by other atomics, so we can use `Relaxed`
-        // FIXME: is this ordering correct?
+        // FIXME: is this ordering correct? - if so make a comment explaining!
         let mut curr = self.intermediate_ptr.load(Ordering::Acquire);
         loop {
             let prefix = metadata & Self::META_MASK;
 
-            // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-            // as it, itself is protected by other atomics, so we can use `Relaxed`
             match self.intermediate_ptr.compare_exchange_weak(
                 curr,
                 ptr::map_addr(curr, |x| (x & !Self::META_MASK) | prefix).cast_mut(),
-                Ordering::Release, // FIXME: is this ordering correct?
+                Ordering::Release, // FIXME: is this ordering correct? - if so make a comment explaining!
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
@@ -986,13 +980,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     pub fn try_update_meta(&self, old: *const T, metadata: usize) -> bool {
         let prefix = metadata & Self::META_MASK;
 
-        // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-        // as it, itself is protected by other atomics, so we can use `Relaxed`
         self.intermediate_ptr
             .compare_exchange(
                 old.cast_mut(),
                 ptr::map_addr(old, |x| (x & !Self::META_MASK) | prefix).cast_mut(),
-                Ordering::Acquire, // FIXME: is this ordering correct?
+                Ordering::Acquire, // FIXME: is this ordering correct? - if so make a comment explaining!
                 Ordering::Relaxed,
             )
             .is_ok()
@@ -1001,19 +993,15 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// Sets all bits of the internal pointer which are set in the `inactive_bits` parameter
     pub fn set_in_metadata(&self, active_bits: usize) {
         let backoff = Backoff::new();
-        // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-        // as it, itself is protected by other atomics, so we can use `Relaxed`
-        // FIXME: is this ordering correct?
+        // FIXME: is this ordering correct? - if so make a comment explaining!
         let mut curr = self.intermediate_ptr.load(Ordering::Acquire);
         loop {
             let prefix = active_bits & Self::META_MASK;
 
-            // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-            // as it, itself is protected by other atomics, so we can use `Relaxed`
             match self.intermediate_ptr.compare_exchange_weak(
                 curr,
                 ptr::map_addr_mut(curr, |x| x | prefix),
-                Ordering::Release, // FIXME: is this ordering correct?
+                Ordering::Release, // FIXME: is this ordering correct? - if so make a comment explaining!
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
@@ -1032,19 +1020,15 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// Unsets all bits of the internal pointer which are set in the `inactive_bits` parameter
     pub fn unset_in_metadata(&self, inactive_bits: usize) {
         let backoff = Backoff::new();
-        // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-        // as it, itself is protected by other atomics, so we can use `Relaxed`
-        // FIXME: is this ordering correct?
+        // FIXME: is this ordering correct? - if so make a comment explaining!
         let mut curr = self.intermediate_ptr.load(Ordering::Acquire);
         loop {
             let prefix = inactive_bits & Self::META_MASK;
 
-            // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-            // as it, itself is protected by other atomics, so we can use `Relaxed`
             match self.intermediate_ptr.compare_exchange_weak(
                 curr,
                 ptr::map_addr_mut(curr, |x| x & !prefix),
-                Ordering::Release, // FIXME: is this ordering correct?
+                Ordering::Release, // FIXME: is this ordering correct - if so make a comment explaining!
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
@@ -1062,9 +1046,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
     /// Returns the metadata stored inside the internal pointer
     pub fn load_metadata(&self) -> usize {
-        // ORDERING: `intermediate_ptr` doesn't have to care about anything other than itself
-        // as it, itself is protected by other atomics, so we can use `Relaxed`
-        // FIXME: is this ordering correct?
+        // FIXME: is this ordering correct? - if so make a comment explaining!
         ptr::expose_addr(self.intermediate_ptr.load(Ordering::Acquire)) & Self::META_MASK
     }
 
