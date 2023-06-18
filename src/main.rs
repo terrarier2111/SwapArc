@@ -264,8 +264,8 @@ fn main() {
     threads
         .into_iter()
         .for_each(|thread| thread.join().unwrap());*/
-    for _ in 0..1000 {
-        let mut threads = vec![];
+    for _ in 0..100000 {
+        /*let mut threads = vec![];
         for _ in 0..20
         /*5*//*1*/
         {
@@ -289,7 +289,8 @@ fn main() {
         }
         threads
             .into_iter()
-            .for_each(|thread| thread.join().unwrap());
+            .for_each(|thread| thread.join().unwrap());*/
+        black_box(AutoLocalArc::new(3));
     }
 }
 
@@ -929,6 +930,20 @@ fn bench_alarc_read_light_multi(bencher: &mut Bencher) {
         threads
             .into_iter()
             .for_each(|thread| thread.join().unwrap());
+    });
+}
+
+#[bench]
+fn bench_alarc_create(bencher: &mut Bencher) {
+    bencher.iter(|| {
+        black_box(AutoLocalArc::new(3));
+    });
+}
+
+#[bench]
+fn bench_arc_create(bencher: &mut Bencher) {
+    bencher.iter(|| {
+        black_box(Arc::new(3));
     });
 }
 

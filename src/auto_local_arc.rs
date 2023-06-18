@@ -52,32 +52,31 @@ unsafe impl<T: Send + Sync> Sync for AutoLocalArc<T> {}
 impl<T: Send + Sync> AutoLocalArc<T> {
     #[no_mangle]
     pub fn new(val: T) -> Self {
-        let inner = SizedBox::new(InnerArc {
-            val,
-            cache: Default::default(),
-        })
-        .into_ptr();
+        let inner = unsafe { NonNull::new(alloc(Layout::new::<InnerArc<T>>()).cast::<InnerArc<T>>()) }.unwrap();
         let tid = thread_id();
-        let cache = unsafe { inner.as_ref()
-            .cache
-            .get_or(|token| {
-                // println!("inserting: {}", thread_id());
-                DetachablePtr(
-                   Some(token)
-                )
-            }, |token| {
-                if DEBUG {
-                    println!("write initial cache: {:?}", unsafe { transmute::<_, *const ()>(token) });
-                }
-                unsafe { &mut *token.meta().cache.get() }.write(Cache {
-                    parent: inner,
-                    src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
-                    thread_id: tid,
-                    token: token.clone().into_unsafe_token(),
-                });
-                token.meta().ref_cnt.store(1, Ordering::Release);
-                token.meta().thread_id.store(tid, Ordering::Release);
-            }).meta().cache.get().as_ref().unwrap_unchecked().as_ptr() };
+        let (cache, ptr) = ThreadLocal::new_insert(|token| { // FIXME: try not allocating in case only a single thread's ref cnt gets used!
+            // println!("inserting: {}", thread_id());
+            DetachablePtr(
+                Some(token)
+            )
+        }, |token| {
+            if DEBUG {
+                println!("write initial cache: {:?}", unsafe { transmute::<_, *const ()>(token) });
+            }
+            unsafe { &mut *token.meta().cache.get() }.write(Cache {
+                parent: inner,
+                src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
+                thread_id: tid,
+                token: token.clone().into_unsafe_token(),
+            });
+            *unsafe { (&mut *token.meta().ref_cnt.as_ptr()) } = 1;
+            *unsafe { (&mut *token.meta().thread_id.as_ptr()) } = tid;
+        });
+        unsafe { inner.as_ptr().write(InnerArc {
+            val,
+            cache,
+        }); }
+        let cache = unsafe { ptr.meta().cache.get().as_ref().unwrap_unchecked().as_ptr() };
         if DEBUG {
             println!("initial: tid {} address {:?}", tid, cache);
         }
