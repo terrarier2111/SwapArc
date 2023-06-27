@@ -1080,6 +1080,14 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     // TODO: to ensure that there's NO update pending
 }
 
+impl<T: Send + Sync + Default, D: DataPtrConvert<T> + Default, const METADATA_BITS: u32> Default
+    for SwapArcAnyMeta<T, D, METADATA_BITS>
+{
+    fn default() -> Self {
+        Self::new(D::default())
+    }
+}
+
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
     for SwapArcAnyMeta<T, D, METADATA_BITS>
 {
