@@ -403,7 +403,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     (data.new.ptr.cast_const(), data.new.gen_cnt)
                 }
             } else {
-                print!("br 8");
                 // there's no new value so we can just return the newest one we have
                 data.new.ref_cnt += 1;
                 (data.new.ptr.cast_const(), data.new.gen_cnt)
@@ -1788,7 +1787,7 @@ fn test_store() {
 }
 
 #[test]
-fn test_cache() { // FIXME: fix this (for correctness)
+fn test_cache() {
     let test = SwapArc::new(Arc::new(0));
     let tmp0 = test.load();
     test.store(Arc::new(1));
@@ -1804,7 +1803,7 @@ fn test_cache() { // FIXME: fix this (for correctness)
 }
 
 #[test]
-fn test_cache_switching() { // FIXME: fix this (for miri)!
+fn test_cache_switching() {
     let test = SwapArc::new(Arc::new(0));
     let tmp0 = test.load();
     test.store(Arc::new(1));
