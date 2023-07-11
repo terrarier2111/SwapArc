@@ -14,6 +14,7 @@ use std::ptr::{null, null_mut, NonNull};
 use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thread_local::ThreadLocal;
+use crate::owned::OwnedData;
 
 pub type SwapArc<T> = SwapArcAnyMeta<T, Arc<T>, 0>;
 pub type SwapArcOption<T> = SwapArcAnyMeta<T, Option<Arc<T>>, 0>;
@@ -149,8 +150,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // Furthermore we know that the ptr to self is valid and non-null.
                 parent: unsafe { NonNull::new_unchecked((self as *const Self).cast_mut()) },
                 inner: UnsafeCell::new(LocalDataInner {
-                    next_gen_cnt: 2,
-                    intermediate: LocalCounted::default(),
+                    next_gen_cnt: 3,
+                    intermediate: OwnedData::default(),
                     new: LocalCounted {
                         gen_cnt: 0,
                         ptr: null_mut(),
@@ -158,7 +159,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         _phantom_data: Default::default(),
                     },
                     curr: LocalCounted {
-                        gen_cnt: 1,
+                        gen_cnt: 2,
                         ptr: curr_ptr.cast_mut(),
                         ref_cnt: 1,
                         _phantom_data: Default::default(),
@@ -229,6 +230,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
             // the following conditional relies on preconditions provided by the caller (`load`)
             // to be precise we rely on `parent.ptr` to be different from `data.curr.ptr`
+            // this allows us to deduce whether the first or the second part of the condition
+            // didn't hold without being able to check the first part of the condition
+            // (as we can't load the value from the atomic again)
             if data.new.ref_cnt == 0 {
                 let (ptr, gen_cnt) = load_updated_slow(this, data);
                 // SAFETY: this is safe because we know that `load_new_slow` returns a pointer that
@@ -263,25 +267,20 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // to the value stored inside `ptr` anyways, so it doesn't really matter when exactly we update `curr`
                 // and this allows us to save many branches on drop
                 data.curr = mem::take(&mut data.new);
+                let curr = this.load_raw_full_internal();
+                // FIXME: add safety comment!
+                let fake_ref = ManuallyDrop::new(unsafe { D::from(curr.ptr) });
                 // if the `ref_cnt` of `intermediate` is not `0`, we know that its `ptr` is valid
-                if data.intermediate.ref_cnt != 0 {
-                    // increase the ref count of the new value
-                    data.intermediate.val().increase_ref_cnt();
-                    // SAFETY: we know that the reference count for the stored `D` got
-                    // increased by us and thus we can decrease it again when
-                    // it isn't needed anymore.
-                    data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
-                    // ORDERING: This is `Release` as the counters act as guards for the critical
-                    // sections inside them and as a guard this counter has to make sure that every
-                    // load of it will automatically ensure that the critical section of its last
-                    // decrement has finished when the new critical section begins.
-                    parent
-                        .parent()
-                        .intermediate_ref_cnt
-                        .fetch_sub(1, Ordering::Release);
+                if !data.intermediate.val().cast_const().is_null() {
+                    let curr_ptr = curr.ptr;
+                    // keep the increase of the ref count of the new value
+                    mem::forget(curr);
+                    // FIXME: add safety comment!
+                    data.new = unsafe { LocalCounted::new(data, curr_ptr) };
+                    // FIXME: add safety comment!
+                    unsafe { data.intermediate.replace(null_mut()) };
                     // SAFETY: this is safe because `data.new` was just updated by us and thus we know that it
                     // contains a valid ptr inside its `ptr` field.
-                    let fake_ref = ManuallyDrop::new(unsafe { D::from(data.new.ptr) });
                     return SwapArcGuard {
                         parent,
                         fake_ref,
@@ -297,50 +296,56 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // `intermediate`: value
                 // to avoid this we try to update `new` or just return `curr` if we fail to do so
 
-                // TODO: do we always have to assume that there is an update pending or can we check if there actually is?
-                let curr = this.load_strongly();
-
                 // SAFETY: we know that `curr.ptr` has to be valid because we just moved
                 // `new` to `curr` with `new`'s `ref_cnt` being non-zero (which means that
                 // `new.ptr` had to have been valid)
                 let other = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
-                if core::ptr::eq(curr.fake_ref.deref() as *const D, other.deref() as *const D) {
+                if core::ptr::eq(fake_ref.deref() as *const D, other.deref() as *const D) {
                     // there is no new update, just stick with the version we have
 
                     data.curr.ref_cnt += 1;
                     // SAFETY: this is safe because the pointer contained inside `curr.ptr` is guaranteed to always be valid
-                    let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
                     return SwapArcGuard {
                         parent,
-                        fake_ref,
+                        fake_ref: other,
                         gen_cnt: data.curr.gen_cnt,
                     };
                 }
-                // increase the strong reference count
-                let new_ptr = ManuallyDrop::into_inner(curr.fake_ref.clone()).into_ptr();
 
                 // don't modify the gen_cnt because we know that there are no references
                 // left to this (thread-)local instance
-                data.new.refill_unchecked(new_ptr);
+                data.new.refill_unchecked(curr.ptr);
+
+                // keep the ref count increased
+                mem::forget(curr);
 
                 return SwapArcGuard {
                     parent,
                     // SAFETY: This is safe because we just created the instance `new_ptr` is pointing to
                     // and we didn't delete it. Thus `new_ptr` is a ptr to a valid instance of `D`.
-                    fake_ref: ManuallyDrop::new(unsafe { D::from(new_ptr) }),
+                    fake_ref,
                     gen_cnt: data.new.gen_cnt,
                 };
             }
 
-            if data.intermediate.ref_cnt != 0 {
-                data.intermediate.ref_cnt += 1;
+            if !data.intermediate.val().is_null() {
+                // FIXME: do we have to use a stronger ordering or is Relaxed sufficient?
+                if parent.parent().ptr.load(Ordering::Relaxed) != data.intermediate.val() {
+                    let new = parent.parent().load_raw_full_internal();
+                    unsafe { data.intermediate.replace(new.ptr.cast_mut()); }
+                    // we need to retain the ref count increment above
+                    mem::forget(new);
+                }
+
                 // SAFETY: we just checked that the ref count of `intermediate` is greater than 0
                 // and thus we know that `intermediate.ptr` has to be a valid value.
-                let fake_ref = ManuallyDrop::new(unsafe { D::from(data.intermediate.ptr) });
+                let fake_ref = ManuallyDrop::new(unsafe { D::from(data.intermediate.val()) });
+                // FIXME: add comment explaining this!
+                fake_ref.increase_ref_cnt();
                 return SwapArcGuard {
                     parent: &parent,
                     fake_ref,
-                    gen_cnt: data.intermediate.gen_cnt,
+                    gen_cnt: INTERMEDIATE_GEN_CNT,
                 };
             }
 
@@ -369,14 +374,21 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     let loaded = SwapArcAnyMeta::<T, D, { META_DATA_BITS }>::strip_metadata(
                         parent.parent().intermediate_ptr.load(Ordering::Acquire),
                     );
-                    if data.intermediate.gen_cnt != 0 {
-                        data.intermediate.refill_unchecked(loaded);
-                    } else {
-                        // FIXME: add safety comment!
-                        let new = unsafe { LocalCounted::new(data, loaded) };
-                        data.intermediate = new;
-                    }
-                    (loaded, data.intermediate.gen_cnt)
+                    // FIXME: add safety comment!
+                    unsafe { ManuallyDrop::new(D::from(loaded)).increase_ref_cnt(); }
+                    unsafe { ManuallyDrop::new(D::from(loaded)).increase_ref_cnt(); }
+
+                    // FIXME: explain ordering
+
+                    // release the reference to the intermediate reference as we incremented it and thus don't need to protect it any longer.
+                    parent
+                        .parent()
+                        .intermediate_ref_cnt
+                        .fetch_sub(1, Ordering::Release);
+
+                    // FIXME: add safety comment!
+                    unsafe { data.intermediate.replace(loaded.cast_mut()); }
+                    (loaded, INTERMEDIATE_GEN_CNT)
                 } else {
                     // the update is on-going, so we have to fallback to our locally most recent value
                     // and signal that the update finished.
@@ -391,6 +403,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     (data.new.ptr.cast_const(), data.new.gen_cnt)
                 }
             } else {
+                print!("br 8");
                 // there's no new value so we can just return the newest one we have
                 data.new.ref_cnt += 1;
                 (data.new.ptr.cast_const(), data.new.gen_cnt)
@@ -448,6 +461,10 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     /// to be used even after the `SwapArc` was dropped.
     #[cfg(feature = "ptr-ops")]
     pub fn load_raw_full(&self) -> SwapArcFullPtrGuard<T, D, METADATA_BITS> {
+        self.load_raw_full_internal()
+    }
+
+    fn load_raw_full_internal(&self) -> SwapArcFullPtrGuard<T, D, METADATA_BITS> {
         let (ptr, src) = self.load_internal();
 
         // FIXME: add safety comment!
@@ -1156,28 +1173,23 @@ cfg_if! {
                 if likely(self.gen_cnt == data.curr.gen_cnt) {
                     data.curr.ref_cnt -= 1;
                 } else {
-                    slow_drop(self.parent, data, self.gen_cnt);
+                    slow_drop(data, self.gen_cnt, self.ptr);
                 }
                 #[cold]
-                fn slow_drop<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>(parent: &LocalData<T, D, METADATA_BITS>, data: &mut LocalDataInner<T, D>, gen_cnt: usize) {
+                fn slow_drop<T: Send + Sync, D: DataPtrConvert<T>>(data: &mut LocalDataInner<T, D>, gen_cnt: usize, ptr: *const T) {
                     if gen_cnt == data.new.gen_cnt {
                         data.new.ref_cnt -= 1;
                         if data.new.ref_cnt == 0 {
-                            if data.intermediate.ref_cnt != 0 {
-                                // increase the ref count of the new value
-                                data.intermediate.val().increase_ref_cnt();
-                                // SAFETY: we know that the reference count for the stored `D` got
-                                // increased by us and thus we can decrease it again when
-                                // it isn't needed anymore.
-                                data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
-                                parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::Release);
+                            if !data.intermediate.val().is_null() {
+                                // FIXME: add comment!
+                                data.new.refill_unchecked(data.intermediate.val());
+                                // FIXME: add safety comment!
+                                unsafe { data.intermediate.replace_softly(null_mut()); }
                             }
                         }
                     } else {
-                        data.intermediate.ref_cnt -= 1;
-                        if data.intermediate.ref_cnt == 0 {
-                            parent.parent().intermediate_ref_cnt.fetch_sub(1, Ordering::Release);
-                        }
+                        // FIXME: add safety comment!
+                        unsafe { D::from(ptr); }
                     }
                 }
             }
@@ -1185,8 +1197,7 @@ cfg_if! {
 
         impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Debug for SwapArcPtrGuard<'_, T, D, METADATA_BITS> {
             fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-                let tmp = format!("{:?}", self.ptr);
-                f.write_str(tmp.as_str())
+                self.ptr.fmt(f)
             }
         }
 
@@ -1215,9 +1226,13 @@ cfg_if! {
 
         impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Debug for SwapArcFullPtrGuard<T, D, METADATA_BITS> {
             fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-                let tmp = format!("{:?}", self.ptr);
-                f.write_str(tmp.as_str())
+                self.ptr.fmt(f)
             }
+        }
+    } else {
+        struct SwapArcFullPtrGuard<T: Send + Sync, D: DataPtrConvert<T> = Arc<T>, const METADATA_BITS: u32 = 0> {
+            inner: D,
+            ptr: *const T,
         }
     }
 }
@@ -1252,42 +1267,27 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
             // locally owned `D`.
             data.curr.ref_cnt -= 1;
         } else {
-            slow_drop(self.parent, data, self.gen_cnt);
+            slow_drop(data, self.gen_cnt, &mut self.fake_ref);
         }
         #[cold]
-        fn slow_drop<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>(
-            parent: &LocalData<T, D, METADATA_BITS>,
+        fn slow_drop<T: Send + Sync, D: DataPtrConvert<T>>(
             data: &mut LocalDataInner<T, D>,
             gen_cnt: usize,
+            fake_ref: &mut ManuallyDrop<D>,
         ) {
             if gen_cnt == data.new.gen_cnt {
                 data.new.ref_cnt -= 1;
                 if data.new.ref_cnt == 0 {
-                    if data.intermediate.ref_cnt != 0 {
-                        // increase the ref count of the new value
-                        data.intermediate.val().increase_ref_cnt();
-                        // SAFETY: we know that the reference count for the stored `D` got
-                        // increased by us and thus we can decrease it again when
-                        // it isn't needed anymore.
-                        data.new = unsafe { mem::take(&mut data.intermediate).make_drop() };
-                        // FIXME: ordering comment
-                        parent
-                            .parent()
-                            .intermediate_ref_cnt
-                            .fetch_sub(1, Ordering::Release);
+                    if !data.intermediate.val().is_null() {
+                        // FIXME: add comment!
+                        data.new.refill_unchecked(data.intermediate.val());
+                        // FIXME: add safety comment!
+                        unsafe { data.intermediate.replace_softly(null_mut()); }
                     }
                 }
             } else {
-                data.intermediate.ref_cnt -= 1;
-                if data.intermediate.ref_cnt == 0 {
-                    // we have no local references to the `intermediate` value anymore
-                    // so release the outside reference as well.
-                    // FIXME: ordering comment
-                    parent
-                        .parent()
-                        .intermediate_ref_cnt
-                        .fetch_sub(1, Ordering::Release);
-                }
+                // FIXME: add safety comment!
+                unsafe { (fake_ref as *mut ManuallyDrop<D>).cast::<D>().read(); }
             }
         }
     }
@@ -1403,14 +1403,66 @@ unsafe impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Send
 {
 }
 
+const INTERMEDIATE_GEN_CNT: usize = 1;
+
 struct LocalDataInner<T: Send + Sync, D: DataPtrConvert<T>> {
     next_gen_cnt: usize,
-    intermediate: LocalCounted<T, D>,
-    new: LocalCounted<T, D, true>,
-    curr: LocalCounted<T, D, true>,
+    intermediate: OwnedData<T, D>,
+    new: LocalCounted<T, D>,
+    curr: LocalCounted<T, D>,
 }
 
-struct LocalCounted<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool = false> {
+// FIXME: explain this additional module!
+mod owned {
+    use std::marker::PhantomData;
+    use std::ptr::null_mut;
+    use crate::DataPtrConvert;
+
+    // FIXME: add safety comments
+
+    pub(crate) struct OwnedData<T: Send + Sync, D: DataPtrConvert<T>>(*mut T, PhantomData<D>);
+
+    impl<T: Send + Sync, D: DataPtrConvert<T>> OwnedData<T, D> {
+        #[inline]
+        pub(crate) unsafe fn new(val: *mut T) -> Self {
+            Self(val, Default::default())
+        }
+
+        pub(crate) unsafe fn replace(&mut self, new: *mut T) {
+            if !self.0.is_null() {
+                unsafe { D::from(self.0.cast_const()); }
+            }
+            self.0 = new;
+        }
+
+        #[inline]
+        pub(crate) unsafe fn replace_softly(&mut self, new: *mut T) {
+            self.0 = new;
+        }
+
+        #[inline]
+        pub(crate) fn val(&self) -> *mut T {
+            self.0
+        }
+    }
+
+    impl<T: Send + Sync, D: DataPtrConvert<T>> Default for OwnedData<T, D> {
+        #[inline]
+        fn default() -> Self {
+            Self(null_mut(), Default::default())
+        }
+    }
+
+    impl<T: Send + Sync, D: DataPtrConvert<T>> Drop for OwnedData<T, D> {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { D::from(self.0.cast_const()); }
+            }
+        }
+    }
+}
+
+struct LocalCounted<T: Send + Sync, D: DataPtrConvert<T>> {
     gen_cnt: usize, // TODO: would it help somehow (the performance) if we were to make `gen_cnt` an `u8`? - it probably wouldn't!
     ptr: *mut T,
     ref_cnt: usize,
@@ -1422,7 +1474,7 @@ struct LocalCounted<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool = fal
 unsafe impl<T: Send + Sync, D: DataPtrConvert<T>> Send for LocalCounted<T, D> {}
 unsafe impl<T: Send + Sync, D: DataPtrConvert<T>> Sync for LocalCounted<T, D> {}
 
-impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, DROP> {
+impl<T: Send + Sync, D: DataPtrConvert<T>> LocalCounted<T, D> {
     /// SAFETY: The caller has to ensure that the safety invariants relied upon
     /// in the `val`, `refill_unchecked` and `drop` methods are being upheld.
     unsafe fn new(parent: &mut LocalDataInner<T, D>, ptr: *const T) -> Self {
@@ -1430,7 +1482,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, 
         let res = parent.next_gen_cnt.overflowing_add(1);
         // if an overflow occurs, we add an additional 1 to the result in order to never
         // reach 0 which is reserved for the "default" `gen_cnt`
-        parent.next_gen_cnt = res.0 + res.1 as usize;
+        parent.next_gen_cnt = res.0 + ((res.1 as usize) << 1); // FIXME: do we actually have to allocate `1` as a special id or could we reuse `0`?
         Self {
             gen_cnt,
             ptr: ptr.cast_mut(),
@@ -1447,13 +1499,11 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, 
     }
 
     fn refill_unchecked(&mut self, ptr: *const T) {
-        if DROP {
-            if !self.ptr.is_null() {
-                // SAFETY: the burden of ensuring that choosing `DROP` is correct
-                // is being placed upon whoever instantiates this struct.
-                unsafe {
-                    D::from(self.ptr);
-                }
+        if !self.ptr.is_null() {
+            // SAFETY: the burden of ensuring that choosing `DROP` is correct
+            // is being placed upon whoever instantiates this struct.
+            unsafe {
+                D::from(self.ptr);
             }
         }
         self.ptr = ptr.cast_mut();
@@ -1461,22 +1511,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> LocalCounted<T, D, 
     }
 }
 
-impl<T: Send + Sync, D: DataPtrConvert<T>> LocalCounted<T, D, false> {
-    /// SAFETY: callers have to make sure that the value behind the `ptr`
-    /// contained inside this struct may be dropped as soon as this struct
-    /// gets dropped.
-    #[inline]
-    unsafe fn make_drop(self) -> LocalCounted<T, D, true> {
-        LocalCounted {
-            gen_cnt: self.gen_cnt,
-            ptr: self.ptr,
-            ref_cnt: self.ref_cnt,
-            _phantom_data: Default::default(),
-        }
-    }
-}
-
-impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCounted<T, D, DROP> {
+impl<T: Send + Sync, D: DataPtrConvert<T>> Default for LocalCounted<T, D> {
     #[inline]
     fn default() -> Self {
         Self {
@@ -1488,16 +1523,13 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> Default for LocalCo
     }
 }
 
-impl<T: Send + Sync, D: DataPtrConvert<T>, const DROP: bool> Drop for LocalCounted<T, D, DROP> {
+impl<T: Send + Sync, D: DataPtrConvert<T>> Drop for LocalCounted<T, D> {
     #[inline]
     fn drop(&mut self) {
-        if DROP {
-            if !self.ptr.is_null() {
-                // SAFETY: the person defining this struct has to make sure that
-                // choosing `DROP` is correct.
-                unsafe {
-                    D::from(self.ptr);
-                }
+        if !self.ptr.is_null() {
+            // FIXME: add safety comment!
+            unsafe {
+                D::from(self.ptr);
             }
         }
     }
@@ -1745,12 +1777,45 @@ fn test_other_load_multi_miri() {
 
 #[test]
 fn test_load() {
-    let tmp = SwapArc::new(Arc::new(3));
-    tmp.load();
+    let test = SwapArc::new(Arc::new(3));
+    test.load();
 }
 
 #[test]
 fn test_store() {
-    let tmp = SwapArc::new(Arc::new(3));
-    tmp.store(Arc::new(-2));
+    let test = SwapArc::new(Arc::new(3));
+    test.store(Arc::new(-2));
+}
+
+#[test]
+fn test_cache() { // FIXME: fix this (for correctness)
+    let test = SwapArc::new(Arc::new(0));
+    let tmp0 = test.load();
+    test.store(Arc::new(1));
+    let tmp1 = test.load();
+    test.store(Arc::new(2));
+    let tmp2 = test.load();
+    test.store(Arc::new(3));
+    let tmp3 = test.load();
+    assert_eq!(tmp0.deref().deref(), &0);
+    assert_eq!(tmp1.deref().deref(), &1);
+    assert_eq!(tmp2.deref().deref(), &2);
+    assert_eq!(tmp3.deref().deref(), &3);
+}
+
+#[test]
+fn test_cache_switching() { // FIXME: fix this (for miri)!
+    let test = SwapArc::new(Arc::new(0));
+    let tmp0 = test.load();
+    test.store(Arc::new(1));
+    let tmp1 = test.load();
+    test.store(Arc::new(2));
+    let tmp2 = test.load();
+    test.store(Arc::new(3));
+    assert_eq!(tmp0.deref().deref(), &0);
+    drop(tmp0);
+    let tmp3 = test.load();
+    assert_eq!(tmp1.deref().deref(), &1);
+    assert_eq!(tmp2.deref().deref(), &2);
+    assert_eq!(tmp3.deref().deref(), &3);
 }
