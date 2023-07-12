@@ -150,7 +150,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // Furthermore we know that the ptr to self is valid and non-null.
                 parent: unsafe { NonNull::new_unchecked((self as *const Self).cast_mut()) },
                 inner: UnsafeCell::new(LocalDataInner {
-                    next_gen_cnt: 3,
+                    next_gen_cnt: 2,
                     intermediate: OwnedData::default(),
                     new: LocalCounted {
                         gen_cnt: 0,
@@ -159,7 +159,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         _phantom_data: Default::default(),
                     },
                     curr: LocalCounted {
-                        gen_cnt: 2,
+                        gen_cnt: 1,
                         ptr: curr_ptr.cast_mut(),
                         ref_cnt: 1,
                         _phantom_data: Default::default(),
@@ -272,11 +272,10 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(curr.ptr) });
                 // if the `ref_cnt` of `intermediate` is not `0`, we know that its `ptr` is valid
                 if !data.intermediate.val().cast_const().is_null() {
-                    let curr_ptr = curr.ptr;
+                    // FIXME: add safety comment!
+                    data.new = unsafe { LocalCounted::new(data, curr.ptr) };
                     // keep the increase of the ref count of the new value
                     mem::forget(curr);
-                    // FIXME: add safety comment!
-                    data.new = unsafe { LocalCounted::new(data, curr_ptr) };
                     // FIXME: add safety comment!
                     unsafe { data.intermediate.replace(null_mut()) };
                     // SAFETY: this is safe because `data.new` was just updated by us and thus we know that it
@@ -375,8 +374,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         parent.parent().intermediate_ptr.load(Ordering::Acquire),
                     );
                     // FIXME: add safety comment!
-                    unsafe { ManuallyDrop::new(D::from(loaded)).increase_ref_cnt(); }
-                    unsafe { ManuallyDrop::new(D::from(loaded)).increase_ref_cnt(); }
+                    unsafe { ManuallyDrop::new(D::from(loaded)).increase_ref_cnt_by(2); }
 
                     // FIXME: explain ordering
 
@@ -443,9 +441,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         let curr_meta = Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire));
         // SAFETY: This is safe as we know that the ptr is valid and we are *not* dropping the
         // inner value we read from it.
-        let ptr =
-            ManuallyDrop::into_inner(unsafe { (&guard.fake_ref as *const ManuallyDrop<D>).read() })
-                .into_ptr();
+        let ptr = guard.fake_ref.into_ptr();
         SwapArcPtrGuard {
             parent: guard.parent,
             ptr: ptr::map_addr(ptr, |x| x | curr_meta),
@@ -1402,7 +1398,7 @@ unsafe impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Send
 {
 }
 
-const INTERMEDIATE_GEN_CNT: usize = 1;
+const INTERMEDIATE_GEN_CNT: usize = 0;
 
 struct LocalDataInner<T: Send + Sync, D: DataPtrConvert<T>> {
     next_gen_cnt: usize,
@@ -1481,7 +1477,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>> LocalCounted<T, D> {
         let res = parent.next_gen_cnt.overflowing_add(1);
         // if an overflow occurs, we add an additional 1 to the result in order to never
         // reach 0 which is reserved for the "default" `gen_cnt`
-        parent.next_gen_cnt = res.0 + ((res.1 as usize) << 1); // FIXME: do we actually have to allocate `1` as a special id or could we reuse `0`?
+        parent.next_gen_cnt = res.0 + res.1 as usize;
         Self {
             gen_cnt,
             ptr: ptr.cast_mut(),
@@ -1563,6 +1559,13 @@ pub trait DataPtrConvert<T: Send + Sync>: RefCnt + Sized {
     #[inline]
     fn increase_ref_cnt(&self) {
         mem::forget(self.clone());
+    }
+
+    #[inline]
+    fn increase_ref_cnt_by(&self, amount: usize) {
+        for _ in 0..amount {
+            self.increase_ref_cnt();
+        }
     }
 }
 
