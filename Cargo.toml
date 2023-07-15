@@ -23,8 +23,8 @@ cfg-if = "1.0.0"
 [dev-dependencies]
 rand = "0.8.5"
 arc-swap = "1.5.1"
+criterion = "0.5.1"
 
 [[bench]]
 name = "swap_arc"
-required-features = ["arc-swap", "rand"]
 harness = false

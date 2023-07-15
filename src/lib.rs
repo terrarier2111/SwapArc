@@ -150,7 +150,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // Furthermore we know that the ptr to self is valid and non-null.
                 parent: unsafe { NonNull::new_unchecked((self as *const Self).cast_mut()) },
                 inner: UnsafeCell::new(LocalDataInner {
-                    next_gen_cnt: 2,
+                    next_gen_cnt: 3,
                     intermediate: OwnedData::default(),
                     new: LocalCounted {
                         gen_cnt: 0,
@@ -159,7 +159,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         _phantom_data: Default::default(),
                     },
                     curr: LocalCounted {
-                        gen_cnt: 1,
+                        gen_cnt: 2,
                         ptr: curr_ptr.cast_mut(),
                         ref_cnt: 1,
                         _phantom_data: Default::default(),
@@ -1271,7 +1271,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
             fake_ref: &mut ManuallyDrop<D>,
         ) {
             if gen_cnt == data.new.gen_cnt {
-                data.new.ref_cnt -= 1;
+                data.new.ref_cnt -= 1; // FIXME: this causes an underflow!
                 if data.new.ref_cnt == 0 {
                     if !data.intermediate.val().is_null() {
                         // FIXME: add comment!
@@ -1398,7 +1398,7 @@ unsafe impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Send
 {
 }
 
-const INTERMEDIATE_GEN_CNT: usize = 0;
+const INTERMEDIATE_GEN_CNT: usize = 1;
 
 struct LocalDataInner<T: Send + Sync, D: DataPtrConvert<T>> {
     next_gen_cnt: usize,
@@ -1477,7 +1477,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>> LocalCounted<T, D> {
         let res = parent.next_gen_cnt.overflowing_add(1);
         // if an overflow occurs, we add an additional 1 to the result in order to never
         // reach 0 which is reserved for the "default" `gen_cnt`
-        parent.next_gen_cnt = res.0 + res.1 as usize;
+        parent.next_gen_cnt = res.0 + ((res.1 as usize) << 1);
         Self {
             gen_cnt,
             ptr: ptr.cast_mut(),
