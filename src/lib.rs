@@ -139,33 +139,38 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     }
 
     /// Loads the reference counted stored value partially.
+    #[inline(never)]
     pub fn load(&self) -> SwapArcGuard<T, D, METADATA_BITS> {
         let parent = self.thread_local.get_or(|| {
-            let curr = self.load_strongly();
-            // increase the reference count
-            let curr_ptr = ManuallyDrop::into_inner(curr.fake_ref.clone()).into_ptr();
-            CachePadded::new(LocalData {
-                // SAFETY: this is safe because we know that this will only ever be accessed
-                // if there is a live reference to `self` present.
-                // Furthermore we know that the ptr to self is valid and non-null.
-                parent: unsafe { NonNull::new_unchecked((self as *const Self).cast_mut()) },
-                inner: UnsafeCell::new(LocalDataInner {
-                    next_gen_cnt: 3,
-                    intermediate: OwnedData::default(),
-                    new: LocalCounted {
-                        gen_cnt: 0,
-                        ptr: null_mut(),
-                        ref_cnt: usize::MAX,
-                        _phantom_data: Default::default(),
-                    },
-                    curr: LocalCounted {
-                        gen_cnt: 2,
-                        ptr: curr_ptr.cast_mut(),
-                        ref_cnt: 1,
-                        _phantom_data: Default::default(),
-                    },
-                }),
-            })
+            #[inline(never)]
+            fn slow<T: Sync + Send, D: DataPtrConvert<T>, const METADATA_BITS: u32>(slf: &SwapArcAnyMeta<T, D, METADATA_BITS>) -> CachePadded<LocalData<T, D, METADATA_BITS>> {
+                let curr = slf.load_strongly();
+                // increase the reference count
+                let curr_ptr = ManuallyDrop::into_inner(curr.fake_ref.clone()).into_ptr();
+                CachePadded::new(LocalData {
+                    // SAFETY: this is safe because we know that this will only ever be accessed
+                    // if there is a live reference to `self` present.
+                    // Furthermore we know that the ptr to self is valid and non-null.
+                    parent: unsafe { NonNull::new_unchecked((slf as *const SwapArcAnyMeta<T, D, METADATA_BITS>).cast_mut()) },
+                    inner: UnsafeCell::new(LocalDataInner {
+                        next_gen_cnt: 3,
+                        intermediate: OwnedData::default(),
+                        new: LocalCounted {
+                            gen_cnt: 0,
+                            ptr: null_mut(),
+                            ref_cnt: usize::MAX,
+                            _phantom_data: Default::default(),
+                        },
+                        curr: LocalCounted {
+                            gen_cnt: 2,
+                            ptr: curr_ptr.cast_mut(),
+                            ref_cnt: 1,
+                            _phantom_data: Default::default(),
+                        },
+                    }),
+                })
+            }
+            slow(self)
         });
         // SAFETY: This is safe because we know that we are the only thread that
         // is able to access the thread local data at this time and said data has to be initialized
@@ -187,6 +192,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             };
         }
 
+        #[inline(never)]
         #[cold]
         fn load_slow<'a, T: Send + Sync, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(
             this: &'a SwapArcAnyMeta<T, D, { META_DATA_BITS }>,
