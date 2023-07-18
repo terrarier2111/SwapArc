@@ -142,6 +142,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     #[inline(never)]
     pub fn load(&self) -> SwapArcGuard<T, D, METADATA_BITS> {
         let parent = self.thread_local.get_or(|| {
+            #[cold]
             #[inline(never)]
             fn slow<T: Sync + Send, D: DataPtrConvert<T>, const METADATA_BITS: u32>(slf: &SwapArcAnyMeta<T, D, METADATA_BITS>) -> CachePadded<LocalData<T, D, METADATA_BITS>> {
                 let curr = slf.load_strongly();
@@ -1694,6 +1695,12 @@ mod ptr {
     pub(crate) fn from_exposed_addr_mut<T>(exposed_addr: usize) -> *mut T {
         core::ptr::from_exposed_addr_mut(exposed_addr)
     }
+}
+
+#[inline(never)]
+#[no_mangle]
+fn test(sa: &Arc<SwapArc<usize>>) -> SwapArcGuard<usize> {
+    sa.load()
 }
 
 #[cfg(all(test, not(miri)))]
