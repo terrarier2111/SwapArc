@@ -181,7 +181,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         // ORDERING: This is `Relaxed` because we are only speculatively loading `ptr` here,
         // so we don't care about the consistency of state of the atomics around it.
         let no_update =
-            Self::strip_metadata(parent.parent().ptr.load(Ordering::Relaxed)) == data.curr.ptr;
+            Self::strip_metadata(self.ptr.load(Ordering::Relaxed)) == data.curr.ptr;
         if likely(no_update && data.new.ref_cnt == 0) {
             data.curr.ref_cnt += 1;
             // SAFETY: this is safe because the pointer contained inside `curr.ptr` is guaranteed to always be valid
@@ -195,11 +195,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
         #[inline(never)]
         #[cold]
-        fn load_slow<'a, T: Send + Sync, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(
-            this: &'a SwapArcAnyMeta<T, D, { META_DATA_BITS }>,
-            parent: &'a LocalData<T, D, META_DATA_BITS>,
-            data: &mut LocalDataInner<T, D>,
-        ) -> SwapArcGuard<'a, T, D, META_DATA_BITS> {
+        fn load_slow<T: Send + Sync, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(
+            parent: &LocalData<T, D, META_DATA_BITS>,
+        ) -> SwapArcGuard<T, D, META_DATA_BITS> {
             fn load_updated_slow<
                 'a,
                 T: Send + Sync,
@@ -234,6 +232,12 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 };
                 (new_ptr, gen_cnt)
             }
+            let this = parent.parent();
+
+            // SAFETY: This is safe because we know that we are the only thread that
+            // is able to access the thread local data at this time and said data has to be initialized
+            // and we also know, that the pointer has to be non-null
+            let data = unsafe { parent.inner.get().as_mut().unwrap_unchecked() };
 
             // the following conditional relies on preconditions provided by the caller (`load`)
             // to be precise we rely on `parent.ptr` to be different from `data.curr.ptr`
@@ -422,7 +426,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             };
         }
 
-        load_slow(self, parent, data)
+        load_slow(parent)
     }
 
     /// Loads the reference counted value that's currently stored
@@ -1253,7 +1257,7 @@ pub struct SwapArcGuard<
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
     for SwapArcGuard<'_, T, D, METADATA_BITS>
 {
-    #[inline]
+    #[inline(never)]
     fn drop(&mut self) {
         // SAFETY: This is safe because we know that we are the only thread that
         // is able to access the thread local data at this time and said data has to be initialized
@@ -1699,8 +1703,15 @@ mod ptr {
 
 #[inline(never)]
 #[no_mangle]
-fn test(sa: &Arc<SwapArc<usize>>) -> SwapArcGuard<usize> {
+fn load_hook(sa: &Arc<SwapArc<usize>>) -> SwapArcGuard<usize> {
     sa.load()
+}
+
+#[inline(never)]
+#[no_mangle]
+fn drop_hook(sa: &Arc<SwapArc<usize>>) -> usize {
+    drop(sa.load());
+    1
 }
 
 #[cfg(all(test, not(miri)))]
