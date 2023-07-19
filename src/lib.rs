@@ -8,7 +8,7 @@ use std::cell::UnsafeCell;
 use std::fmt::{Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::mem;
-use std::mem::{align_of, ManuallyDrop};
+use std::mem::{align_of, ManuallyDrop, MaybeUninit};
 use std::ops::Deref;
 use std::ptr::{null, null_mut, NonNull};
 use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
@@ -188,7 +188,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
             return SwapArcGuard {
                 parent,
-                fake_ref,
+                fake_ref: MaybeUninit::new(fake_ref),
                 gen_cnt: data.curr.gen_cnt,
             };
         }
@@ -251,7 +251,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
                 return SwapArcGuard {
                     parent,
-                    fake_ref,
+                    fake_ref: MaybeUninit::new(fake_ref),
                     gen_cnt,
                 };
             }
@@ -268,7 +268,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(data.curr.ptr) });
                 return SwapArcGuard {
                     parent,
-                    fake_ref,
+                    fake_ref: MaybeUninit::new(fake_ref),
                     gen_cnt: data.curr.gen_cnt,
                 };
             }
@@ -293,7 +293,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // contains a valid ptr inside its `ptr` field.
                     return SwapArcGuard {
                         parent,
-                        fake_ref,
+                        fake_ref: MaybeUninit::new(fake_ref),
                         gen_cnt: data.new.gen_cnt,
                     };
                 }
@@ -317,7 +317,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // SAFETY: this is safe because the pointer contained inside `curr.ptr` is guaranteed to always be valid
                     return SwapArcGuard {
                         parent,
-                        fake_ref: other,
+                        fake_ref: MaybeUninit::new(other),
                         gen_cnt: data.curr.gen_cnt,
                     };
                 }
@@ -333,7 +333,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     parent,
                     // SAFETY: This is safe because we just created the instance `new_ptr` is pointing to
                     // and we didn't delete it. Thus `new_ptr` is a ptr to a valid instance of `D`.
-                    fake_ref,
+                    fake_ref: MaybeUninit::new(fake_ref),
                     gen_cnt: data.new.gen_cnt,
                 };
             }
@@ -354,7 +354,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 fake_ref.increase_ref_cnt();
                 return SwapArcGuard {
                     parent: &parent,
-                    fake_ref,
+                    fake_ref: MaybeUninit::new(fake_ref),
                     gen_cnt: INTERMEDIATE_GEN_CNT,
                 };
             }
@@ -421,7 +421,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
             return SwapArcGuard {
                 parent,
-                fake_ref,
+                fake_ref: MaybeUninit::new(fake_ref),
                 gen_cnt,
             };
         }
@@ -452,7 +452,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         let curr_meta = Self::get_metadata(self.intermediate_ptr.load(Ordering::Acquire));
         // SAFETY: This is safe as we know that the ptr is valid and we are *not* dropping the
         // inner value we read from it.
-        let ptr = guard.fake_ref.into_ptr();
+        // FIXME: expand safety comment to accomodate for fake_ref being MaybeUninit now!
+        let ptr = unsafe { guard.fake_ref.assume_init().into_ptr() };
         SwapArcPtrGuard {
             parent: guard.parent,
             ptr: ptr::map_addr(ptr, |x| x | curr_meta),
@@ -1250,8 +1251,16 @@ pub struct SwapArcGuard<
     const METADATA_BITS: u32 = 0,
 > {
     parent: &'a LocalData<T, D, METADATA_BITS>,
-    fake_ref: ManuallyDrop<D>,
+    fake_ref: MaybeUninit<ManuallyDrop<D>>,
     gen_cnt: usize,
+}
+
+impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcGuard<'_, T, D, METADATA_BITS> {
+    #[inline(always)]
+    fn fake_ref(&self) -> &ManuallyDrop<D> {
+        // FIXME: add safety comment!
+        unsafe { self.fake_ref.assume_init_ref() }
+    }
 }
 
 impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
@@ -1273,15 +1282,17 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
             // locally owned `D`.
             data.curr.ref_cnt -= 1;
         } else {
-            slow_drop(data, self.gen_cnt, &mut self.fake_ref);
+            slow_drop(self);
         }
         #[cold]
-        fn slow_drop<T: Send + Sync, D: DataPtrConvert<T>>(
-            data: &mut LocalDataInner<T, D>,
-            gen_cnt: usize,
-            fake_ref: &mut ManuallyDrop<D>,
+        fn slow_drop<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>(
+            slf: &mut SwapArcGuard<T, D, METADATA_BITS>,
         ) {
-            if gen_cnt == data.new.gen_cnt {
+            // SAFETY: This is safe because we know that we are the only thread that
+            // is able to access the thread local data at this time and said data has to be initialized
+            // and we also know, that the pointer has to be non-null
+            let data = unsafe { slf.parent.inner.get().as_mut().unwrap_unchecked() };
+            if slf.gen_cnt == data.new.gen_cnt {
                 data.new.ref_cnt -= 1; // FIXME: this causes an underflow!
                 if data.new.ref_cnt == 0 {
                     if !data.intermediate.val().is_null() {
@@ -1293,7 +1304,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
                 }
             } else {
                 // FIXME: add safety comment!
-                unsafe { (fake_ref as *mut ManuallyDrop<D>).cast::<D>().read(); }
+                unsafe { ManuallyDrop::into_inner(slf.fake_ref.assume_init_read()); }
             }
         }
     }
@@ -1306,7 +1317,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Deref
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        self.fake_ref.deref()
+        self.fake_ref().deref()
     }
 }
 
@@ -1315,7 +1326,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Borrow<D>
 {
     #[inline]
     fn borrow(&self) -> &D {
-        self.fake_ref.deref()
+        self.fake_ref().deref()
     }
 }
 
