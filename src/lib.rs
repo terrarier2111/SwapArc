@@ -1,12 +1,19 @@
 #![feature(core_intrinsics)]
 #![feature(thread_local)]
+#![feature(const_collections_with_hasher)]
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use crate::swap_arc_tls_optimistic::SwapArcIntermediateTLS;
 pub use swap_arc_tls_optimistic::{DataPtrConvert, RefCnt};
 
 mod swap_arc_tls_optimistic;
+pub mod auto_local_arc;
+mod cached_arc;
+mod spreaded_arc;
+
+pub(crate) static TID: AtomicUsize = AtomicUsize::new(0);
 
 pub type SwapArc<T> = SwapArcIntermediateTLS<T, Arc<T>, 0>;
 pub type SwapArcOption<T> = SwapArcIntermediateTLS<T, Option<Arc<T>>, 0>;

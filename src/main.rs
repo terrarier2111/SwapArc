@@ -1,4 +1,4 @@
-#![feature(core_intrinsics)]
+/*#![feature(core_intrinsics)]
 #![feature(arbitrary_self_types)]
 // only for testing!
 #![allow(soft_unstable)]
@@ -945,7 +945,7 @@ fn bench_arc_create(bencher: &mut Bencher) {
     bencher.iter(|| {
         black_box(Arc::new(3));
     });
-}
+}*/
 
 /*
 #[bench]
@@ -1388,3 +1388,5 @@ fn leak_arc<'a, T: 'a>(val: Arc<T>) -> &'a Arc<T> {
     unsafe { ptr.as_ref() }.unwrap()
 }
 */
+
+fn main() {}

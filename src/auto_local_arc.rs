@@ -97,7 +97,7 @@ impl<T: Send + Sync> AutoLocalArc<T> {
 const MAX_REFCOUNT: usize = usize::MAX / 2_usize;
 
 impl<T: Send + Sync> Clone for AutoLocalArc<T> {
-    #[inline]
+    #[inline(never)]
     fn clone(&self) -> Self {
         let cache_ptr = unsafe { *self.cache.get() };
         let cache = unsafe { cache_ptr.as_ref() };
@@ -268,7 +268,7 @@ unsafe fn handle_large_ref_count<T: Send + Sync>(cache: *mut Cache<T>, ref_cnt: 
 }
 
 impl<T: Send + Sync> Drop for AutoLocalArc<T> {
-    #[inline]
+    #[inline(never)]
     fn drop(
         &mut self) {
         let cache_ptr = unsafe { *self.cache.get() };
@@ -336,13 +336,23 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
     }
 }
 
+#[inline(never)]
+pub fn drop_stuff(alarc: AutoLocalArc<usize>) {
+    drop(alarc);
+}
+
+#[inline(never)]
+pub fn recreate_stuff(alarc: &AutoLocalArc<usize>) -> AutoLocalArc<usize> {
+    alarc.clone()
+}
+
 impl<T: Send + Sync> Deref for AutoLocalArc<T> {
     type Target = T;
 
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
         let offset = memoffset::offset_of!(InnerArc<T>, val);
-        unsafe { &*self.inner.cast::<T>().as_ptr().byte_add(offset) }
+        unsafe { &*(((self.inner.cast::<T>().as_ptr() as usize) + offset) as *const Self::Target) }
     }
 }
 
