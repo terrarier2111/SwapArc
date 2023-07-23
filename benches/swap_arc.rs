@@ -42,7 +42,7 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            tmp.store(Arc::new(rand::random()));
+                            tmp.store(Arc::new(random()));
                         }
                     }));
                 }
@@ -70,16 +70,16 @@ fn main() {
                             spin_loop();
                         }
                         for _ in 0..20000 {
-                            let l1 = tmp.load();
-                            let l2 = tmp.load();
-                            let l3 = tmp.load();
-                            let l4 = tmp.load();
-                            let l5 = tmp.load();
-                            black_box(l1);
-                            black_box(l2);
-                            black_box(l3);
-                            black_box(l4);
-                            black_box(l5);
+                            let l1 = black_box(tmp.load());
+                            let l2 = black_box(tmp.load());
+                            let l3 = black_box(tmp.load());
+                            let l4 = black_box(tmp.load());
+                            let l5 = black_box(tmp.load());
+                            drop(black_box(l1));
+                            drop(black_box(l2));
+                            drop(black_box(l3));
+                            drop(black_box(l4));
+                            drop(black_box(l5));
                         }
                     }));
                 }
