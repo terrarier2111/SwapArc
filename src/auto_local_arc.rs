@@ -123,11 +123,12 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             }
         } else {
             #[inline(never)]
-            fn clone_different_thread<T: Send + Sync>(inner: NonNull<InnerArc<T>>, tid: u64, cache_ptr: NonNull<Cache<T>>, ptr_to_cache_ptr: *mut NonNull<Cache<T>>) -> AutoLocalArc<T> {
+            fn clone_different_thread<T: Send + Sync>(inner: NonNull<InnerArc<T>>, tid: u64, ptr_to_cache_ptr: *mut NonNull<Cache<T>>) -> AutoLocalArc<T> {
                 // println!("increment non-local cnt");
                 // we aren't the owner, now we have to do some more work
 
-                let inner = inner;
+                let cache_ptr = unsafe { *ptr_to_cache_ptr };
+
                 let cached = unsafe { inner.as_ref()
                     .cache
                     .get_or(|token| {
@@ -169,12 +170,16 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
 
                 if ref_cnt == strip_flags(debt) {
                     if debt > 0 {
-                        // we have a retry loop here in case the debt's updater hasn't finished yet
-                        let backoff = Backoff::new();
-                        // wait for the other thread to clean up
-                        while local_meta.thread_id.load(Ordering::Acquire) != STOP_DESTROY {
-                            backoff.snooze();
+                        #[cold]
+                        fn wait_for_updater<T: Send + Sync>(local_meta: &Metadata<T>) {
+                            // we have a retry loop here in case the debt's updater hasn't finished yet
+                            let backoff = Backoff::new();
+                            // wait for the other thread to clean up
+                            while local_meta.thread_id.load(Ordering::Acquire) != STOP_DESTROY {
+                                backoff.snooze();
+                            }
                         }
+                        wait_for_updater::<T>(local_meta)
                     }
                     // the local cache has no valid references anymore
                     local_cache.src.store(cache_ptr.as_ptr(), Ordering::Release);
@@ -214,12 +219,16 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                             // but all local references got dropped first and then some other thread increased the debt
                             // and thus it might still be cleaning up the cache.
 
-                            // we have a retry loop here in case the debt's updater hasn't finished yet
-                            let backoff = Backoff::new();
-                            // wait for the other thread to clean up
-                            while local_meta.thread_id.load(Ordering::Acquire) != STOP_DESTROY {
-                                backoff.snooze();
+                            #[cold]
+                            fn wait_for_updater<T: Send + Sync>(local_meta: &Metadata<T>) {
+                                // we have a retry loop here in case the debt's updater hasn't finished yet
+                                let backoff = Backoff::new();
+                                // wait for the other thread to clean up
+                                while local_meta.thread_id.load(Ordering::Acquire) != STOP_DESTROY {
+                                    backoff.snooze();
+                                }
                             }
+                            wait_for_updater::<T>(local_meta)
                         }
                         // the local cache has no valid references anymore
                         local_cache.src.store(cache_ptr.as_ptr(), Ordering::Release);
@@ -241,7 +250,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                 }
             }
 
-            clone_different_thread::<T>(self.inner, tid, cache_ptr, self.cache.get())
+            clone_different_thread::<T>(self.inner, tid, self.cache.get())
         }
     }
 }
@@ -746,11 +755,15 @@ impl Drop for DropGuard {
 // This method may only be called locally.
 fn guard() -> *const AtomicPtr<()> {
     if GUARD.load(Ordering::Relaxed) == null_mut() {
-        // initialize guard
-        DROP_GUARD.with(|_| {});
+        #[cold]
+        fn init_guard() {
+            // initialize guard
+            DROP_GUARD.with(|_| {});
 
-        GUARD.store(sentinel_addr().cast_mut(), Ordering::Relaxed);
-        GUARDS.lock().unwrap().insert((&GUARD as *const AtomicPtr<()>) as usize);
+            GUARD.store(sentinel_addr().cast_mut(), Ordering::Relaxed);
+            GUARDS.lock().unwrap().insert((&GUARD as *const AtomicPtr<()>) as usize);
+        }
+        init_guard();
     }
     &GUARD as *const _
 }
