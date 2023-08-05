@@ -50,7 +50,7 @@ unsafe impl<T: Send + Sync> Send for AutoLocalArc<T> {}
 unsafe impl<T: Send + Sync> Sync for AutoLocalArc<T> {}
 
 impl<T: Send + Sync> AutoLocalArc<T> {
-    #[no_mangle]
+    #[inline(never)]
     pub fn new(val: T) -> Self {
         let inner = unsafe { NonNull::new(alloc(Layout::new::<InnerArc<T>>()).cast::<InnerArc<T>>()) }.unwrap();
         let tid = thread_id();
@@ -97,7 +97,7 @@ impl<T: Send + Sync> AutoLocalArc<T> {
 const MAX_REFCOUNT: usize = usize::MAX / 2_usize;
 
 impl<T: Send + Sync> Clone for AutoLocalArc<T> {
-    #[inline(never)]
+    // #[inline(never)]
     fn clone(&self) -> Self {
         let cache_ptr = unsafe { *self.cache.get() };
         let cache = unsafe { cache_ptr.as_ref() };
@@ -277,7 +277,7 @@ unsafe fn handle_large_ref_count<T: Send + Sync>(cache: *mut Cache<T>, ref_cnt: 
 }
 
 impl<T: Send + Sync> Drop for AutoLocalArc<T> {
-    #[inline(never)]
+    // #[inline(never)]
     fn drop(
         &mut self) {
         let cache_ptr = unsafe { *self.cache.get() };
@@ -353,6 +353,11 @@ pub fn drop_stuff(alarc: AutoLocalArc<usize>) {
 #[inline(never)]
 pub fn recreate_stuff(alarc: &AutoLocalArc<usize>) -> AutoLocalArc<usize> {
     alarc.clone()
+}
+
+#[inline(never)]
+pub fn create_alarc(val: usize) -> AutoLocalArc<usize> {
+    AutoLocalArc::new(val)
 }
 
 impl<T: Send + Sync> Deref for AutoLocalArc<T> {
