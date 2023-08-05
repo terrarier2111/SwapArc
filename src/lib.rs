@@ -448,7 +448,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         // SAFETY: This is safe as we know that the ptr is valid and we are *not* dropping the
         // inner value we read from it.
         // FIXME: expand safety comment to accomodate for fake_ref being MaybeUninit now!
-        let ptr = unsafe { guard.fake_ref.assume_init().into_ptr() };
+        let fake_ref = unsafe { (guard.fake_ref.assume_init_ref() as *const ManuallyDrop<D>).read() };
+        let ptr = unsafe { fake_ref.into_ptr() };
         SwapArcPtrGuard {
             parent: guard.parent,
             ptr: ptr::map_addr(ptr, |x| x | curr_meta),
