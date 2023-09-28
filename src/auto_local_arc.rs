@@ -53,7 +53,7 @@ impl<T: Send + Sync> AutoLocalArc<T> {
     #[inline(never)]
     pub fn new(val: T) -> Self {
         let inner = unsafe { NonNull::new(alloc(Layout::new::<InnerArc<T>>()).cast::<InnerArc<T>>()) }.unwrap();
-        let tid = thread_id();
+        let tid = tid::thread_identifier();
         let (cache, ptr) = ThreadLocal::new_insert(|token| { // FIXME: try not allocating in case only a single thread's ref cnt gets used!
             // println!("inserting: {}", thread_id());
             DetachablePtr(
@@ -66,7 +66,7 @@ impl<T: Send + Sync> AutoLocalArc<T> {
             unsafe { &mut *token.meta().cache.get() }.write(Cache {
                 parent: inner,
                 src: AtomicPtr::new(null_mut()), // we have no src, as we are the src ourselves
-                thread_id: tid,
+                thread_id: AtomicUsize::new(tid),
                 token: token.clone().into_unsafe_token(),
             });
             *unsafe { (&mut *token.meta().ref_cnt.as_ptr()) } = 1;
@@ -103,27 +103,28 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
         let cache = unsafe { cache_ptr.as_ref() };
         // check if we are the owner of this alarc's cache
 
-        let tid = thread_id();
+        let tid = tid::thread_identifier();
 
-        if cache.thread_id == tid {
+        if cache.thread_id.load(Ordering::Acquire) == tid {
             let meta = unsafe { cache.token.meta() };
             // println!("increment local cnt");
             // we are the owner of this cache, just perform a simple increment
 
-            let ref_cnt = meta.ref_cnt.load(Ordering::Relaxed/*Acquire*/);
+            let ref_cnt = meta.ref_cnt.load(Ordering::Relaxed/*Acquire*/); // FIXME: store the detached flag here,
+                                                                                        // FIXME: so we can handle collisions between ids inside handle_arge_ref_cnt
             if unlikely(ref_cnt >= MAX_REFCOUNT) {
                 unsafe {
                     handle_large_ref_count((cache as *const Cache<T>).cast_mut(), ref_cnt);
                 }
             }
             meta.ref_cnt.store(ref_cnt + 1, Ordering::Release);
-            Self {
+            return Self {
                 inner: self.inner,
                 cache: cache_ptr.into(),
-            }
-        } else {
-            #[inline(never)]
-            fn clone_different_thread<T: Send + Sync>(inner: NonNull<InnerArc<T>>, tid: u64, ptr_to_cache_ptr: *mut NonNull<Cache<T>>) -> AutoLocalArc<T> {
+            };
+        }
+        #[inline(never)]
+            fn clone_different_thread<T: Send + Sync>(inner: NonNull<InnerArc<T>>, tid: usize, ptr_to_cache_ptr: *mut NonNull<Cache<T>>) -> AutoLocalArc<T> {
                 // println!("increment non-local cnt");
                 // we aren't the owner, now we have to do some more work
 
@@ -142,7 +143,7 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                         unsafe { &mut *token.meta().cache.get() }.write(Cache {
                             parent: inner,
                             src: AtomicPtr::new(cache_ptr.as_ptr()),
-                            thread_id: tid,
+                            thread_id: AtomicUsize::new(tid),
                             token: token.into_unsafe_token(),
                         });
                     }) };
@@ -193,9 +194,9 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
                     // remove the reference to the external cache, as we moved it to our own cache instead
                     *unsafe { &mut *ptr_to_cache_ptr } = local_cache_ptr;
                 } else {
-                    if local_cache.thread_id != tid {
+                    if local_cache.thread_id.load(Ordering::Acquire) != tid {
                         if DEBUG {
-                            println!("differing ids: cache {:?} cache_tid {} curr {}", local_cache as *const _, local_cache.thread_id, tid);
+                            println!("differing ids: cache {:?} cache_tid {} curr {}", local_cache as *const _, local_cache.thread_id.load(Ordering::Acquire), tid);
                         }
                     }
                     // the local cache is still in use, try simply incrementing its counter
@@ -251,7 +252,6 @@ impl<T: Send + Sync> Clone for AutoLocalArc<T> {
             }
 
             clone_different_thread::<T>(self.inner, tid, self.cache.get())
-        }
     }
 }
 
@@ -283,8 +283,8 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
         let cache_ptr = unsafe { *self.cache.get() };
         let cache = unsafe { cache_ptr.as_ref() };
         let meta = unsafe { cache.token.meta() };
-        let tid = thread_id();
-        if cache.thread_id == tid {
+        let tid = tid::thread_identifier();
+        if cache.thread_id.load(Ordering::Acquire) == tid {
             let ref_cnt = meta.ref_cnt.load(Ordering::Relaxed);
             meta.state.store(CACHE_STATE_IN_USE, Ordering::Release);
             meta.ref_cnt.store(ref_cnt - 1, Ordering::Release);
@@ -294,10 +294,10 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             // `ref_cnt` can't race with `debt` here because we are the only ones who are able to update `ref_cnt`
             let debt = meta.debt.load(Ordering::Acquire);
             if DEBUG {
-                if tid == TID.load(Ordering::Acquire) as u64 {
+                if tid == TID.load(Ordering::Acquire) {
                     println!(
                         "local drop: {} refs: {} debt: {}",
-                        cache.thread_id, ref_cnt, debt
+                        cache.thread_id.load(Ordering::Acquire), ref_cnt, debt
                     );
                 }
             }
@@ -318,12 +318,12 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
             // println!("non-local cache ptr drop!");
             let guard = unsafe { guard().as_ref().unwrap_unchecked() };
             guard.store(cache_ptr.as_ptr().cast(), Ordering::Release);
-            let cache_tid = cache.thread_id;
+            let cache_tid = cache.thread_id.load(Ordering::Acquire);
             let debt = meta.debt.fetch_add(1, Ordering::AcqRel) + 1;
             fence(Ordering::Acquire);
             let ref_cnt = meta.ref_cnt.load(Ordering::Acquire);
             if DEBUG {
-                if tid == TID.load(Ordering::Acquire) as u64 {
+                if tid == TID.load(Ordering::Acquire) {
                     println!(
                         "FAILED local drop: {} refs: {} debt: {} | glob {} | tid {} address {:?}",
                         cache_tid, ref_cnt, debt/*, fin*/, TID.load(Ordering::Acquire), tid, cache_ptr.as_ptr()
@@ -416,7 +416,7 @@ impl<T: Send + Sync> Drop for InnerArc<T> {
 #[repr(C)]
 struct Cache<T: Send + Sync> {
     parent: NonNull<InnerArc<T>>,
-    thread_id: u64,
+    thread_id: AtomicUsize, // FIXME: set this to an invalid value once the owning thread exits.
     token: UnsafeToken<DetachablePtr<T>, Metadata<T>, false>,
     src: AtomicPtr<Cache<T>>,
 }
@@ -427,7 +427,7 @@ struct Cache<T: Send + Sync> {
 fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
     cache: NonNull<Cache<T>>,
     detached: bool,
-    exp_tid: u64,
+    exp_tid: usize,
 ) -> bool {
     let token = unsafe { cache.as_ref().token.duplicate() };
     let meta = unsafe { token.meta() };
@@ -489,7 +489,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
                     let super_cache_ptr = unsafe { NonNull::new_unchecked(src) };
                     let super_cache = unsafe { super_cache_ptr.as_ref() };
                     let super_meta = unsafe { super_cache.token.meta() };
-                    let super_tid = super_cache.thread_id;
+                    let super_tid = super_cache.thread_id.load(Ordering::Acquire);
                     let debt = super_meta.debt.fetch_add(1, Ordering::AcqRel) + 1; // we add 1 at the end to make sure we use the post-update value
                     /*// this fence protects the following load of `ref_cnt` from being moved before the guard increment.
                 fence(Ordering::Acquire);*/
@@ -538,7 +538,7 @@ fn cleanup_cache<const UPDATE_SUPER: bool, T: Send + Sync>(
 }
 
 struct Metadata<T: Send + Sync> {
-    thread_id: AtomicU64,
+    thread_id: AtomicUsize,
     ref_cnt: AtomicUsize, // this ref cnt may only be updated by the current thread
     debt: AtomicUsize, // this debt count may only be updated by threads other than the current one - this has a `detached` flag as its last bit
     state: AtomicU8,
@@ -586,7 +586,7 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
                 // doesn't necessarily have to be the same as the one
                 // owning the cache and we have to make sure that all decrements happened before this.
                 let ref_cnt = meta.ref_cnt.load(Ordering::Acquire);
-                let tid = cache.thread_id;
+                let tid = cache.thread_id.load(Ordering::Acquire);
                 // mark the cache as detached in order to allow other threads to see
                 if DEBUG {
                     println!("detached {:?}", cache as *const Cache<T>);
@@ -614,40 +614,10 @@ impl<T: Send + Sync> Drop for DetachablePtr<T> {
 type TLocal<T> = ThreadLocal<DetachablePtr<T>, Metadata<T>, false>;
 
 // invalid tids
-const INVALID_TID: u64 = START_DESTROY;
-const START_DESTROY: u64 = u64::MAX - 2;
-const STOP_DESTROY: u64 = u64::MAX - 1;
-const NOT_PRESENT: u64 = u64::MAX;
-
-#[thread_local]
-static ACTUAL_TID: Cell<u64> = Cell::new(NOT_PRESENT);
-
-#[inline]
-fn thread_id() -> u64 {
-    let act_tid = ACTUAL_TID.get();
-    if unlikely(act_tid == NOT_PRESENT) {
-        let tid = set_actual_tid();
-
-        return tid;
-    }
-    act_tid
-}
-
-#[cold]
-#[inline(never)]
-fn set_actual_tid() -> u64 {
-    // let tid = thread::current().id().as_u64().get();
-    let tid = thread_id::get() as u64;
-
-    if unlikely(tid >= INVALID_TID) {
-        // we can't have any thread id be our INVALID_TID
-        abort();
-    }
-
-    ACTUAL_TID.set(tid);
-
-    tid
-}
+const INVALID_TID: usize = START_DESTROY;
+const START_DESTROY: usize = usize::MAX - 2;
+const STOP_DESTROY: usize = usize::MAX - 1;
+const NOT_PRESENT: usize = usize::MAX;
 
 // this is for `debt` and indicates that the thread local cache containing
 // the DetachablePtr is being dropped or got dropped.
@@ -771,4 +741,42 @@ fn guard() -> *const AtomicPtr<()> {
         init_guard();
     }
     &GUARD as *const _
+}
+
+
+mod tid {
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub(crate) fn thread_identifier() -> usize {
+        use std::arch::asm;
+
+        let res;
+        unsafe { asm!("mov {}, fs", out(reg) res, options(nostack, nomem, pure, preserves_flags)); }
+        res
+    }
+
+    #[cfg(all(target_arch = "x86", target_os = "linux"))]
+    pub(crate) fn thread_identifier() -> usize {
+        let res;
+        unsafe { asm!("mov {}, gs", out(reg) res, options(nostack, nomem, pure, preserves_flags)); }
+        res
+    }
+
+    #[cfg(all(target_arch = "aarch64"))] // FIXME: does this actually work on linux and is it specific to linux?
+    pub(crate) fn thread_identifier() -> usize {
+        let res;
+        unsafe { asm!("mrs {}, TPIDR_EL0", out(reg) res); } // TODO: add some assembly options
+        res
+    }
+
+    /* // FIXME: try using a compatible way to accessing this
+    #[cfg(all(target_arch = "arm"))] // FIXME: does this actually work on linux and is it specific to linux?
+    pub(crate) fn thread_identifier() -> usize {
+        let res;
+        unsafe { asm!("mrc p15, 0, {}, c13, c0, 2", out(reg) res); } // TODO: add some assembly options
+        res
+    }*/
+
+    // FIXME: support windows and macos!
+
 }
