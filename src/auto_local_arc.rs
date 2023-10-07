@@ -41,6 +41,8 @@ const DEBUG: bool = false;
 
 // FIXME: all instances of tid and cache.thread_id differing are in alternative caches!
 
+/// This implementation of atomic reference counting is optimized for high contention
+/// scenarios.
 pub struct AutoLocalArc<T: Send + Sync> {
     inner: NonNull<InnerArc<T>>,
     cache: UnsafeCell<NonNull<Cache<T>>>,
@@ -306,6 +308,11 @@ impl<T: Send + Sync> Drop for AutoLocalArc<T> {
                 if DEBUG {
                     println!("rc is debt: {}", is_detached(debt));
                 }
+                // provide a fastpath for local-only references
+                /*if strip_flags(debt) == 0 {
+                    
+                    return;
+                }*/
                 if cleanup_cache::<true, T>(cache_ptr, is_detached(debt), tid) {
                     // don't modify the state anymore as it might have been deallocated or be reassociated with another
                     // thread's entry
@@ -416,8 +423,8 @@ impl<T: Send + Sync> Drop for InnerArc<T> {
 #[repr(C)]
 struct Cache<T: Send + Sync> {
     parent: NonNull<InnerArc<T>>,
-    thread_id: AtomicUsize, // FIXME: set this to an invalid value once the owning thread exits.
     token: UnsafeToken<DetachablePtr<T>, Metadata<T>, false>,
+    thread_id: AtomicUsize, // FIXME: set this to an invalid value once the owning thread exits.
     src: AtomicPtr<Cache<T>>,
 }
 

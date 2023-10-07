@@ -1,4 +1,4 @@
-/*#![feature(core_intrinsics)]
+#![feature(core_intrinsics)]
 #![feature(arbitrary_self_types)]
 // only for testing!
 #![allow(soft_unstable)]
@@ -712,7 +712,7 @@ fn bench_arc_read_light_single(bencher: &mut Bencher) {
 }
 
 #[bench]
-fn bench_abrc_read_light_single_many(bencher: &mut Bencher) {
+fn bench_arc_read_light_single_many(bencher: &mut Bencher) {
     let tmp = Arc::new(3);
     bencher.iter(|| {
         for _ in 0..1000 {
@@ -945,7 +945,7 @@ fn bench_arc_create(bencher: &mut Bencher) {
     bencher.iter(|| {
         black_box(Arc::new(3));
     });
-}*/
+}
 
 /*
 #[bench]
@@ -1389,4 +1389,4 @@ fn leak_arc<'a, T: 'a>(val: Arc<T>) -> &'a Arc<T> {
 }
 */
 
-fn main() {}
+// fn main() {}
