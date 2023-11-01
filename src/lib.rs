@@ -675,6 +675,14 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         }
     }
 
+    #[inline]
+    pub fn swap(&self, updated: D) -> Option<D> {
+        // SAFETY: we know that `updated` is an instance of `D`, so we can generate a valid ptr to its content.
+        unsafe {
+            self._store_raw(updated.into_ptr())
+        }
+    }
+
     /// Update the value inside the SwapArc to value passed in `updated`.
     #[inline]
     pub fn store(&self, updated: D) {
@@ -698,7 +706,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
     /// SAFETY: `updated` has to be a pointer that points to a valid instance
     /// of `T` and has to be acquired by calling `D::as_ptr` or via similar means.
-    unsafe fn _store_raw(&self, updated: *const T) {
+    unsafe fn _store_raw(&self, updated: *const T) -> Option<D> {
         let new = updated.cast_mut();
         let backoff = Backoff::new();
         loop {
@@ -735,19 +743,21 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // the critical section (in this case the swap of `updated` and the load + store of `intermediate_ptr`) has ended.
                     self.intermediate_ref_cnt
                         .fetch_and(!Self::UPDATE, Ordering::Release);
-                    if !old.is_null() {
+                    let ret = if !old.is_null() {
                         // drop the `virtual reference` we hold to the `D`
 
                         // SAFETY: we know that we hold a `virtual reference` to the `D`
                         // which `updated` pointed to before but we took it out of
                         // `updated` and we know that the value in `updated` has to be valid
                         // while it is in there.
-                        D::from(old);
-                    }
+                        Some(D::from(old))
+                    } else {
+                        None
+                    };
                     // try finishing the update up
                     // FIXME: safety comment!
                     self.update_curr(new);
-                    break;
+                    return ret;
                 }
                 Err(old) => {
                     if old & Self::UPDATE != 0 {
@@ -768,16 +778,18 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                     // is visible at this point. The `Release` part of this ordering is necessary
                     // in order to make the memory allocation visible at the next load.
                     let old = self.updated.swap(new, Ordering::AcqRel);
-                    if !old.is_null() {
+                    let ret = if !old.is_null() {
                         // drop the `virtual reference` we hold to the `D`
 
                         // SAFETY: we know that we hold a `virtual reference` to the `D`
                         // which `updated` pointed to before but we took it out of
                         // `updated` and we know that the value in `updated` has to be valid
                         // while it is in there.
-                        D::from(old);
-                    }
-                    break;
+                        Some(D::from(old))
+                    } else {
+                        None
+                    };
+                    return ret;
                 }
             }
         }
