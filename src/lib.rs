@@ -1,4 +1,5 @@
 #![cfg_attr(miri, feature(strict_provenance))]
+#![cfg_attr(miri, feature(exposed_provenance)]
 
 use cfg_if::cfg_if;
 use crossbeam_utils::{Backoff, CachePadded};
