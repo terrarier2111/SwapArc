@@ -1,5 +1,7 @@
 #![cfg_attr(miri, feature(strict_provenance))]
+#![cfg_attr(miri, feature(exposed_provenance))]
 
+use crate::owned::OwnedData;
 use cfg_if::cfg_if;
 use crossbeam_utils::{Backoff, CachePadded};
 use likely_stable::{likely, unlikely};
@@ -14,7 +16,6 @@ use std::ptr::{null, null_mut, NonNull};
 use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thread_local::ThreadLocal;
-use crate::owned::OwnedData;
 
 pub type SwapArc<T> = SwapArcAnyMeta<T, Arc<T>, 0>;
 pub type SwapArcOption<T> = SwapArcAnyMeta<T, Option<Arc<T>>, 0>;
@@ -149,9 +150,12 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // SAFETY: this is safe because we know that this will only ever be accessed
                 // if there is a live reference to `self` present.
                 // Furthermore we know that the ptr to self is valid and non-null.
-                parent: unsafe { NonNull::new_unchecked((self as *const SwapArcAnyMeta<T, D, METADATA_BITS>).cast_mut()) },
+                parent: unsafe {
+                    NonNull::new_unchecked(
+                        (self as *const SwapArcAnyMeta<T, D, METADATA_BITS>).cast_mut(),
+                    )
+                },
                 inner: UnsafeCell::new(LocalDataInner {
-                    next_gen_cnt: 3,
                     intermediate: OwnedData::default(),
                     new: LocalCounted {
                         gen_cnt: 0,
@@ -160,7 +164,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         _phantom_data: Default::default(),
                     },
                     curr: LocalCounted {
-                        gen_cnt: 2,
+                        gen_cnt: 1,
                         ptr: curr_ptr.cast_mut(),
                         ref_cnt: 1,
                         _phantom_data: Default::default(),
@@ -175,8 +179,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
         // ORDERING: This is `Relaxed` because we are only speculatively loading `ptr` here,
         // so we don't care about the consistency of state of the atomics around it.
-        let no_update =
-            Self::strip_metadata(self.ptr.load(Ordering::Relaxed)) == data.curr.ptr;
+        let no_update = Self::strip_metadata(self.ptr.load(Ordering::Relaxed)) == data.curr.ptr;
         if likely(no_update && data.new.ref_cnt == 0) {
             data.curr.ref_cnt += 1;
             // SAFETY: this is safe because the pointer contained inside `curr.ptr` is guaranteed to always be valid
@@ -193,40 +196,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         fn load_slow<T: Send + Sync, D: DataPtrConvert<T>, const META_DATA_BITS: u32>(
             parent: &LocalData<T, D, META_DATA_BITS>,
         ) -> SwapArcGuard<T, D, META_DATA_BITS> {
-            fn load_updated_slow<
-                'a,
-                T: Send + Sync,
-                D: DataPtrConvert<T>,
-                const META_DATA_BITS: u32,
-            >(
-                this: &'a SwapArcAnyMeta<T, D, { META_DATA_BITS }>,
-                data: &'a mut LocalDataInner<T, D>,
-            ) -> (*const T, usize) {
-                let curr = this.load_strongly();
-                // increase the strong reference count
-                let new_ptr = ManuallyDrop::into_inner(curr.fake_ref.clone()).into_ptr();
-
-                // check if we can immediately update our `curr` value or if we have to
-                // put the update into `new` until `curr` can be updated.
-                let gen_cnt = if data.curr.ref_cnt == 0 {
-                    // don't modify the gen_cnt because we know that there are no references
-                    // left to this (thread-)local instance
-                    data.curr.refill_unchecked(new_ptr);
-                    data.curr.gen_cnt
-                } else {
-                    if data.new.gen_cnt != 0 {
-                        // don't modify the gen_cnt because we know that there are no references
-                        // left to this (thread-)local instance
-                        data.new.refill_unchecked(new_ptr);
-                    } else {
-                        // FIXME: add safety comment!
-                        let new = unsafe { LocalCounted::new(data, new_ptr) };
-                        data.new = new;
-                    }
-                    data.new.gen_cnt
-                };
-                (new_ptr, gen_cnt)
-            }
             let this = parent.parent();
 
             // SAFETY: This is safe because we know that we are the only thread that
@@ -240,8 +209,25 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
             // didn't hold without being able to check the first part of the condition
             // (as we can't load the value from the atomic again)
             if data.new.ref_cnt == 0 {
-                let (ptr, gen_cnt) = load_updated_slow(this, data);
-                // SAFETY: this is safe because we know that `load_new_slow` returns a pointer that
+                let (ptr, gen_cnt) = {
+                    let curr = this.load_strongly();
+                    // increase the strong reference count
+                    let new_ptr = ManuallyDrop::into_inner(curr.fake_ref.clone()).into_ptr();
+
+                    // check if we can immediately update our `curr` value or if we have to
+                    // put the update into `new` until `curr` can be updated.
+                    let gen_cnt = if data.curr.ref_cnt == 0 {
+                        // this is safe as there are no more references to curr
+                        data.curr.refill_unchecked(new_ptr);
+                        data.curr.gen_cnt
+                    } else {
+                        // this is safe as there are no more references to new
+                        data.new.refill_unchecked(new_ptr);
+                        data.new.gen_cnt
+                    };
+                    (new_ptr, gen_cnt)
+                };
+                // SAFETY: this is safe because we know that `ptr`
                 // was acquired through `D::as_ptr` and points to a valid instance of `D`.
                 let fake_ref = ManuallyDrop::new(unsafe { D::from(ptr) });
                 return SwapArcGuard {
@@ -272,16 +258,16 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // we can do the `curr` update on load because we know that we have a strong reference
                 // to the value stored inside `ptr` anyways, so it doesn't really matter when exactly we update `curr`
                 // and this allows us to save many branches on drop
-                data.curr = mem::take(&mut data.new);
-                let curr = this.load_raw_full_internal();
+                data.propagate_new();
+                let loaded = this.load_raw_full_internal();
                 // FIXME: add safety comment!
-                let fake_ref = ManuallyDrop::new(unsafe { D::from(curr.ptr) });
+                let fake_ref = ManuallyDrop::new(unsafe { D::from(loaded.ptr) });
                 // if the `ref_cnt` of `intermediate` is not `0`, we know that its `ptr` is valid
                 if !data.intermediate.val().cast_const().is_null() {
                     // FIXME: add safety comment!
-                    data.new = unsafe { LocalCounted::new(data, curr.ptr) };
+                    data.new.refill_unchecked(loaded.ptr);
                     // keep the increase of the ref count of the new value
-                    mem::forget(curr);
+                    mem::forget(loaded);
                     // FIXME: add safety comment!
                     unsafe { data.intermediate.replace(null_mut()) };
                     // SAFETY: this is safe because `data.new` was just updated by us and thus we know that it
@@ -319,10 +305,10 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
                 // don't modify the gen_cnt because we know that there are no references
                 // left to this (thread-)local instance
-                data.new.refill_unchecked(curr.ptr);
+                data.new.refill_unchecked(loaded.ptr);
 
                 // keep the ref count increased
-                mem::forget(curr);
+                mem::forget(loaded);
 
                 return SwapArcGuard {
                     parent,
@@ -337,7 +323,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                 // FIXME: do we have to use a stronger ordering or is Relaxed sufficient?
                 if parent.parent().ptr.load(Ordering::Relaxed) != data.intermediate.val() {
                     let new = parent.parent().load_raw_full_internal();
-                    unsafe { data.intermediate.replace(new.ptr.cast_mut()); }
+                    unsafe {
+                        data.intermediate.replace(new.ptr.cast_mut());
+                    }
                     // we need to retain the ref count increment above
                     mem::forget(new);
                 }
@@ -363,7 +351,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
 
                 // we have to make sure we observe the update of `intermediate_ref_cnt` correctly
                 fence(Ordering::Acquire); // FIXME: is this still required?
-                // increment the reference count in order to avoid race conditions and act as a guard for our load
+                                          // increment the reference count in order to avoid race conditions and act as a guard for our load
 
                 // ORDERING: This is `Acquire` because we have to ensure that the previous critical sections have
                 // a happens-before relationship with this increment, i.e they are finished at the point this operation
@@ -380,7 +368,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         parent.parent().intermediate_ptr.load(Ordering::Acquire),
                     );
                     // FIXME: add safety comment!
-                    unsafe { ManuallyDrop::new(D::from(loaded)).increase_ref_cnt_by(2); }
+                    unsafe {
+                        ManuallyDrop::new(D::from(loaded)).increase_ref_cnt_by(2);
+                    }
 
                     // FIXME: explain ordering
 
@@ -391,7 +381,9 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
                         .fetch_sub(1, Ordering::Release);
 
                     // FIXME: add safety comment!
-                    unsafe { data.intermediate.replace(loaded.cast_mut()); }
+                    unsafe {
+                        data.intermediate.replace(loaded.cast_mut());
+                    }
                     (loaded, INTERMEDIATE_GEN_CNT)
                 } else {
                     // the update is on-going, so we have to fallback to our locally most recent value
@@ -448,7 +440,8 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
         // SAFETY: This is safe as we know that the ptr is valid and we are *not* dropping the
         // inner value we read from it.
         // FIXME: expand safety comment to accomodate for fake_ref being MaybeUninit now!
-        let fake_ref = unsafe { (guard.fake_ref.assume_init_ref() as *const ManuallyDrop<D>).read() };
+        let fake_ref =
+            unsafe { (guard.fake_ref.assume_init_ref() as *const ManuallyDrop<D>).read() };
         let ptr = unsafe { ManuallyDrop::into_inner(fake_ref).into_ptr() };
         SwapArcPtrGuard {
             parent: guard.parent,
@@ -678,9 +671,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
     #[inline]
     pub fn swap(&self, updated: D) -> Option<D> {
         // SAFETY: we know that `updated` is an instance of `D`, so we can generate a valid ptr to its content.
-        unsafe {
-            self._store_raw(updated.into_ptr())
-        }
+        unsafe { self._store_raw(updated.into_ptr()) }
     }
 
     /// Update the value inside the SwapArc to value passed in `updated`.
@@ -1263,7 +1254,9 @@ pub struct SwapArcGuard<
     gen_cnt: usize,
 }
 
-impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> SwapArcGuard<'_, T, D, METADATA_BITS> {
+impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32>
+    SwapArcGuard<'_, T, D, METADATA_BITS>
+{
     #[inline(always)]
     fn fake_ref(&self) -> &ManuallyDrop<D> {
         // FIXME: add safety comment!
@@ -1307,12 +1300,16 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
                         // FIXME: add comment!
                         data.new.refill_unchecked(data.intermediate.val());
                         // FIXME: add safety comment!
-                        unsafe { data.intermediate.replace_softly(null_mut()); }
+                        unsafe {
+                            data.intermediate.replace_softly(null_mut());
+                        }
                     }
                 }
             } else {
                 // FIXME: add safety comment!
-                unsafe { ManuallyDrop::into_inner(slf.fake_ref.assume_init_read()); }
+                unsafe {
+                    ManuallyDrop::into_inner(slf.fake_ref.assume_init_read());
+                }
             }
         }
     }
@@ -1389,7 +1386,7 @@ impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Drop
                 // still updates pending.
 
                 // ORDERING: This is `Relaxed` because we are only speculatively loading `updated` here,
-                // so we don't care about the consistency of state of the atomics around it.
+                // so we don't care about the consistent state of the atomics around it.
                 if ref_cnt == 1 && !self.parent.updated.load(Ordering::Relaxed).is_null() {
                     self.parent.try_update_intermediate_implicitly();
                 }
@@ -1428,20 +1425,53 @@ unsafe impl<T: Send + Sync, D: DataPtrConvert<T>, const METADATA_BITS: u32> Send
 {
 }
 
-const INTERMEDIATE_GEN_CNT: usize = 1;
+const INTERMEDIATE_GEN_CNT: usize = 2;
 
 struct LocalDataInner<T: Send + Sync, D: DataPtrConvert<T>> {
-    next_gen_cnt: usize,
+    /// intermediate is owned because when all 3 slots (curr, new and intermediate) are being used by a single thread
+    /// we want to still be able to replace one of these slots and as such intermediate must act upon the central
+    /// reference counter in order to be able to just replace intermediate safely at any point
     intermediate: OwnedData<T, D>,
     new: LocalCounted<T, D>,
     curr: LocalCounted<T, D>,
 }
 
-// FIXME: explain this additional module!
+impl<T: Send + Sync, D: DataPtrConvert<T>> LocalDataInner<T, D> {
+    fn propagate_new(&mut self) {
+        let new_gen = 1 - self.new.gen_cnt;
+        let new = mem::replace(
+            &mut self.new,
+            LocalCounted {
+                gen_cnt: new_gen,
+                ptr: null_mut(),
+                ref_cnt: 0,
+                _phantom_data: PhantomData,
+            },
+        );
+        self.curr = new;
+    }
+
+    fn propagate_new_replace(&mut self, replace: *mut T) {
+        let new_gen = 1 - self.new.gen_cnt;
+        let new = mem::replace(
+            &mut self.new,
+            LocalCounted {
+                gen_cnt: new_gen,
+                ptr: replace,
+                ref_cnt: 1,
+                _phantom_data: PhantomData,
+            },
+        );
+        self.curr = new;
+    }
+}
+
+/// module to deal with passing around a pointer that has a reference (that's counted)
+/// associated with it which should be destroyed as soon as the pointer won't be used anymore
 mod owned {
+    use crate::DataPtrConvert;
     use std::marker::PhantomData;
     use std::ptr::null_mut;
-    use crate::DataPtrConvert;
 
     // FIXME: add safety comments
 
@@ -1455,7 +1485,9 @@ mod owned {
 
         pub(crate) unsafe fn replace(&mut self, new: *mut T) {
             if !self.0.is_null() {
-                unsafe { D::from(self.0.cast_const()); }
+                unsafe {
+                    D::from(self.0.cast_const());
+                }
             }
             self.0 = new;
         }
@@ -1481,41 +1513,27 @@ mod owned {
     impl<T: Send + Sync, D: DataPtrConvert<T>> Drop for OwnedData<T, D> {
         fn drop(&mut self) {
             if !self.0.is_null() {
-                unsafe { D::from(self.0.cast_const()); }
+                unsafe {
+                    D::from(self.0.cast_const());
+                }
             }
         }
     }
 }
 
 struct LocalCounted<T: Send + Sync, D: DataPtrConvert<T>> {
-    gen_cnt: usize, // TODO: would it help somehow (the performance) if we were to make `gen_cnt` an `u8`? - it probably wouldn't!
+    gen_cnt: usize,
     ptr: *mut T,
     ref_cnt: usize,
     _phantom_data: PhantomData<D>,
 }
 
 // SAFETY: These impls are safe as the lack of Send and Sync impls on ptrs is just due to
-// historic reasons and doesn't have a logical foundation.
+// historic reasons and don't have a logical foundation.
 unsafe impl<T: Send + Sync, D: DataPtrConvert<T>> Send for LocalCounted<T, D> {}
 unsafe impl<T: Send + Sync, D: DataPtrConvert<T>> Sync for LocalCounted<T, D> {}
 
 impl<T: Send + Sync, D: DataPtrConvert<T>> LocalCounted<T, D> {
-    /// SAFETY: The caller has to ensure that the safety invariants relied upon
-    /// in the `val`, `refill_unchecked` and `drop` methods are being upheld.
-    unsafe fn new(parent: &mut LocalDataInner<T, D>, ptr: *const T) -> Self {
-        let gen_cnt = parent.next_gen_cnt;
-        let res = parent.next_gen_cnt.overflowing_add(1);
-        // if an overflow occurs, we add an additional 1 to the result in order to never
-        // reach 0 which is reserved for the "default" `gen_cnt`
-        parent.next_gen_cnt = res.0 + ((res.1 as usize) << 1);
-        Self {
-            gen_cnt,
-            ptr: ptr.cast_mut(),
-            ref_cnt: 1,
-            _phantom_data: Default::default(),
-        }
-    }
-
     #[inline]
     fn val(&self) -> ManuallyDrop<D> {
         // SAFETY: this is safe because we know that the pointer
@@ -1533,18 +1551,6 @@ impl<T: Send + Sync, D: DataPtrConvert<T>> LocalCounted<T, D> {
         }
         self.ptr = ptr.cast_mut();
         self.ref_cnt = 1;
-    }
-}
-
-impl<T: Send + Sync, D: DataPtrConvert<T>> Default for LocalCounted<T, D> {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            gen_cnt: 0,
-            ptr: null_mut(),
-            ref_cnt: 0,
-            _phantom_data: Default::default(),
-        }
     }
 }
 
